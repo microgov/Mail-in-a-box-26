@@ -13,7 +13,7 @@
 #########################################################
 
 # The fork's repository (bootstrap.sh compares the checkout's origin with it).
-DEFAULT_SOURCE=https://github.com/LM1337/Mail-in-a-box-26
+DEFAULT_SOURCE=https://github.com/microgov/Mail-in-a-box-26
 
 if [ -z "$TAG" ]; then
 	# If a version to install isn't explicitly given as an environment
@@ -32,7 +32,7 @@ if [ -z "$TAG" ]; then
 	if [ "$UBUNTU_VERSION" == "Ubuntu 26.04 LTS" ]; then
 		# This machine is running Ubuntu 26.04, which is supported by
 		# this fork of Mail-in-a-Box.
-		TAG=v78-r2604.1
+		TAG=aws-cf
 	elif [ "$UBUNTU_VERSION" == "Ubuntu 22.04 LTS" ]; then
 		# This machine is running Ubuntu 22.04, which is supported by
 		# Mail-in-a-Box versions 60 and later.
