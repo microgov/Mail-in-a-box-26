@@ -362,7 +362,9 @@ ufw_allow submission
 
 # Configure SMTP Relay
 # - needs review
-#   - this is a as yet unaltered direct copy/paste from my miab v76 fork awsai branch
+#   - this is a as yet unaltered direct copy/paste from my miab v76 fork awscfai branch
+#   -  ( https://github.com/microgov/mailinabox-4rk-aws-cf/tree/awscfai )
+#   -  ( https://github.com/microgov/mailinabox-4rk-aws-cf/blob/awscfai/setup/mail-postfix.sh )
 
 if [[ -n "${SMTP_RELAY_ENDPOINT:-}" && -n "${SMTP_RELAY_PORT:-}" && \
 	  -n "${SMTP_RELAY_USER:-}" && -n "${SMTP_RELAY_PASSWORD:-}" ]]; then
