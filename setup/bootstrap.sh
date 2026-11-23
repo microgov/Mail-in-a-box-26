@@ -2,13 +2,13 @@
 #########################################################
 # This script is intended to be run like this:
 #
-#   sudo bash -c "$(curl -fsSL https://raw.githubusercontent.com/LM1337/Mail-in-a-box-26/main/setup/bootstrap.sh)"
+#   sudo bash -c "$(curl -fsSL https://raw.githubusercontent.com/microgov/Mail-in-a-box-26/aws-cf/setup/bootstrap.sh)"
 #
 # ("curl ... | sudo bash" works as root, with sudo.ws, or with NONINTERACTIVE=1;
 # see below for sudo-rs.)
 #
-# This is the Ubuntu 26.04 fork of Mail-in-a-Box (see README-fork.md),
-# https://github.com/LM1337/Mail-in-a-box-26
+# This is the Ubuntu 26.04 fork of Mail-in-a-Box (see README-fork.md and README-aws-cf.md),
+# https://github.com/microgov/Mail-in-a-box-26
 #
 #########################################################
 
@@ -75,7 +75,7 @@ if [ -z "${NONINTERACTIVE:-}" ] && [ ! -t 0 ]; then
 			echo "stops them when this script comes through a pipe into sudo. Run it like this instead"
 			echo "(variables such as TAG=... go after sudo):"
 			echo
-			echo "  sudo bash -c \"\$(curl -fsSL https://raw.githubusercontent.com/LM1337/Mail-in-a-box-26/main/setup/bootstrap.sh)\""
+			echo "  sudo bash -c \"\$(curl -fsSL https://raw.githubusercontent.com/microgov/Mail-in-a-box-26/aws-cf/setup/bootstrap.sh)\""
 			echo
 			echo "Or give NONINTERACTIVE=1 and the answers (see README-fork.md, Installation)."
 			exit 1
