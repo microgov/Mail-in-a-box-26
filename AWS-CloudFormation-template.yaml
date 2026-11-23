@@ -308,11 +308,11 @@ Resources:
           # Ensure CloudFormation is signaled on exit/failure
           trap '/opt/aws/bin/cfn-signal -e $? --stack ${AWS::StackName} --resource EC2Instance --region ${AWS::Region}' EXIT
           # 4. Query IMDSv2 Metadata Safely (replaces deprecated ec2metadata)
-          IMDS_TOKEN=$(curl -s -X PUT "http://169.254.169" -H "X-aws-ec2-metadata-token-ttl-seconds: 21600")
-          export PRIVATE_IP=$(curl -s -H "X-aws-ec2-metadata-token: $IMDS_TOKEN" http://169.254.169)
-          export INSTANCE_ID=$(curl -s -H "X-aws-ec2-metadata-token: $IMDS_TOKEN" http://169.254.169)
+          IMDS_TOKEN=$(curl -s -X PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 21600")
+          export PRIVATE_IP=$(curl -s -H "X-aws-ec2-metadata-token: $IMDS_TOKEN" http://169.254.169.254/latest/meta-data/)
+          export INSTANCE_ID=$(curl -s -H "X-aws-ec2-metadata-token: $IMDS_TOKEN" http://169.254.169.254/latest/meta-data/)
           if [[ -z "${InstanceEIP}" ]]; then
-          export PUBLIC_IP=$(curl -s -H "X-aws-ec2-metadata-token: $IMDS_TOKEN" http://169.254.169)
+          export PUBLIC_IP=$(curl -s -H "X-aws-ec2-metadata-token: $IMDS_TOKEN" http://169.254.169.254/latest/meta-data/)
           else
           export PUBLIC_IP="${InstanceEIP}"
           fi
@@ -354,6 +354,7 @@ Resources:
           id -u $STORAGE_USER &>/dev/null || useradd -m $STORAGE_USER
           mkdir -p $STORAGE_ROOT
           git clone "${MailInABoxCloneUrl}" /opt/mailinabox
+          ln -s /opt/mailinabox /root/mailinabox # not sure about this - needs review - suspect ai confused - sometimes ai gets it right :-}
           cd /opt/mailinabox && git checkout "${MailInABoxBranchOrTag}"
 
           # 7. Restore from S3 Backup (if RestorePrefix is provided)
@@ -379,7 +380,7 @@ Resources:
 
           # 9. Configure Local DNS Resolution via Netplan
           INTERFACE=$(ip route list | grep default | grep -E 'dev (\w+)' -o | awk '{print $2}')
-          cat < /etc/netplan/99-custom-dns.yaml
+          cat <<EOT > /etc/netplan/99-custom-dns.yaml
           network:
             version: 2
             ethernets:
@@ -397,7 +398,7 @@ Resources:
           echo "Mail-in-a-box (${MailInABoxBranchOrTag}) backups for $INSTANCE_ID created on $(date -Im)" > /tmp/README.txt
           aws s3 cp /tmp/README.txt "s3://${BackupS3Bucket}/$INSTANCE_ID/README.txt"
           mkdir -p "$STORAGE_ROOT/backup"
-          cat < "$STORAGE_ROOT/backup/custom.yaml"
+          cat <<EOT > "$STORAGE_ROOT/backup/custom.yaml"
           min_age_in_days: 7
           # target: s3://s3.$RESTORE_S3_amazonaws.com{BackupS3Bucket}/$INSTANCE_ID
           target: s3://s3.$RESTORE_S3_REGION.amazonaws.com/${BackupS3Bucket}/$INSTANCE_ID
