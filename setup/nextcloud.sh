@@ -22,8 +22,8 @@ echo "Installing Nextcloud (contacts/calendar)..."
 # * The hash is the SHA256 hash of the ZIP package. Nextcloud publishes it next to the download
 #   (https://download.nextcloud.com/server/releases/nextcloud-<ver>.zip.sha256; there is no .sha1).
 #   Check it against the hash this script prints when it doesn't match what is below.
-nextcloud_ver=34.0.5
-nextcloud_hash=d077fdca3dc78ef60b5bbc51182f2a1737aa01e2044d6c23f4e7b72146f5239a
+nextcloud_ver=34.0.6
+nextcloud_hash=ec74a0cf6de20e2a234c5bde55e370e4a7f12b46a266ae3d33c8f3edc17b153e
 
 # Nextcloud apps
 # --------------
@@ -39,12 +39,12 @@ nextcloud_hash=d077fdca3dc78ef60b5bbc51182f2a1737aa01e2044d6c23f4e7b72146f5239a
 # (wget_verify still accepts 40-char SHA1 hashes, but don't add new ones.)
 
 # Always ensure the versions are supported, see https://apps.nextcloud.com/apps/contacts
-contacts_ver=8.9.2
-contacts_hash=92f7c79c411273045ed6346f6988c05af673c3170a3adaba91a15066b8dce7c5
+contacts_ver=8.10.0
+contacts_hash=035d943115f129d20fbaba19b2124a0d2f65a59c35cabe142495bb6ae650d549
 
 # Always ensure the versions are supported, see https://apps.nextcloud.com/apps/calendar
-calendar_ver=6.6.4
-calendar_hash=0557b6b5852a467cf3f746e59d56478d227f78bf7a66357b30dfc10cae4c7e3c
+calendar_ver=6.6.6
+calendar_hash=b19149fad6462ce8ec028e53551651d1b1291f30cd3dbd70e85434b1d28b4abe
 
 # Always ensure the versions are supported, see https://apps.nextcloud.com/apps/user_external
 # user_external 4.0.0 declares nextcloud min-version=31 max-version=34 and there is no release
@@ -83,8 +83,9 @@ tools/editconf.py /etc/php/"$PHP_VER"/mods-available/apcu.ini -c ';' \
 # Called when a Nextcloud upgrade step fails. php-fpm was stopped before the upgrade chain
 # and also serves Roundcube and Z-Push, so start it again before bailing out.
 NextcloudUpgradeFailed() {
-	echo "Nextcloud upgrade failed. A copy of the installation, database and configuration from"
+	echo "Nextcloud upgrade failed. A copy of ${NEXTCLOUD_BACKUP_WHAT:-the installation, database and configuration} from"
 	echo "before the upgrade is in ${BACKUP_DIRECTORY:-$STORAGE_ROOT/owncloud-backup}."
+	if [ -n "${NEXTCLOUD_RESTORE_HINT:-}" ]; then echo "$NEXTCLOUD_RESTORE_HINT"; fi
 	echo "See $STORAGE_ROOT/owncloud/nextcloud.log, fix the cause and run setup again."
 	service php"$PHP_VER"-fpm start &> /dev/null || /bin/true
 	exit 1
@@ -233,9 +234,40 @@ InstallNextcloud() {
 # version.php since the restore procedure can leave the system in a state where you have a newer Nextcloud
 # application version than the database.
 
+# The copies in $STORAGE_ROOT/owncloud-backup (owncloud.db holds every user's
+# calendars and contacts) were readable by every local account: the directory
+# and its subdirectories 0755, the database copies 0644 (B177). Only root needs
+# them (tools/owncloud-restore.sh), so the directory is 0700, which closes all
+# copies, also those of earlier runs. With "create" it is made if missing (just
+# before a backup); otherwise only an existing one is closed. Something else
+# than a directory there (a symbolic link, which chmod, mkdir -p and cp would
+# follow, or a file) is left alone: without "create" it is reported, with
+# "create" setup stops, as the backup must not be written through it.
+owncloud_backup_private() {
+	local d="$STORAGE_ROOT/owncloud-backup"
+	if [ -L "$d" ] || { [ -e "$d" ] && [ ! -d "$d" ]; }; then
+		if [ "${1:-}" = "create" ]; then
+			echo "Setup stopped: $d is not a directory (a symbolic link or a file), so Nextcloud's backup copies cannot go there. Move it away and run setup again." >&2
+			exit 1
+		fi
+		echo "Not changing $d: it is not a directory (a symbolic link or a file)."
+		return 0
+	fi
+	if [ ! -e "$d" ] && [ "${1:-}" = "create" ]; then
+		mkdir -m 0700 "$d"
+	fi
+	if [ -d "$d" ]; then
+		chmod 0700 "$d"
+	fi
+}
+owncloud_backup_private
+
 # If config.php exists, get version number, otherwise CURRENT_NEXTCLOUD_VER is empty.
+# Read from the file's 'version' line (Nextcloud writes it with var_export, one
+# key per line), as www-data, which owns it. Up to v78-r2604.1 root included
+# the file in PHP, so PHP code that www-data had added to it ran as root (B147).
 if [ -f "$STORAGE_ROOT/owncloud/config.php" ]; then
-	CURRENT_NEXTCLOUD_VER=$(php"$PHP_VER" -r "include(\"$STORAGE_ROOT/owncloud/config.php\"); echo(\$CONFIG['version']);")
+	CURRENT_NEXTCLOUD_VER=$(sudo -u www-data sed -n "/^[[:space:]]*'version'[[:space:]]*=>[[:space:]]*'\([0-9.]*\)'.*/{s//\1/p;q}" "$STORAGE_ROOT/owncloud/config.php")
 else
 	CURRENT_NEXTCLOUD_VER=""
 fi
@@ -245,22 +277,29 @@ fi
 if [ ! -d /usr/local/lib/owncloud/ ] || [[ ! ${CURRENT_NEXTCLOUD_VER} =~ ^$nextcloud_ver ]]; then
 
 	# Stop php-fpm if running. If they are not running (which happens on a previously failed install), dont bail.
-	service php"$PHP_VER"-fpm stop &> /dev/null || /bin/true
+	# setup/start.sh starts it again if the run ends before its restart after zpush.sh (B149).
+	stop_php_fpm
 
 	# Backup the existing ownCloud/Nextcloud.
 	# Create a backup directory to store the current installation and database to
 	BACKUP_DIRECTORY=$STORAGE_ROOT/owncloud-backup/$(date +"%Y-%m-%d-%T")
+	owncloud_backup_private create
 	mkdir -p "$BACKUP_DIRECTORY"
 	if [ -d /usr/local/lib/owncloud/ ]; then
 		echo "Upgrading Nextcloud --- backing up existing installation, configuration, and database to directory to $BACKUP_DIRECTORY..."
 		cp -r /usr/local/lib/owncloud "$BACKUP_DIRECTORY/owncloud-install"
 	fi
-	if [ -e "$STORAGE_ROOT/owncloud/owncloud.db" ]; then
-		cp "$STORAGE_ROOT/owncloud/owncloud.db" "$BACKUP_DIRECTORY"
-	fi
-	if [ -e "$STORAGE_ROOT/owncloud/config.php" ]; then
-		cp "$STORAGE_ROOT/owncloud/config.php" "$BACKUP_DIRECTORY"
-	fi
+	# Only a regular file is backed up: www-data owns $STORAGE_ROOT/owncloud and
+	# could have put a symbolic link there, whose target root would read into
+	# the backup (or, kept as a link, tools/owncloud-restore.sh later) (B147).
+	# cp -P: a link put there after the test is copied as a link.
+	for f in owncloud.db config.php; do
+		if [ -L "$STORAGE_ROOT/owncloud/$f" ] || { [ -e "$STORAGE_ROOT/owncloud/$f" ] && [ ! -f "$STORAGE_ROOT/owncloud/$f" ]; }; then
+			echo "Not backing up $STORAGE_ROOT/owncloud/$f: it is not a regular file."
+		elif [ -e "$STORAGE_ROOT/owncloud/$f" ]; then
+			cp -P "$STORAGE_ROOT/owncloud/$f" "$BACKUP_DIRECTORY"
+		fi
+	done
 
 	# If ownCloud or Nextcloud was previously installed....
 	if [ -n "${CURRENT_NEXTCLOUD_VER}" ]; then
@@ -341,13 +380,162 @@ if [ ! -d /usr/local/lib/owncloud/ ] || [[ ! ${CURRENT_NEXTCLOUD_VER} =~ ^$nextc
 		# and move nextcloud_ver and the app pins at the top of this file to 35.
 		# if [[ ${CURRENT_NEXTCLOUD_VER} =~ ^33 ]]; then
 		#	# runs with PHP 8.5
-		#	InstallNextcloud 34.0.5 d077fdca3dc78ef60b5bbc51182f2a1737aa01e2044d6c23f4e7b72146f5239a 8.9.2 92f7c79c411273045ed6346f6988c05af673c3170a3adaba91a15066b8dce7c5 6.6.4 0557b6b5852a467cf3f746e59d56478d227f78bf7a66357b30dfc10cae4c7e3c 4.0.0 f1f98c577bd02177fe74e9199f8e50d0c288ffa94bb50a227101a5ba0633c529
-		#	CURRENT_NEXTCLOUD_VER="34.0.5"
+		#	InstallNextcloud 34.0.6 ec74a0cf6de20e2a234c5bde55e370e4a7f12b46a266ae3d33c8f3edc17b153e 8.10.0 035d943115f129d20fbaba19b2124a0d2f65a59c35cabe142495bb6ae650d549 6.6.6 b19149fad6462ce8ec028e53551651d1b1291f30cd3dbd70e85434b1d28b4abe 4.0.0 f1f98c577bd02177fe74e9199f8e50d0c288ffa94bb50a227101a5ba0633c529
+		#	CURRENT_NEXTCLOUD_VER="34.0.6"
 		# fi
 		##
 	fi
 
 	InstallNextcloud $nextcloud_ver $nextcloud_hash $contacts_ver $contacts_hash $calendar_ver $calendar_hash $user_external_ver $user_external_hash
+fi
+
+# Update the apps contacts, calendar and user_external to the versions at the
+# top of this file when Nextcloud itself stays (B176). InstallNextcloud puts
+# them in only together with a new Nextcloud, so up to v78-r2604.3 a new
+# version of an app (a fix of calendar, say) reached an existing box only with
+# the next update of Nextcloud. An app whose version (its appinfo/info.xml) is
+# older than the pin, or that is missing, is replaced; a newer one is kept
+# (Nextcloud does not downgrade an app). After InstallNextcloud, and on a
+# fresh install, the versions match and nothing happens.
+#
+# www-data owns /usr/local/lib/owncloud and can create, replace or link any
+# name in apps/ at any moment, so root never uses a name there that it chose
+# itself (a fixed name like apps/.calendar.old could be a link to a directory
+# by then, into which mv would move the app, e.g. into Python's library as a
+# package that shadows a module of root's) and never moves into a name there
+# without -T. The work is done in a directory of root's own in /usr/local/lib
+# (mode 0700, the same file system as Nextcloud, not the tmpfs /tmp, from
+# where mv would copy file by file):
+#  1. every app to update is downloaded, checked against its SHA256 hash and
+#     unpacked there first, so a failed download changes nothing;
+#  2. PHP-FPM is stopped, as for an update of Nextcloud above (start.sh starts
+#     it again, B149), and the database, config.php and the old apps are
+#     copied to a new directory in $STORAGE_ROOT/owncloud-backup (only
+#     regular files, as above, B147);
+#  3. each old app is moved out of apps/ into root's directory and the new one
+#     in with mv -T (rename(2), which does not follow a link: if www-data put
+#     something in the way, mv fails and setup stops);
+#  4. "occ upgrade" runs the apps' migrations. It refuses the read-only
+#     config.php that the last setup run left (config_is_read_only, set again
+#     at the end of this script), so the flag is removed first, as for an
+#     update of Nextcloud. The old apps stay in the backup directory if it
+#     fails; root's directory is removed on success, and a run that stopped
+#     before leaves one that the next run removes.
+# The installed version is read as www-data, with a time limit: root opens no
+# path in apps/, which www-data could have made a FIFO or a link.
+nextcloud_app_version() {
+	timeout 20 sudo -u www-data sed -n 's:.*<version>\([0-9][0-9A-Za-z.~+-]*\)</version>.*:\1:p' "/usr/local/lib/owncloud/apps/$1/appinfo/info.xml" 2> /dev/null | head -n 1 || true
+}
+UpdateNextcloudApps() {
+	local apps=/usr/local/lib/owncloud/apps dl item app version hash installed f
+	local todo=()
+	rm -rf /usr/local/lib/.nextcloud-apps.* /usr/local/lib/.nextcloud-db.* # of a run that stopped here
+	for item in "contacts $contacts_ver $contacts_hash" "calendar $calendar_ver $calendar_hash" "user_external $user_external_ver $user_external_hash"; do
+		read -r app version hash <<< "$item"
+		installed=$(nextcloud_app_version "$app")
+		if [ "$installed" = "$version" ]; then
+			continue
+		fi
+		if [ -n "$installed" ] && [ "$(printf '%s\n%s\n' "$installed" "$version" | sort -V | tail -n 1)" = "$installed" ]; then
+			echo "Nextcloud: $app $installed is newer than $version, keeping it."
+			continue
+		fi
+		todo+=("$app $version $hash ${installed:--}")
+	done
+	if [ ${#todo[@]} = 0 ]; then
+		return 0
+	fi
+
+	# 1. Download, check and unpack.
+	dl=$(mktemp -d /usr/local/lib/.nextcloud-apps.XXXXXXXX)
+	mkdir "$dl/new" "$dl/old"
+	for item in "${todo[@]}"; do
+		read -r app version hash installed <<< "$item"
+		echo "Downloading the Nextcloud app $app $version..."
+		wget_verify "https://github.com/nextcloud-releases/$app/releases/download/v$version/$app-v$version.tar.gz" "$hash" "$dl/$app.tgz"
+		mkdir "$dl/unpack-$app"
+		if ! tar -xf "$dl/$app.tgz" -C "$dl/unpack-$app" || [ ! -f "$dl/unpack-$app/$app/appinfo/info.xml" ]; then
+			echo "Nextcloud: the archive of $app $version could not be unpacked or has no $app/appinfo/info.xml. Nothing was changed." >&2
+			rm -rf "$dl"
+			exit 1
+		fi
+		mv -T "$dl/unpack-$app/$app" "$dl/new/$app"
+		chown -R www-data:www-data "$dl/new/$app"
+	done
+
+	# 2. Stop PHP-FPM and back up. The database is in WAL mode, and a cron.php
+	# that started before setup stopped cron may still write to it (cron's
+	# KillMode leaves its jobs running, see setup/start.sh), so copying
+	# owncloud.db could miss transactions that are only in owncloud.db-wal.
+	# www-data, the owner of the database, writes a consistent copy with
+	# "VACUUM INTO" (root opens no database of www-data's) into a directory of
+	# its own that root made for it in /usr/local/lib; root takes the file
+	# from there if it is a regular file (B147) and removes the directory.
+	stop_php_fpm
+	BACKUP_DIRECTORY=$STORAGE_ROOT/owncloud-backup/$(date +"%Y-%m-%d-%T")
+	owncloud_backup_private create
+	mkdir -p "$BACKUP_DIRECTORY/apps"
+	if [ -L "$STORAGE_ROOT/owncloud/owncloud.db" ] || { [ -e "$STORAGE_ROOT/owncloud/owncloud.db" ] && [ ! -f "$STORAGE_ROOT/owncloud/owncloud.db" ]; }; then
+		echo "Not backing up $STORAGE_ROOT/owncloud/owncloud.db: it is not a regular file."
+	elif [ -e "$STORAGE_ROOT/owncloud/owncloud.db" ]; then
+		local dbcopy; dbcopy=$(mktemp -d /usr/local/lib/.nextcloud-db.XXXXXXXX)
+		chown www-data:www-data "$dbcopy"
+		if ! timeout 900 sudo -u www-data python3 -I -c 'import sqlite3, sys, urllib.parse
+con = sqlite3.connect("file:" + urllib.parse.quote(sys.argv[1]) + "?mode=ro", uri=True, timeout=60)
+con.execute("VACUUM INTO ?", (sys.argv[2],))
+con.close()' "$STORAGE_ROOT/owncloud/owncloud.db" "$dbcopy/owncloud.db" \
+				|| ! chown root:root "$dbcopy" || ! chmod 0700 "$dbcopy" \
+				|| [ -L "$dbcopy/owncloud.db" ] || [ ! -f "$dbcopy/owncloud.db" ]; then
+			# (The directory is root's again before the checks: www-data can no
+			# longer swap the file for a link or a FIFO between them and cp.)
+			rm -rf "$dbcopy"
+			echo "Nextcloud: could not make a copy of the database for the backup (VACUUM INTO). Nothing was changed." >&2
+			exit 1
+		fi
+		cp -P "$dbcopy/owncloud.db" "$BACKUP_DIRECTORY/owncloud.db"
+		rm -rf "$dbcopy"
+	fi
+	if [ -L "$STORAGE_ROOT/owncloud/config.php" ] || { [ -e "$STORAGE_ROOT/owncloud/config.php" ] && [ ! -f "$STORAGE_ROOT/owncloud/config.php" ]; }; then
+		echo "Not backing up $STORAGE_ROOT/owncloud/config.php: it is not a regular file."
+	elif [ -e "$STORAGE_ROOT/owncloud/config.php" ]; then
+		cp -P "$STORAGE_ROOT/owncloud/config.php" "$BACKUP_DIRECTORY"
+	fi
+
+	# 3. Swap.
+	for item in "${todo[@]}"; do
+		read -r app version hash installed <<< "$item"
+		echo "Updating the Nextcloud app $app from ${installed/#-/(not installed)} to $version..."
+		if [ -e "$apps/$app" ] || [ -L "$apps/$app" ]; then
+			mv -T "$apps/$app" "$dl/old/$app"
+			cp -a "$dl/old/$app" "$BACKUP_DIRECTORY/apps/$app"
+		fi
+		mv -T "$dl/new/$app" "$apps/$app"
+	done
+
+	# 4. Upgrade.
+	if [ -e "$STORAGE_ROOT/owncloud/owncloud.db" ]; then
+		sudo -u www-data sed -i -e '/config_is_read_only/d' "$STORAGE_ROOT/owncloud/config.php"
+		NEXTCLOUD_BACKUP_WHAT="the replaced apps (apps/), the database and the configuration"
+		NEXTCLOUD_RESTORE_HINT="To go back: with PHP-FPM stopped, copy owncloud.db and config.php from there to $STORAGE_ROOT/owncloud/ and the directories in apps/ to /usr/local/lib/owncloud/apps/ (all owned by www-data)."
+		NextcloudUpgrade php"$PHP_VER"
+		NEXTCLOUD_BACKUP_WHAT=
+		NEXTCLOUD_RESTORE_HINT=
+	fi
+	rm -rf "$dl"
+}
+UpdateNextcloudApps
+
+# A run that stopped after a swap and before its upgrade left Nextcloud
+# needing an upgrade, in which state occ refuses most commands (app:enable
+# below): finish it here. (The output is read first: with pipefail, grep -q
+# ending the pipe early could fail it.)
+if [ -e "$STORAGE_ROOT/owncloud/owncloud.db" ]; then
+	nc_status=$(sudo -u www-data php"$PHP_VER" /usr/local/lib/owncloud/occ status --output=json 2> /dev/null || true)
+	if [[ $nc_status == *'"needsDbUpgrade":true'* ]]; then
+		echo "Nextcloud needs an upgrade (an earlier setup run stopped before it), running it now..."
+		sudo -u www-data sed -i -e '/config_is_read_only/d' "$STORAGE_ROOT/owncloud/config.php"
+		NextcloudUpgrade php"$PHP_VER"
+	fi
 fi
 
 # ### Configuring Nextcloud
@@ -368,9 +556,12 @@ if [ ! -f "$STORAGE_ROOT/owncloud/owncloud.db" ]; then
 	# Create user data directory
 	mkdir -p "$STORAGE_ROOT/owncloud"
 
-	# Create an initial configuration file.
+	# Create an initial configuration file. Both files below are written with
+	# tools/write_conf.py, which does not follow a symbolic link in a
+	# directory of www-data's: this branch also runs on an existing box whose
+	# owncloud.db is gone (B147).
 	instanceid=oc$(echo "$PRIMARY_HOSTNAME" | sha1sum | fold -w 10 | head -n 1)
-	cat > "$STORAGE_ROOT/owncloud/config.php" <<EOF;
+	tools/write_conf.py "$STORAGE_ROOT/owncloud/config.php" <<EOF;
 <?php
 \$CONFIG = array (
   'datadirectory' => '$STORAGE_ROOT/owncloud',
@@ -398,7 +589,7 @@ EOF
 	# when the install script is run. Make an administrator account
 	# here or else the install can't finish.
 	adminpassword=$(dd if=/dev/urandom bs=1 count=40 2>/dev/null | sha1sum | fold -w 30 | head -n 1)
-	cat > /usr/local/lib/owncloud/config/autoconfig.php <<EOF;
+	tools/write_conf.py /usr/local/lib/owncloud/config/autoconfig.php 640 <<EOF;
 <?php
 \$AUTOCONFIG = array (
   # storage/database
@@ -554,7 +745,8 @@ tools/editconf.py /etc/php/"$PHP_VER"/fpm/php.ini -c ';' \
 # This version was probably in use in Mail-in-a-Box v0.41 (February 26, 2019) and earlier.
 # We moved to v0.6.3 in 193763f8. Ignore errors - maybe there are duplicated users with the
 # correct backend already.
-sqlite3 "$STORAGE_ROOT/owncloud/owncloud.db" "UPDATE oc_users_external SET backend='127.0.0.1';" || /bin/true
+# As www-data, which owns the database and its directory, not as root by path (B147).
+sudo -u www-data sqlite3 "$STORAGE_ROOT/owncloud/owncloud.db" "UPDATE oc_users_external SET backend='127.0.0.1';" || /bin/true
 
 # Set up a general cron job for Nextcloud.
 # Also add another job for Calendar updates, per advice in the Nextcloud docs

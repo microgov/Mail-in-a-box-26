@@ -188,19 +188,62 @@ echo "Installing ppa prereqs..."
 apt_get_quiet update --allow-releaseinfo-change
 apt_install lsb-release ca-certificates curl gnupg
 SURY_KEY_FPR=15058500A0235D97F5D10063B188E2B695BD4743 # DEB.SURY.ORG Automatic Signing Key
+SURY_KEYRING=usr/share/keyrings/debsuryorg-archive-keyring.gpg # in the package, and below /
 SURY_TMP=$(mktemp -d)
 hide_output curl -fsSLo "$SURY_TMP/keyring.deb" https://packages.sury.org/debsuryorg-archive-keyring.deb
 dpkg-deb -x "$SURY_TMP/keyring.deb" "$SURY_TMP/x"
-if [ "$(GNUPGHOME="$SURY_TMP" gpg --show-keys --with-colons "$SURY_TMP/x/usr/share/keyrings/debsuryorg-archive-keyring.gpg" 2>/dev/null \
+# The key file is a regular file in the package today (2025.11.18), but a
+# later version may make it a symbolic link to the real file, as Debian's own
+# keyrings do since 2025 (.gpg to .pgp). Links on the way are followed inside
+# the unpacked package only, as if it were /, where dpkg would install it (an
+# absolute target and ".." stay inside it), at most 10 of them (B158).
+SURY_X=$(realpath -e -- "$SURY_TMP/x")
+SURY_KEY=$(python3 -I - "$SURY_X" "$SURY_KEYRING" <<'PY' || true
+import os, sys
+root, todo, cur, links = sys.argv[1], [p for p in sys.argv[2].split("/") if p], [], 0
+while todo:
+    name = todo.pop(0)
+    if name == ".":
+        continue
+    if name == "..":
+        cur = cur[:-1]
+        continue
+    path = os.path.join(root, *cur, name)
+    if os.path.islink(path):
+        links += 1
+        if links > 10:
+            sys.exit(1)
+        target = os.readlink(path)
+        if target.startswith("/"):
+            cur = []
+        todo = [p for p in target.split("/") if p] + todo
+        continue
+    cur.append(name)
+print(os.path.join(root, *cur))
+PY
+)
+if [ -z "$SURY_KEY" ] || [[ $SURY_KEY != "$SURY_X"/* ]] || [ -L "$SURY_KEY" ] || [ ! -f "$SURY_KEY" ] \
+	|| [ "$(GNUPGHOME="$SURY_TMP" gpg --show-keys --with-colons "$SURY_KEY" 2>/dev/null \
 	| awk -F: '$1=="pub"{p=1;next} p&&$1=="fpr"{print $10;p=0}')" != "$SURY_KEY_FPR" ]; then
 	echo "The deb.sury.org keyring package does not contain exactly the expected key $SURY_KEY_FPR."
 	exit 1
 fi
-hide_output dpkg -i "$SURY_TMP/keyring.deb"
+# Only the key file that was checked above is installed, not the package:
+# dpkg -i also ran the package's maintainer scripts as root and installed its
+# other files, none of which had been checked (B158). The package that
+# earlier versions installed owns the same path; it is purged first (which
+# also removes its copy of the key in /etc/apt/trusted.gpg.d/), so that the
+# file is setup's own. The path in php.list's signed-by stays the same.
+if dpkg-query -W -f='${db:Status-Abbrev}' debsuryorg-archive-keyring 2> /dev/null | grep -q '^[ihr][iUFHWt]'; then
+	apt_get_quiet purge debsuryorg-archive-keyring
+fi
+if ! cmp -s "$SURY_KEY" "/$SURY_KEYRING"; then
+	install -m 644 "$SURY_KEY" "/$SURY_KEYRING"
+fi
 rm -rf "$SURY_TMP"
-# The keyring package also installs the key into /etc/apt/trusted.gpg.d/, which
+# The keyring package installed the key into /etc/apt/trusted.gpg.d/ too, which
 # makes APT trust it for every source (incl. the Ubuntu archive). We only use it
-# via signed-by=. dpkg does not restore a deleted conffile on reinstall.
+# via signed-by=. (A box whose package was removed before setup ran.)
 rm -f /etc/apt/trusted.gpg.d/debsuryorg-archive.gpg
 echo "deb [signed-by=/usr/share/keyrings/debsuryorg-archive-keyring.gpg] https://packages.sury.org/php/ $(lsb_release -sc) main" > /etc/apt/sources.list.d/php.list
 cat > /etc/apt/preferences.d/mailinabox-sury-php << EOF;

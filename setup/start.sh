@@ -9,6 +9,44 @@ source setup/functions.sh # load our functions
 # If not, this shows an error and exits.
 source setup/preflight.sh
 
+# Setup gives owner and mode to these paths in STORAGE_ROOT (and reads or
+# writes mailinabox.version) only through descriptors, and refuses a path
+# that is a symbolic link or anything but a directory or regular file, or a
+# database with a second hard link: another account (www-data, the storage
+# user) could have put it there (B147). Checked here first, with the same
+# rules (tools/write_conf.py --check-own), so that such a box stops before
+# setup has changed anything, not in the middle of the run; the checks at
+# those places stay. STORAGE_ROOT as questions.sh takes it below (the
+# environment, /etc/mailinabox.conf, /home/user-data).
+pf_conf() { { sed -n "s/^$1=//p" /etc/mailinabox.conf 2> /dev/null || true; } | tail -n 1; }
+pf_root=${STORAGE_ROOT:-$(pf_conf STORAGE_ROOT)}
+pf_user=${STORAGE_USER:-$(pf_conf STORAGE_USER)}
+pf_root=${pf_root:-/home/${pf_user:-user-data}}
+pf_problems=$(tools/write_conf.py --check-own "$pf_root/mail" "$pf_root/mail/users.sqlite" \
+	"$pf_root/mail/roundcube/roundcube.sqlite" "$pf_root/mail/postgrey" "$pf_root/mail/postgrey/db" \
+	"$pf_root/mail/dkim" "$pf_root/mail/spamassassin" 2>&1 || true)
+if [ -L "$pf_root/mailinabox.version" ] || { [ -e "$pf_root/mailinabox.version" ] && [ ! -f "$pf_root/mailinabox.version" ]; }; then
+	pf_problems+="${pf_problems:+$'\n'}$pf_root/mailinabox.version is not a regular file"
+fi
+if [ -n "$pf_problems" ]; then
+	echo
+	echo "Setup stopped before it changed anything. It no longer follows a symbolic"
+	echo "link, or changes a database with a second hard link, in these places, as"
+	echo "another account could have put them there (B147):"
+	echo
+	echo "  ${pf_problems//$'\n'/$'\n'  }"
+	echo
+	echo "* A symbolic link, e.g. $pf_root/mail moved to another disk: put the directory"
+	echo "  back, or mount the other disk there with a bind mount instead of the link."
+	echo "* A second hard link of users.sqlite or roundcube.sqlite: find its other name with"
+	echo "  \"find / -xdev -samefile FILE\" and remove that name, unless you made it on"
+	echo "  purpose (the account www-data can make such a link)."
+	echo "* mailinabox.version must be a regular file with the number of the last migration."
+	echo
+	echo "Then run setup again."
+	exit 1
+fi
+
 # No cron jobs while setup runs: they would run against half-configured
 # services (Nextcloud's cron.php during its upgrade steps, Munin during its
 # installation), and their mail to root bounces until setup has written the
@@ -50,6 +88,9 @@ if [ -n "$SETUP_STOPPED_CRON" ] && [ "$(systemctl is-enabled cron.service 2> /de
 fi
 function setup_ended {
 	local rc=$?
+	# PHP-FPM that setup/nextcloud.sh stopped for a Nextcloud upgrade, when the
+	# run ended before PHP-FPM's restart after zpush.sh (B149).
+	start_stopped_php_fpm
 	if [ -n "$SETUP_MASKED_CRON" ]; then
 		systemctl unmask --runtime --quiet cron.service 2> /dev/null || true
 		rm -f "$SETUP_CRON_MASK_MARKER"
@@ -114,10 +155,12 @@ source setup/questions.sh
 # Run some network checks to make sure setup on this machine makes sense.
 # Skip on existing installs since we don't want this to block the ability to
 # upgrade, and these checks are also in the control panel status checks.
-if [ -z "${DEFAULT_PRIMARY_HOSTNAME:-}" ]; then
-if [ -z "${SKIP_NETWORK_CHECKS:-}" ]; then
+# A first install is one without /etc/mailinabox.conf (see above). The test
+# was for an empty DEFAULT_PRIMARY_HOSTNAME, which questions.sh sets on a
+# first interactive install (the suggested hostname), so only installs with
+# PRIMARY_HOSTNAME in the environment ran the checks (B146).
+if [ -n "${FIRST_TIME_SETUP:-}" ] && [ -z "${SKIP_NETWORK_CHECKS:-}" ]; then
 	source setup/network-checks.sh
-fi
 fi
 
 # Create the STORAGE_USER and STORAGE_ROOT directory if they don't already exist.
@@ -137,9 +180,11 @@ if [ ! -d "$STORAGE_ROOT" ]; then
 fi
 f=$STORAGE_ROOT
 while [[ $f != / ]]; do chmod a+rx "$f"; f=$(dirname "$f"); done;
+# The storage user may write in STORAGE_ROOT (its home), so the file is
+# written and given to it without following a symbolic link there (B147).
 if [ ! -f "$STORAGE_ROOT/mailinabox.version" ]; then
-	setup/migrate.py --current > "$STORAGE_ROOT/mailinabox.version"
-	chown "$STORAGE_USER:$STORAGE_USER" "$STORAGE_ROOT/mailinabox.version"
+	setup/migrate.py --current | tools/write_conf.py "$STORAGE_ROOT/mailinabox.version" 644
+	tools/write_conf.py --own "$STORAGE_ROOT/mailinabox.version" "$STORAGE_USER" "$STORAGE_USER" 644
 fi
 
 # Save the global options in /etc/mailinabox.conf so that standalone
@@ -196,16 +241,27 @@ source setup/management.sh
 source setup/munin.sh
 
 # Wait for the management daemon to start...
-until nc -z -w 4 127.0.0.1 10222
+# (nc of Ubuntu 26.04 prints "Connection to ... succeeded!" for -z, B174.)
+until nc -z -w 4 127.0.0.1 10222 > /dev/null 2>&1
 do
 	echo "Waiting for the Mail-in-a-Box management daemon to start..."
 	sleep 2
 done
 
 # ...and then have it write the DNS and nginx configuration files and start those
-# services.
-tools/dns_update
-tools/web_update
+# services. Both tools fail on an HTTP error of the daemon (B159): setup then
+# stops here with a clear message, after trying both. No service is stopped at
+# this point (PHP-FPM was started again above), so mail keeps running.
+setup_update_failed=
+tools/dns_update || setup_update_failed+="the DNS zones (tools/dns_update), "
+tools/web_update || setup_update_failed+="the web configuration (tools/web_update), "
+if [ -n "$setup_update_failed" ]; then
+	echo
+	echo "Setup stopped: the management daemon could not update ${setup_update_failed%, }."
+	echo "Its answer is above. Mail and the web server keep running. Fix the cause and run"
+	echo "setup again (sudo mailinabox)."
+	exit 1
+fi
 
 # Write the adaptive fail2ban configuration (repeat offenders get longer bans,
 # slow jails, allowlist) from the "fail2ban" settings in settings.yaml. It is
@@ -226,6 +282,16 @@ elif [ "$f2b_setup_rc" = 0 ]; then
 else
 	exit "$f2b_setup_rc"
 fi
+
+# Nextcloud's own brute-force throttle: the settings nc_protection,
+# nc_max_attempts and nc_allowlist of the same "fail2ban" settings go into
+# Nextcloud's config.php and its bypass list (management/nextcloud_throttle.py;
+# needs the management venv, so it runs here and not in nextcloud.sh). While
+# the settings have no value of their own for it, values set in config.php by
+# hand are taken over into them. It never stops setup: on a problem it prints
+# a warning and Nextcloud keeps its settings.
+management/nextcloud_throttle.py --setup \
+	|| echo "Nextcloud's brute-force settings were not applied (management/nextcloud_throttle.py --setup failed); setup goes on."
 
 # If there aren't any mail users yet, create one.
 source setup/firstuser.sh

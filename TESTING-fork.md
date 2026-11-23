@@ -7,7 +7,10 @@ fixed bugs in [BUGS-fork.md](BUGS-fork.md).
 
 The fork's first release is v78-r2604.0; v78-r2604.1 is a bug-fix release
 of the control panel's login, tested without the full set of scenarios
-(see "v78-r2604.1"). The tests below are a small, fixed set of scenarios
+(see "v78-r2604.1"); v78-r2604.2 is a bug-fix release tested with T1, T1n,
+T2, T4 and T5b, the last three from upstream's v78 or the previous release
+(see "v78-r2604.2"); v78-r2604.3 and v78-r2604.4 are small releases tested
+with T1 and T5b (see there). The tests below are a small, fixed set of scenarios
 on test machines, not a test of every setup that exists.
 Make a backup and try a release on a copy before you run it on the box that
 holds your mail.
@@ -65,6 +68,7 @@ compares against after a migration or upgrade.
 | T4 | the 22.04 test VM | in place, 22.04 → 24.04 → 26.04, two release upgrades | `curl …/tools/upgrade-in-place-to-2604.sh \| sudo bash -s -- --yes` | migrated |
 | T5 | the 24.04 test VM after an in-place upgrade with rc3 | update of a box that already runs the fork | `git remote set-url` to GitHub, then `sudo bash -c "$(curl -fsSL …/setup/bootstrap.sh)"`; the setup dialogs answered with Enter | migrated |
 | T6 | a box on the Internet (public DNS, open port 25), before a final release | fresh install, then an update of it | as T1, then as T5; `tools/update-check.sh` around the update, `mailcheck` with a real external probe address | fresh |
+| T1n | the installed T1 box (from v78-r2604.2) | setup's network checks, `setup/network-checks.sh` of the release before and of the release under test, each under setup's shell options (`set -euo pipefail`) | the script run on the box through its own resolver; cases: not listed, a listed hostname, a listed IP address, a public resolver, a failing resolver | none |
 
 Variants: **T3b** is a clean T3 run from the tag after a first run had found
 bugs. **T3c** and **T4b** repeat T3 and T4 with the automatic tmux of rc4;
@@ -260,6 +264,18 @@ report. The groups:
   `management/daemon.py` is documented and every documented operation has a
   route, that `smoke.py` calls or excludes each of them, and the content
   types it expects.
+  `tests/fork/ban-reasons.py` (v78-r2604.4; no box needed) checks that the
+  reasons of bans in System > Intrusion Protection show no user name that
+  is not an account of the box: the log lines of each jail's filter, also
+  with names that the line repeats or that have spaces, and lines of
+  Nextcloud's log that are not valid JSON, and long lines that must not
+  take long. `tests/fork/nextcloud-throttle.py` (v78-r2604.4; no box
+  needed) checks the reader of Nextcloud's throttle on a temporary
+  database (no account of the box goes to it, no login name comes back),
+  the stale failures with the protection off, and the takeover of values
+  set in config.php by hand, per value. Group admin runs both
+  (`admin-ban-reasons-masking`, `admin-nextcloud-throttle-unit`), so a
+  certification run includes them.
 * **dns**: DNSSEC (RRSIG, DNSKEY), MX and DKIM for each zone, SSHFP against the
   host keys sshd serves, custom records.
 * **web**: Nextcloud version, CalDAV, CardDAV and WebDAV with the mail
@@ -357,6 +373,9 @@ the in-place tool reports it.
 | rc7 | 2026-10-25 | 68/68 ³ | 79/79 ³ | 79/79 ³ | 79/79 ³ | 79/79 (T5b from rc6), 71/71 (from rc3) ³ |
 | v78-r2604.0 | 2026-10-27 | 80/80 ⁴ | 91/91 ⁴ | 91/91 ⁴ | 91/91 ⁴ | 92/92 (T5b from rc6 through rc7), 91/91 (from rc6) ⁴ |
 | v78-r2604.1 | 2026-10-27 | not run ⁵ | not run | not run | not run | not run ⁵ |
+| v78-r2604.2 | 2026-11-15 | 70/70 twice ⁶ | 81/81 (from v78) ⁶ | not run | 81/81 (from v78) ⁶ | 80/81 (T5b from v78-r2604.1) ⁶ |
+| v78-r2604.3 | 2026-11-16 | 71/71, 72/72 ⁷ | not run | not run | not run | 81/82, 82/83 (T5b from v78-r2604.2) ⁷ |
+| v78-r2604.4 | 2026-11-19 | 84/84 twice ⁸ | not run | not run | not run | 94/94, 95/95 (T5b from v78-r2604.3) ⁸ |
 
 ¹ Certification run at `33f056b`, before the last fixes of rc6 (B80-B85);
 not repeated on the code of the release (see "rc6 certification" below).
@@ -391,10 +410,39 @@ B135 to B139.
 panel (62/62) and the smoke test's API group (6/6) on a test box at the
 branch (see "v78-r2604.1" below).
 
+⁶ Runs of the branch before the release commit, from the lab's mirror (see
+"v78-r2604.2" below): T1 at `b7bdae7` and again at `e63ffe1` with setup's
+network checks; T2 at `e63ffe1`; T4 with the in-place tool of `8f0f910`
+(the same as in `e63ffe1`) and setup at `e63ffe1`; T5b's update at
+`b7bdae7`, its second and third setup runs at `e63ffe1`. T2 and T4 started
+from upstream's v78 on 22.04, not from v74. T5b's one FAIL is the test's
+own: its preparation had moved one of alice's mails to Spam and back,
+which gives the mail a new UID and so a new POP3 UIDL (see the
+counter-check below). After `e63ffe1` only the version strings,
+`tools/expected-changes/`, the log audit's list and the documentation
+changed.
+
+⁷ Runs of the branch before the release commit, from the lab's mirror (see
+"v78-r2604.3" below): T1 and T5b at `0d5d0f9` (the post-quantum change),
+then again at `2a4024d` (with B175; T1's second setup run at `7c00f91`).
+T5b's one FAIL in both runs is the test artefact of v78-r2604.2: it fails
+the same way on the snapshot before any update (see the counter-check).
+After `2a4024d` only the clean-up of two admin checks of the smoke test
+after a failure, the version strings, `tools/expected-changes/` and the
+documentation changed.
+
+⁸ Runs of the branch before the release commit, from the lab's mirror (see
+"v78-r2604.4" below): T1 at `d80a036` (install and a second setup run),
+T5b at `e3df071` and again, from the same snapshot, at `f6e7f8b`. After
+`f6e7f8b` only the log audit's list (`d80a036`), the version strings,
+`tools/expected-changes/` and the documentation changed; T5b's log audit
+was repeated with the list of `d80a036`.
+
 Every FAIL in this table is one of the known differences below, except one
-Nextcloud lock in rc4 T5 (see there) and the first runs of rc6 T3 and T5b,
+Nextcloud lock in rc4 T5 (see there), the first runs of rc6 T3 and T5b,
 where the stricter comparison of rc6 found mails left in the snapshot (see
-there).
+there), and T5b of v78-r2604.2 and v78-r2604.3, where the test's preparation
+had moved a mail (see there).
 
 ### rc1 and rc2 (2026-10-23)
 
@@ -1031,6 +1079,110 @@ the Python function behind `/me` in `management/daemon.py` (a rename of
 the review, no change in behavior; checked with `py_compile` only) and the
 documentation.
 
+### v78-r2604.2 (2026-11-15)
+
+A bug-fix release (B144 to B174). The runs installed or updated the branch
+`fix/r2604.2` from the lab's mirror of the repository (`SOURCE` and `TAG`
+set to it), on one hypervisor; the commits are in the table and in note ⁶
+of the results. T2 and T4 started from upstream's v78 on Ubuntu 22.04: the
+22.04 test VM with its test data, updated from v74 to v78 by v78's own
+`setup/bootstrap.sh` (exit 0, "Your Mail-in-a-Box is running.", Nextcloud
+27.1.11). T3 and T6 did not run. The peer for port 25, the probe address
+of `mailcheck` and the rsync target of `backup` was the second test box.
+
+| Run | Result |
+|---|---|
+| T1 (fresh 26.04, `b7bdae7`, `SKIP_NETWORK_CHECKS=1`) | install exit 0 in 1289 s; smoke 70/70; a second setup run at `9ba5f2b` exit 0 in 82 s, which changed nothing but the usual restarts. Checked: the component versions, the owners and modes of B147, the sury key without its package (B158), no leftover Roundcube directory (B157), no folder "spamassassin" after the smoke test's Spam moves (B155), Roundcube's `des_key` unchanged by the second run (B172). Roundcube's CardDAV sync fails in the lab on the box's self-signed certificate (cURL error 60); with that certificate trusted on the box, the address book synced, with no permission error in Roundcube's logs. Log audit: 0 unknown |
+| T1 repeated (fresh 26.04, `e63ffe1`, with setup's network checks) | install exit 0 in 1479 s, with "Your Mail-in-a-Box is running."; the network checks run before setup installs its own resolver, so they asked the lab's public resolvers, Spamhaus refused them, and setup printed its two "could not check" notes and went on; no "Connection to ... succeeded!" line (B174); setup's start check (B147) did not stop the fresh box nor the second run; smoke 70/70; a second setup run exit 0 in 75 s, with the same `des_key`. Log audit: 0 unknown |
+| T1n (on T1's box, `setup/network-checks.sh` of v78-r2604.1 and of `b7bdae7` under `set -euo pipefail`, through the box's own resolver) | not listed (NXDOMAIN): the old script ended with exit 1 and no output (B145 reproduced), the new one went on; a listed hostname and a listed IP address: both stop, the old one for the IP address without a message, the new one with Spamhaus' message; a public resolver that Spamhaus refuses: both go on; a resolver that does not answer: both stop, the new one with the port 25 message, the old one without a message |
+| T2 (v78 on 22.04 → fresh 26.04, `e63ffe1`, `--from` an IPv6 address) | `--check` "No blockers found", its rsync probe over IPv6 worked (B167); Spamhaus through a public resolver and with port 53 blocked: "could not check", never "not listed" (B165); the migration exit 0 in 45 min, "All checks passed. The migration is finished."; mail offline 44 min 45 s; setup upgraded Nextcloud from 27.1.11 in 7 steps (2658 s); no `.rsync-partial` left (B164); `--check-old`: nothing of the old box started again. Smoke 81/81. Log audit of the new box: 1 unknown class, ssh's note in the migration log that it recorded the old box's host key (now in the list); of the old box: 0 unknown |
+| T4 (v78 on 22.04 → 24.04 → 26.04 in place, tool of `8f0f910`, setup at `e63ffe1`) | "All checks passed. The upgrade is finished."; mail offline 1 h 54 min, 3 reboots (prepare-release needed one for a kernel update); `PROBE_ADDRESS` given in the environment was in `/etc/mailinabox.conf` after the reboots (B153); the watcher of the SSH server used `sshd`'s port: port 22 down 24 min, the fallback on 1022 opened and closed again, nothing of it left (B162). Smoke 81/81. Log audit: 19 unknown classes, all of the lab VM's boot (QEMU of the host, 4 CPUs) or harmless lines of the release upgrades from 22.04 that the list missed (now in the list; see CHANGELOG-fork.md) |
+| T5b (the copy of the production box, updated to the published v78-r2604.1 → `b7bdae7`, then `e63ffe1`) | `update-check.sh before` and `backup` with the tool of v78-r2604.1 exit 0; the update in a pty, the dialogs answered with Enter, exit 0 in 160 s; `after`: 12 expected changes and 1 unexpected, the lab's origin in the version line (the update came from the lab's mirror); `mailcheck` OK. Smoke 80/81: `mig-pop3-uidl-alice` failed because the test's preparation had moved one of alice's mails to Spam and back (to create the folder of B155) after the manifest was written; counter-check: only that mail's UIDL differs, its new UID has the same UIDVALIDITY, Message-ID and Maildir file, the other 5 seeded mails match. Setup removed alice's folder "spamassassin" ("from 1 mailboxes", B155), and the smoke test's Spam moves created none; `des_key` identical in all 6 records (B172); owners and modes (B147); the sury key (B158); no leftover directories (B157); PHP-FPM active after every run (B149); `tools/dns_update` and `tools/web_update` exit 0 (B159); `management/backup.py` exit 0 and every service running afterwards (B148, success path only). A second and a third setup run at `e63ffe1` exit 0 in 85 and 78 s, which changed nothing but the nightly cron minute (B108). Log audit from the update to the backup, against the baseline of v78-r2604.1: 0 unknown |
+
+Not tested in this release: T3 (in place from 24.04) and T6 (a box on the
+Internet); the failure paths of B148, B151, B156, B160, B161, B168 and
+B169 (the runs took the normal path of each); Roundcube's CardDAV sync
+with a certificate that a client trusts by itself (only with the lab's
+certificate added on T1's box); and the release commit itself, which
+after `e63ffe1` changes only the version strings, `tools/expected-changes/`,
+the log audit's list and the documentation. In the lab, the test machines
+with an IPv6 address could reach port 25 on the Internet over IPv6 (the
+status check "Outbound mail (SMTP port 25) is not blocked" passed through
+it; the tests sent no mail there).
+
+### v78-r2604.3 (2026-11-16)
+
+A small release: the post-quantum key exchange in Postfix and B175. The
+runs installed or updated the branch `fix/r2604.3` from the lab's mirror
+of the repository (`SOURCE` and `TAG` set to it), on one hypervisor; the
+commits are in the table and in note ⁷ of the results. T2, T3, T4 and T6
+did not run: the release changes two Postfix parameters, the control
+panel's login and the smoke test, not the migration or in-place tools.
+The peer for port 25, the probe address of `mailcheck` and the rsync
+target of `backup` was the second test box; it has no post-quantum group
+in Postfix.
+
+| Run | Result |
+|---|---|
+| T1 (fresh 26.04, `0d5d0f9`) | install exit 0 in 1268 s; smoke 71/71, among them `tls-key-exchange`: X25519MLKEM768, X25519 only, P-256 only and TLS 1.2 on ports 443, 993, 465, 587 and 25; `tls_eecdh_auto_curves` and `tls_ffdhe_auto_groups` empty and once each in main.cf, `postconf` without warnings; log audit 0 unknown classes; a second setup run exit 0. |
+| T1 repeated (fresh 26.04, `2a4024d`, with setup's network checks) | install exit 0 in 1212 s with "Your Mail-in-a-Box is running." and setup's two "could not check" notes for Spamhaus; smoke 72/72, among them `admin-login-non-ascii` (a test user with umlauts in its password logs in to the control panel with the Authorization header in UTF-8 and in Latin-1, a wrong password with an umlaut is refused as wrong, and after a change to a password with '€' it logs in to the panel and by IMAP AUTHENTICATE PLAIN) and `tls-key-exchange`; the test passwords are nowhere in the smoke output; log audit 0 unknown classes; a second setup run at `7c00f91` exit 0 in 99 s, which did not rewrite main.cf, restart Postfix or change Roundcube's des_key. |
+| T5b (the copy of the production box at v78-r2604.2, updated to `0d5d0f9`) | `update-check.sh before` and `backup` exit 0; the update non-interactive, exit 0 in 107 s; `after`: 7 expected changes and 1 unexpected, the lab's origin in the version line; `mailcheck` OK. Before the update the post-quantum handshakes on 465, 587 and 25 failed, after it all five ports negotiated X25519MLKEM768, and X25519, P-256 and TLS 1.2 still worked. Postfix as client to the peer: TLS 1.3 with X25519, one ServerHello, no HelloRetryRequest; its ClientHello grew from 508 to 1527 bytes (key shares for X25519MLKEM768 and X25519). Smoke 81/82: the FAIL is `mig-pop3-uidl-alice` (see the counter-check). |
+| T5b repeated (the copy at the published v78-r2604.2, rebuilt from GitHub, updated to `2a4024d`) | `before` and `backup` exit 0; the update exit 0 in 114 s, without dialogs; `after`: 7 expected, 1 unexpected (the lab's origin); in /etc only main.cf (the two parameters) and the minute of the nightly job changed; `mailcheck` OK; log audit 0 unknown classes. Before the update `admin-login-non-ascii` failed with "'ascii' codec can't decode byte ..." (B175 reproduced), after it passed; FFDHE, DHE and CBC ciphers on port 25 still worked. Smoke 82/83: the FAIL is again `mig-pop3-uidl-alice`. |
+| Counter-check of `mig-pop3-uidl-alice` | It fails the same way on the snapshot (v78-r2604.1) and on the rebuilt v78-r2604.2, before any update. The lab's preparation had moved one of alice's seeded mails to Spam and back (its IMAP session in mail.log, the file's new name in `dovecot-uidlist`), so the mail has UID 12 instead of 9, with the same Message-ID and Dovecot GUID, and so a new POP3 UIDL. With the lab's manifest corrected for that VM, `--only migrated` on a new snapshot of v78-r2604.2 passed 14/14; that snapshot is the start of later T5b runs. |
+
+Not tested in this release: T2, T3, T4 and T6; Postfix's SMTP client
+against a server that offers X25519MLKEM768 on the Internet (only against
+the lab's peer without it, and against itself); the control panel's login
+in a browser (only the smoke test's requests; the panel's new UTF-8
+encoding of the credentials was compared with base64 of the UTF-8 bytes in
+Node); `tools/update-check.sh` does not record the two Postfix parameters,
+so its list of changes does not show the post-quantum change (see Planned
+in CHANGELOG-fork.md); and the release commit itself, which after
+`7c00f91` changes only the version strings, `tools/expected-changes/` and
+the documentation.
+
+### v78-r2604.4 (2026-11-19)
+
+A small release: the reasons of bans, Nextcloud's throttle and the jails'
+thresholds in the control panel, B176 (the pinned Nextcloud apps on an
+existing box, calendar 6.6.6) and B177 (the backup copies of Nextcloud
+root-only). The runs installed or updated the branch `fix/r2604.4` from
+the lab's mirror of the repository, on one hypervisor; the commits are in
+the table and in note ⁸ of the results. T2, T3, T4 and T6 did not run: the
+release changes the control panel, Nextcloud's part of setup and the smoke
+test, not the migration or in-place tools. The peer for port 25, the probe
+address of `mailcheck` and the rsync target of `backup` was the second
+test box.
+
+The lab's names stopped resolving on the Internet during the runs (they
+had relied on a public wildcard record that was removed); Postfix then
+refused the lab's mail with "Sender address rejected: Domain not found".
+Each test box and the peer got forward zones for the other boxes' names in
+their local resolver (bind, with `validate-except` for these zones, which
+the boxes sign without a DS record above them), set after each rollback
+and kept by setup. A first `mailcheck` of T5b at `e3df071` failed that way
+before the change, and the same `mailcheck` failed the same way on the
+snapshot before any update; after the change it passed on the snapshot and
+after the update.
+
+| Run | Result |
+|---|---|
+| T1 (fresh 26.04, `08d7ff3`) | stopped with exit 100 in `apt-get install` of OpenDKIM: the Ubuntu archive did not answer at that time (from the test box, the hypervisor and another machine alike); not a result of the release. |
+| T1 repeated (fresh 26.04, `d80a036`, with setup's network checks) | install exit 0 in 1108 s with "Your Mail-in-a-Box is running."; post-quantum key exchange in Postfix as in v78-r2604.3; calendar 6.6.6 and the other pinned versions; `owncloud-backup` 0700 root; smoke 84/84, among them all new checks (`admin-fail2ban-jail-values`, `admin-fail2ban-ban-reason`, `admin-ban-reasons-masking` with its 34 cases, `admin-nextcloud-throttle`, `-throttle-settings`, `-bypass-allowlist`, `-protection-off`, `-hand-set`, `-setup-no-drift`, `-app-versions`, `-backup-private`, `-throttle-unit`); log audit 0 unknown classes. A second setup run exit 0 in 94 s changed no Nextcloud app, made no backup, left the brute-force settings, fail2ban and Postfix alone; smoke again 84/84, log audit 0 unknown. (A smoke run in between used the smoke test of an older release by a mistake in the test script and does not count.) |
+| T5b (the copy of the production box at v78-r2604.3, updated to `e3df071`) | `update-check.sh before` and `backup` exit 0; the update non-interactive, exit 0 in 189 s; `after`: 7 expected changes and 1 unexpected, the lab's origin in the version line; smoke 94/94. Setup updated calendar 6.6.5 to 6.6.6 (files, Nextcloud's app list, no upgrade pending), set `owncloud-backup` from 0755 to 0700 and made a backup whose database copy passed `PRAGMA integrity_check` and held the state before the upgrade; Nextcloud's brute-force settings, its bypass list, fail2ban's settings and all jails unchanged; second runs of the settings' setup steps changed nothing. The log audit found the new audit lines of the control panel and the failed logins of the new throttle checks without a rule in its list (fixed in `d80a036`); `mailcheck` failed because of the lab's names (see above). |
+| T5b repeated (the same snapshot, updated to `f6e7f8b`) | after the resolver change: `mailcheck` on the snapshot OK; the update exit 0 in 85 s, without dialogs; `after`: 7 expected, 1 unexpected (the lab's origin); `mailcheck` OK; smoke 95/95; the same checks of the release as above passed; the TLS matrix and Postfix's TLS as a client the same before and after. Log audit with the list of `f6e7f8b`: the 5 classes above, with the list of `d80a036`: 0 unknown. |
+
+Not tested in this release: T2, T3, T4 and T6; the opt-in smoke group
+fail2ban (its new check of the reason of a real ban); the database copy of
+the app update with a large Nextcloud database (only with the small
+databases of the test boxes); the failure paths of the app update (a failed download, a failed
+`occ upgrade`, a symbolic link in place of `owncloud-backup`) only on a
+test box during development, not in these runs; the control panel's page
+only in a headless browser at an earlier commit of the branch, and through
+the API in the runs; and the release commit itself, which after `d80a036`
+changes only the version strings, `tools/expected-changes/` and the
+documentation.
+
 ### Production use
 
 rc3 was used to upgrade a production box in place: Ubuntu 24.04 (release-
@@ -1194,6 +1346,17 @@ does not make a new one.
 
 ## Not tested
 
+* **Setup's network checks under setup's shell options, up to
+  v78-r2604.1.** T1 ran setup with `SKIP_NETWORK_CHECKS=1` in every
+  release up to v78-r2604.0 (v78-r2604.1 had no test matrix), and so did
+  T6 of v78-r2604.0 after its first install had stopped (B136). The repeated T6 ran the checks, but through
+  a public resolver that Spamhaus refuses (127.255.255.254, for which
+  `host` exits 0). So `setup/network-checks.sh` never took its "not
+  listed" path (NXDOMAIN, for which `host` exits 1) under setup's
+  `set -euo pipefail`, and B145, which stops such an install without a
+  message, shipped that way in v78-r2604.0 and v78-r2604.1. From
+  v78-r2604.2 on, T1n runs the checks on the installed T1 box through its
+  own resolver (see "Scenarios").
 * **Interactive first install** with `sudo bash -c "$(curl …)"` on 26.04. The
   fresh installs ran non-interactively as root; the `sudo bash -c` form was
   tested for updating an existing box.

@@ -1059,6 +1059,18 @@ def remove_test_mailbox(ctx, email):
     return "archived mailbox removed"
 
 
+def remove_test_user(ctx, email):
+    # Remove a test user of this run and then its archived mailbox. Meant for a finally block, so that a check
+    # that fails half-way leaves neither behind; it raises nothing of its own and returns (error, note).
+    r = admin_api(ctx, "POST", "mail/users/remove", form={"email": email})
+    if r.status != 200:
+        return "users/remove HTTP %d %s" % (r.status, r.text()[:200]), None
+    try:
+        return None, remove_test_mailbox(ctx, email)
+    except Fail as e:
+        return str(e), None
+
+
 # ---------------------------------------------------------------------------
 # checks: logins
 # ---------------------------------------------------------------------------
@@ -1105,6 +1117,71 @@ def c_sieve_login(ctx):
         ms.logout()
     ctx.alice_scripts = scripts
     return "login ok, scripts: %s" % (", ".join("%s%s" % (n, "*" if a else "") for n, a in scripts) or "none")
+
+
+# Key exchange (v78-r2604.3): each TLS service offers the hybrid post-quantum
+# group X25519MLKEM768 and still serves clients without it: X25519 only, P-256
+# only, and TLS 1.2. Postfix gets the group from OpenSSL's defaults once
+# tls_eecdh_auto_curves and tls_ffdhe_auto_groups are empty
+# (setup/mail-postfix.sh); nginx and Dovecot use those defaults anyway. The
+# handshakes use openssl s_client of the machine that runs this test (OpenSSL
+# 3.5 or later). Dovecot is checked on 993 only: its TLS settings are the same
+# for 995 and 4190, and each handshake without a login is a "no auth attempts"
+# line that the dovecot jail counts.
+TLS_KEX_PORTS = [(443, None), (993, None), (465, None), (587, "smtp"), (25, "smtp")]
+TLS_KEX_CASES = [
+    # name, extra s_client arguments, protocol, key exchange (None: any)
+    ("pq", ["-groups", "X25519MLKEM768"], "TLSv1.3", "X25519MLKEM768"),
+    ("x25519", ["-groups", "X25519"], "TLSv1.3", "X25519"),
+    ("p256", ["-groups", "P-256"], "TLSv1.3", "prime256v1"),
+    ("tls12", ["-tls1_2"], "TLSv1.2", None),
+]
+
+
+def tls_handshake(ctx, port, starttls, args):
+    h, p = ctx.net.addr(port)
+    argv = ["openssl", "s_client", "-connect", "%s:%d" % (h, p), "-servername", ctx.hostname] + args
+    if starttls:
+        argv += ["-starttls", starttls]
+    r = subprocess.run(argv, input=b"Q\n", stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=40)
+    out = r.stdout.decode(errors="replace")
+    m = re.search(r"^New, (\S+), Cipher is (\S+)", out, re.M)
+    proto = m.group(1).rstrip(",") if m else None
+    if proto == "(NONE)":
+        proto = None
+    kex = None
+    g = re.search(r"^Negotiated TLS1\.3 group: (\S+)", out, re.M)
+    if g and g.group(1) != "<NULL>":
+        kex = g.group(1)
+    else:
+        t = re.search(r"^(?:Peer|Server) Temp Key: ([^,\n]+)(?:, ([^,\n]+))?", out, re.M)
+        if t:
+            kex = t.group(2) if t.group(1) == "ECDH" and t.group(2) else t.group(1)
+    return proto, kex
+
+
+def c_tls_key_exchange(ctx):
+    try:
+        v = subprocess.run(["openssl", "version"], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                           timeout=10).stdout.decode(errors="replace").strip()
+    except OSError:
+        raise Skip("no openssl on the machine that runs this test")
+    m = re.match(r"OpenSSL (\d+)\.(\d+)", v)
+    if not m or (int(m.group(1)), int(m.group(2))) < (3, 5):
+        raise Skip("openssl here has no X25519MLKEM768 (needs OpenSSL 3.5): %s" % v)
+    bad, parts = [], []
+    for port, starttls in TLS_KEX_PORTS:
+        got = []
+        for name, args, want_proto, want_kex in TLS_KEX_CASES:
+            proto, kex = tls_handshake(ctx, port, starttls, args)
+            got.append("%s=%s/%s" % (name, proto or "-", kex or "-"))
+            if proto != want_proto or (want_kex and kex != want_kex):
+                bad.append("%d %s: %s %s, want %s %s" % (port, name, proto or "no handshake", kex or "-",
+                                                        want_proto, want_kex or "(any)"))
+        parts.append("%d %s" % (port, " ".join(got)))
+    if bad:
+        raise Fail("; ".join(bad))
+    return "X25519MLKEM768 offered, X25519/P-256/TLS 1.2 still served: " + " | ".join(parts)
 
 
 # The services of Mail-in-a-Box must be enabled, or they do not start after a
@@ -1479,10 +1556,71 @@ def c_admin_tmp_user_alias(ctx):
         if r.status != 200:
             raise Fail("aliases/remove HTTP %d" % r.status)
     finally:
-        r = admin_api(ctx, "POST", "mail/users/remove", form={"email": tmp})
+        err, note = remove_test_user(ctx, tmp)
+    if err:
+        raise Fail(err)
+    return "add/list/remove of user and alias ok, %s" % note
+
+
+def login_status(ctx, credentials):
+    # POST /admin/login with the Authorization header made of these bytes.
+    r = http_req(ctx, "POST", "/admin/login",
+                 headers={"Authorization": "Basic " + base64.b64encode(credentials).decode()})
+    j = r.json() if r.status == 200 else {}
+    if j.get("api_key"):
+        SECRETS.add(j["api_key"])
+    return r.status, j.get("status"), j.get("reason", "")
+
+
+def c_admin_login_non_ascii(ctx):
+    # B175: the management daemon read the Authorization header as ASCII, so a user whose password has an
+    # umlaut could not log in to the control panel ("'ascii' codec can't decode byte ..."), although
+    # the panel had set that password. A test user logs in with "ü" and "ß" in its password, the header in
+    # UTF-8 (the panel since B175, curl) and in Latin-1 (the panel before B175); a wrong password with an
+    # umlaut is refused as a wrong password (one failed login, far below the miab-management jail); after a
+    # change through the API to a password with "€", it logs in to the panel and to Dovecot (IMAP
+    # AUTHENTICATE PLAIN, UTF-8).
+    tmp = "smokeuml-%s@%s" % (ctx.tok, ctx.domain)
+    pw = "Smüke-Paß-%s" % ctx.tok
+    pw_eur = pw + "-€"
+    SECRETS.update({pw, pw_eur})
+    r = admin_api(ctx, "POST", "mail/users/add", form={"email": tmp, "password": pw})
     if r.status != 200:
-        raise Fail("users/remove HTTP %d %s" % (r.status, r.text()[:200]))
-    return "add/list/remove of user and alias ok, %s" % remove_test_mailbox(ctx, tmp)
+        raise Fail("users/add HTTP %d %s" % (r.status, r.text()[:200]))
+    notes = []
+    try:
+        for label, cred in (("UTF-8", ("%s:%s" % (tmp, pw)).encode("utf-8")),
+                            ("Latin-1", ("%s:%s" % (tmp, pw)).encode("latin-1"))):
+            st, status, reason = login_status(ctx, cred)
+            if status != "ok":
+                raise Fail("login with the header in %s: HTTP %d %s %s" % (label, st, status, reason[:120]))
+            notes.append("login %s ok" % label)
+        st, status, reason = login_status(ctx, ("%s:Smüke-falsch-%s" % (tmp, ctx.tok)).encode("utf-8"))
+        if status != "invalid" or "codec" in reason:
+            raise Fail("wrong password with an umlaut: HTTP %d %s %s" % (st, status, reason[:120]))
+        notes.append("wrong password refused")
+        r = admin_api(ctx, "POST", "mail/users/password", form={"email": tmp, "password": pw_eur})
+        if r.status != 200:
+            raise Fail("users/password HTTP %d %s" % (r.status, r.text()[:200]))
+        st, status, reason = login_status(ctx, ("%s:%s" % (tmp, pw_eur)).encode("utf-8"))
+        if status != "ok":
+            raise Fail("login with '€' in the password: HTTP %d %s %s" % (st, status, reason[:120]))
+        M = ctx.net.imap()
+        try:
+            typ, _ = M.authenticate("PLAIN", lambda _: b"\0" + tmp.encode() + b"\0" + pw_eur.encode("utf-8"))
+        finally:
+            try:
+                M.logout()
+            except Exception:
+                pass
+        if typ != "OK":
+            raise Fail("IMAP AUTHENTICATE PLAIN with '€' in the password: %s" % typ)
+        notes.append("'€': panel and IMAP ok")
+    finally:
+        err, note = remove_test_user(ctx, tmp)
+    if err:
+        raise Fail(err)
+    return "%s, %s" % (", ".join(notes), note)
 
 
 def c_admin_journal_no_hash(ctx):
@@ -1664,6 +1802,455 @@ def c_fail2ban_settings_roundtrip(ctx):
     if admin_api(ctx, "GET", "system/fail2ban/settings").json()["settings"]["spray_min_ips"] != orig:
         raise Fail("spray_min_ips not restored")
     return "set/restore ok, invalid allowlist refused (400)"
+
+
+def c_fail2ban_jail_values(ctx):
+    # The thresholds of Mail-in-a-Box's own jails (setting "jails"): one value
+    # of miab-roundcube is changed, fail2ban must run with it, and the stored
+    # values are restored. A jail that cannot be changed (recidive) and a
+    # value out of range are refused without a change.
+    if not ctx.remote.available():
+        raise Skip("needs --ssh (fail2ban-client on the box)")
+    st = admin_api(ctx, "GET", "system/fail2ban").json()
+    orig = st["settings"].get("jails") or {}
+    default = st["jail_defaults"]["miab-roundcube"]["maxretry"]
+    cur = (orig.get("miab-roundcube") or {}).get("maxretry", default)
+    new = cur + 3 if cur + 3 <= 1000 else cur - 3
+    want = json.loads(json.dumps(orig))
+    want.setdefault("miab-roundcube", {})["maxretry"] = new
+    try:
+        r = admin_api(ctx, "POST", "system/fail2ban/settings", form={"jails": json.dumps(want)})
+        if r.status != 200:
+            raise Fail("set: HTTP %d %s" % (r.status, r.text()[:200]))
+        if r.json()["settings"]["jails"].get("miab-roundcube", {}).get("maxretry") != new:
+            raise Fail("not stored: %s" % r.json()["settings"]["jails"])
+        rc, out, err = ctx.remote.run("fail2ban-client get miab-roundcube maxretry", sudo=True)
+        if rc != 0 or out.strip() != str(new):
+            raise Fail("fail2ban runs miab-roundcube with maxretry %s, expected %d %s" % (out.strip(), new, err.strip()[:100]))
+        info = admin_api(ctx, "GET", "system/fail2ban").json()["jail_info"].get("miab-roundcube", {})
+        if info.get("maxretry") != new or not info.get("watches"):
+            raise Fail("jail_info of miab-roundcube: %s" % info)
+        for bad in ({"recidive": {"maxretry": 5}}, {"miab-roundcube": {"maxretry": 1}}, {"sshd": {"bantime": "1s"}}):
+            r = admin_api(ctx, "POST", "system/fail2ban/settings", form={"jails": json.dumps(bad)})
+            if r.status != 400:
+                raise Fail("%s accepted: HTTP %d" % (json.dumps(bad), r.status))
+    finally:
+        admin_api(ctx, "POST", "system/fail2ban/settings", form={"jails": json.dumps(orig)})
+    after = admin_api(ctx, "GET", "system/fail2ban").json()["settings"].get("jails") or {}
+    if after != orig:
+        raise Fail("jails not restored: %s (was %s)" % (after, orig))
+    rc, out, _ = ctx.remote.run("fail2ban-client get miab-roundcube maxretry", sudo=True)
+    if out.strip() != str(cur):
+        raise Fail("miab-roundcube maxretry %s after the restore, expected %d" % (out.strip(), cur))
+    return "miab-roundcube maxretry %d -> %d -> %d in fail2ban; recidive, 1 and 1s refused (400)" % (cur, new, cur)
+
+
+F2B_REASON_IP = "203.0.113.77" # TEST-NET-3: never a real client
+
+
+def c_fail2ban_ban_reason(ctx):
+    # The reason of a ban in the status: a ban set by hand has no log lines
+    # (manual), and the jail's rule is given. The address is unbanned again.
+    if not ctx.remote.available():
+        raise Skip("needs --ssh (fail2ban-client on the box)")
+    rc, _, err = ctx.remote.run("fail2ban-client set miab-roundcube banip %s" % F2B_REASON_IP, sudo=True)
+    if rc != 0:
+        raise Fail("fail2ban-client banip: %s" % err.strip()[:200])
+    try:
+        st = admin_api(ctx, "GET", "system/fail2ban").json()
+        bans = [b for j in st["jails"] if j["name"] == "miab-roundcube" for b in j["banned"] if b["ip"] == F2B_REASON_IP]
+        if not bans:
+            raise Fail("the ban of %s in miab-roundcube is not in the status" % F2B_REASON_IP)
+        reason = bans[0].get("reason")
+        if not reason or reason.get("manual") is not True or reason.get("lines"):
+            raise Fail("reason of a ban by hand: %s" % reason)
+        if st.get("reasons_error"):
+            raise Fail(st["reasons_error"])
+        info = st["jail_info"].get("miab-roundcube") or {}
+        if not info.get("watches") or not info.get("maxretry"):
+            raise Fail("no rule for miab-roundcube: %s" % info)
+    finally:
+        ctx.remote.run("fail2ban-client set miab-roundcube unbanip %s" % F2B_REASON_IP, sudo=True)
+    return "ban by hand of %s: manual, rule '%s, %d within %d s'" % (F2B_REASON_IP, info["watches"], info["maxretry"], info["findtime"])
+
+
+NC_THROTTLE_USER = "throttletest-nouser@invalid.example"
+OCC = "cd / && sudo -n -u www-data php /usr/local/lib/owncloud/occ "
+
+
+def nc_fail_logins(ctx, count):
+    # count failed logins of a user that does not exist, from the box's public
+    # address (fail2ban ignores it), through /webdav/ (the address reaches
+    # Nextcloud in X-Forwarded-For, see nextcloud-forwarded-for). Returns
+    # (the HTTP codes, the public address).
+    script = r"""
+set -u
+. /etc/mailinabox.conf
+cd /
+echo "public=$PUBLIC_IP"
+for i in $(seq %(count)d); do
+    curl -sk -o /dev/null -w 'http=%%{http_code}\n' --max-time 90 --resolve "$PRIMARY_HOSTNAME:443:$PUBLIC_IP" \
+        -u '%(user)s:not-the-password' -X PROPFIND -H 'Depth: 0' "https://$PRIMARY_HOSTNAME/webdav/"
+done
+""" % {"user": NC_THROTTLE_USER, "count": count}
+    rc, so, se = ctx.remote.run("bash -c %s" % shlex.quote(script), timeout=120 + 60 * count)
+    public = (re.findall(r"^public=(\S+)$", so, re.M) or [""])[0]
+    return re.findall(r"^http=(\d+)$", so, re.M), public
+
+
+def nc_reset_public(ctx, public):
+    # The failures of the test logins (also when a check failed half-way),
+    # through the control panel's reset, which deletes them also with the
+    # throttle off or the address on the bypass list (occ's reset does
+    # nothing then).
+    if public:
+        try:
+            admin_api(ctx, "POST", "system/nextcloud-throttle/reset", form={"ip": public})
+        except Exception:
+            pass
+
+
+def miab_checkout(ctx):
+    rc, miab, _err = ctx.remote.run("awk '$1 == \"cd\" { print $2; exit }' /usr/local/bin/mailinabox")
+    miab = miab.strip()
+    if rc != 0 or not miab:
+        raise Skip("Mail-in-a-Box checkout not found in /usr/local/bin/mailinabox")
+    return miab
+
+
+def c_nc_throttle(ctx):
+    # Nextcloud's own brute-force throttle in the control panel: two failed
+    # logins must show up for the box's public address with 2 failures, the
+    # name not shown (no account of the box), and a delay; the reset through
+    # the API must delete them.
+    if not ctx.remote.available():
+        raise Skip("needs --ssh (a login from the box's public address)")
+    public = ""
+    try:
+        codes, public = nc_fail_logins(ctx, 2)
+        if codes != ["401", "401"] or not public:
+            raise Fail("PROPFIND /webdav/ with a wrong login: %s" % codes)
+        r = admin_api(ctx, "GET", "system/nextcloud-throttle")
+        if r.status != 200:
+            raise Fail("GET: HTTP %d %s" % (r.status, r.text()[:200]))
+        j = r.json()
+        if not j.get("available"):
+            raise Fail("not available: %s" % j.get("error"))
+        if not j.get("enabled") or j.get("config_current") is not True:
+            raise Fail("throttle enabled=%s config_current=%s" % (j.get("enabled"), j.get("config_current")))
+        e = [x for x in j["entries"] if x["address"] == public]
+        if not e:
+            raise Fail("no entry for %s: %s" % (public, [x["address"] for x in j["entries"]][:10]))
+        e = e[0]
+        if e["attempts"] < 2 or e["recent"] < 2 or e["actions"].get("login", 0) < 2:
+            raise Fail("entry for %s: %s" % (public, e))
+        if NC_THROTTLE_USER in e["accounts"] or e["unknown_names"] < 1:
+            raise Fail("the login name that is no account is shown: %s" % e["accounts"])
+        if e["delay_ms"] <= 0 or e["blocked"] or e["bypassed"]:
+            raise Fail("entry for %s: delay %s, blocked %s, bypassed %s" % (public, e["delay_ms"], e["blocked"], e["bypassed"]))
+        if not any(b["source"] == "system" and b["network"] == "127.0.0.1/32" for b in j["bypass"]):
+            raise Fail("127.0.0.1/32 is not on the bypass list: %s" % j["bypass"])
+        r = admin_api(ctx, "POST", "system/nextcloud-throttle/reset", form={"ip": "not an address"})
+        if r.status != 400:
+            raise Fail("reset of an invalid address: HTTP %d" % r.status)
+        r = admin_api(ctx, "POST", "system/nextcloud-throttle/reset", form={"ip": public})
+        if r.status != 200 or r.json().get("deleted", 0) < 2 or public + "/32" not in r.json().get("subnets", []):
+            raise Fail("reset: HTTP %d %s" % (r.status, r.text()[:200]))
+        attempts, delay, deleted = e["attempts"], e["delay_ms"], r.json()["deleted"]
+    finally:
+        nc_reset_public(ctx, public)
+    left = [x for x in admin_api(ctx, "GET", "system/nextcloud-throttle").json()["entries"] if x["address"] == public]
+    if left:
+        raise Fail("still listed after the reset: %s" % left[0])
+    return "%s: %d failures, delay %d ms, name not shown; reset deleted %d" % (public, attempts, delay, deleted)
+
+
+NC_BYPASS_TEST_NET = "203.0.113.0/24"   # TEST-NET-3, put on the allowlist for a moment
+NC_BYPASS_FOREIGN = "198.51.100.0/24"   # TEST-NET-2, an entry "made in Nextcloud"
+NC_BYPASS_FOREIGN_KEY = "whitelist_9001"
+
+
+def c_nc_bypass_allowlist(ctx):
+    # nc_allowlist puts the allowlist on Nextcloud's bypass list and takes its
+    # own entries off again; 127.0.0.1/32 (B121) and an entry made in Nextcloud
+    # stay. The previous settings are restored.
+    if not ctx.remote.available():
+        raise Skip("needs --ssh (occ on the box)")
+    cur = admin_api(ctx, "GET", "system/fail2ban/settings").json()["settings"]
+    if NC_BYPASS_TEST_NET in cur["allowlist"]:
+        raise Skip("%s is on the allowlist already" % NC_BYPASS_TEST_NET)
+
+    def bypass():
+        rc, out, err = ctx.remote.run(OCC + "config:list bruteForce", timeout=120)
+        try:
+            keys = json.loads(out).get("apps", {}).get("bruteForce") or {}
+        except ValueError:
+            raise Fail("occ config:list bruteForce: %s %s" % (out.strip()[:200], err.strip()[:100]))
+        return {k: str(v) for k, v in keys.items() if k.startswith("whitelist_")}
+
+    ctx.remote.run(OCC + "config:app:set bruteForce %s --value %s --type string" % (NC_BYPASS_FOREIGN_KEY, NC_BYPASS_FOREIGN), timeout=120)
+    try:
+        r = admin_api(ctx, "POST", "system/fail2ban/settings",
+                      form={"allowlist": "\n".join(cur["allowlist"] + [NC_BYPASS_TEST_NET]), "nc_allowlist": "1"})
+        if r.status != 200 or NC_BYPASS_TEST_NET not in (r.json().get("nextcloud") or {}).get("bypass_added", []):
+            raise Fail("set: HTTP %d %s" % (r.status, r.text()[:300]))
+        b = bypass()
+        values = sorted(b.values())
+        for want in ("127.0.0.1/32", NC_BYPASS_FOREIGN, NC_BYPASS_TEST_NET):
+            if want not in values:
+                raise Fail("%s not on the bypass list: %s" % (want, values))
+        j = admin_api(ctx, "GET", "system/nextcloud-throttle").json()
+        src = {x["network"]: x["source"] for x in j["bypass"]}
+        if src.get(NC_BYPASS_TEST_NET) != "panel" or src.get(NC_BYPASS_FOREIGN) != "other" or src.get("127.0.0.1/32") != "system":
+            raise Fail("sources of the bypass entries: %s" % src)
+        if j.get("bypass_current") is not True:
+            raise Fail("bypass_current %s" % j.get("bypass_current"))
+        r = admin_api(ctx, "POST", "system/fail2ban/settings", form={"nc_allowlist": "0"})
+        if r.status != 200 or NC_BYPASS_TEST_NET not in (r.json().get("nextcloud") or {}).get("bypass_removed", []):
+            raise Fail("nc_allowlist off: HTTP %d %s" % (r.status, r.text()[:300]))
+        values = sorted(bypass().values())
+        if NC_BYPASS_TEST_NET in values or "127.0.0.1/32" not in values or NC_BYPASS_FOREIGN not in values:
+            raise Fail("after nc_allowlist off: %s" % values)
+    finally:
+        admin_api(ctx, "POST", "system/fail2ban/settings",
+                  form={"allowlist": "\n".join(cur["allowlist"]), "nc_allowlist": "1" if cur["nc_allowlist"] else "0"})
+        ctx.remote.run(OCC + "config:app:delete bruteForce %s" % NC_BYPASS_FOREIGN_KEY, timeout=120)
+    after = admin_api(ctx, "GET", "system/fail2ban/settings").json()["settings"]
+    if after["allowlist"] != cur["allowlist"] or after["nc_allowlist"] != cur["nc_allowlist"]:
+        raise Fail("settings not restored: %s %s" % (after["allowlist"], after["nc_allowlist"]))
+    return "%s added and removed again; 127.0.0.1/32 and an entry made in Nextcloud stayed" % NC_BYPASS_TEST_NET
+
+
+def c_nc_setup_no_drift(ctx):
+    # management/nextcloud_throttle.py --setup (setup/start.sh) twice: the
+    # second run changes nothing (no line, config.php and the bypass list as
+    # before).
+    if not ctx.remote.available():
+        raise Skip("needs --ssh")
+    miab = miab_checkout(ctx)
+    run = "bash -c %s" % shlex.quote("cd %s && management/nextcloud_throttle.py --setup" % shlex.quote(miab))
+    state = ("bash -c %s" % shlex.quote(". /etc/mailinabox.conf; stat -c %Y \"$STORAGE_ROOT/owncloud/config.php\"; " + OCC + "config:list bruteForce"))
+    rc1, out1, err1 = ctx.remote.run(run, sudo=True, timeout=300)
+    _, before, _ = ctx.remote.run(state, sudo=True, timeout=120)
+    rc2, out2, err2 = ctx.remote.run(run, sudo=True, timeout=300)
+    _, after, _ = ctx.remote.run(state, sudo=True, timeout=120)
+    if rc1 != 0 or rc2 != 0:
+        raise Fail("exit codes %d, %d: %s" % (rc1, rc2, (err1 + err2).strip()[:200]))
+    if out2.strip():
+        raise Fail("the second run changed something: %s" % out2.strip()[:300])
+    if before != after:
+        raise Fail("config.php or the bypass list changed in the second run")
+    return "second run without output, config.php and bypass list unchanged" + ("; first run: " + out1.strip()[:100] if out1.strip() else "")
+
+
+def c_nc_protection_off(ctx):
+    # nc_protection off: config.php gets auth.bruteforce.protection.enabled
+    # false, the failures counted before are deleted (Nextcloud would go on
+    # applying them), and failed logins are neither counted nor refused (no
+    # HTTP 429 after more than max-attempts). Back on, failures are counted
+    # again. The setting is restored.
+    if not ctx.remote.available():
+        raise Skip("needs --ssh")
+    cur = admin_api(ctx, "GET", "system/fail2ban/settings").json()["settings"]
+    if not cur["nc_protection"]:
+        raise Skip("Nextcloud's throttle is off on this box")
+    public = ""
+    try:
+        codes, public = nc_fail_logins(ctx, 2)
+        if codes != ["401", "401"]:
+            raise Fail("failed logins before: %s" % codes)
+        r = admin_api(ctx, "POST", "system/fail2ban/settings", form={"nc_protection": "0"})
+        nc = (r.json() or {}).get("nextcloud") if r.status == 200 else None
+        if not nc or not nc.get("config_changed") or nc.get("attempts_deleted", 0) < 2:
+            raise Fail("off: HTTP %d %s" % (r.status, r.text()[:300]))
+        rc, out, _ = ctx.remote.run(OCC + "config:system:get auth.bruteforce.protection.enabled", timeout=120)
+        if out.strip() != "false":
+            raise Fail("auth.bruteforce.protection.enabled is %r" % out.strip())
+        j = admin_api(ctx, "GET", "system/nextcloud-throttle").json()
+        if j.get("enabled") is not False or [x for x in j["entries"] if x["address"] == public]:
+            raise Fail("overview after off: enabled %s, entries %s" % (j.get("enabled"), [x["address"] for x in j["entries"]]))
+        max_attempts = cur["nc_max_attempts"]
+        codes, _ = nc_fail_logins(ctx, max_attempts + 2)
+        if set(codes) != {"401"} or len(codes) != max_attempts + 2:
+            raise Fail("%d failed logins with the throttle off: %s" % (max_attempts + 2, codes))
+        if [x for x in admin_api(ctx, "GET", "system/nextcloud-throttle").json()["entries"] if x["address"] == public]:
+            raise Fail("failures counted with the throttle off")
+        r = admin_api(ctx, "POST", "system/fail2ban/settings", form={"nc_protection": "1"})
+        if r.status != 200:
+            raise Fail("on again: HTTP %d %s" % (r.status, r.text()[:200]))
+        codes, _ = nc_fail_logins(ctx, 1)
+        e = [x for x in admin_api(ctx, "GET", "system/nextcloud-throttle").json()["entries"] if x["address"] == public]
+        if codes != ["401"] or not e or e[0]["attempts"] != 1:
+            raise Fail("on again: %s, entry %s" % (codes, e))
+    finally:
+        admin_api(ctx, "POST", "system/fail2ban/settings", form={"nc_protection": "1" if cur["nc_protection"] else "0"})
+        nc_reset_public(ctx, public)
+    return "off: failures deleted, %d failed logins neither counted nor refused (all 401); on again: counted" % (max_attempts + 2)
+
+
+def c_nc_hand_set(ctx):
+    # A value set by hand in Nextcloud's config.php, while the settings have
+    # none of their own, is taken over, not overwritten: the control panel
+    # shows it and stores it with the next save, setup stores it at once.
+    # Set by hand here with tools/nextcloud-bruteforce-config.php as www-data
+    # (config.php is read-only for occ). The setting is restored.
+    if not ctx.remote.available():
+        raise Skip("needs --ssh")
+    st = admin_api(ctx, "GET", "system/fail2ban").json()
+    if st["settings"]["nc_max_attempts"] != 10 or st.get("nc_hand_set"):
+        raise Skip("nc_max_attempts is not at its default here")
+    miab = miab_checkout(ctx)
+    def hand_set(value):
+        cmd = ("cd %s && . /etc/mailinabox.conf && NC_CONFIG=\"$STORAGE_ROOT/owncloud/config.php\" NC_SET=%s "
+               "runuser -u www-data -- php%s < tools/nextcloud-bruteforce-config.php"
+               % (shlex.quote(miab), shlex.quote(json.dumps({"auth.bruteforce.max-attempts": value})),
+                  "$(sed -nE 's/^PHP_VER=([0-9.]+).*/\\1/p' setup/functions.sh | head -n 1)"))
+        rc, out, err = ctx.remote.run("bash -c %s" % shlex.quote(cmd), sudo=True, timeout=120)
+        if rc != 0:
+            raise Fail("setting max-attempts by hand: %s" % (err or out).strip()[:200])
+    def stored():
+        rc, out, _ = ctx.remote.run("bash -c %s" % shlex.quote(". /etc/mailinabox.conf; grep -E '^  nc_max_attempts:' \"$STORAGE_ROOT/settings.yaml\" || true"), sudo=True)
+        return out.strip()
+    occ_get = OCC + "config:system:get auth.bruteforce.max-attempts"
+    try:
+        # the control panel
+        hand_set(17)
+        st = admin_api(ctx, "GET", "system/fail2ban").json()
+        if st["settings"]["nc_max_attempts"] != 17 or not st.get("nc_hand_set"):
+            raise Fail("panel: nc_max_attempts %s, nc_hand_set %s" % (st["settings"]["nc_max_attempts"], st.get("nc_hand_set")))
+        r = admin_api(ctx, "POST", "system/fail2ban/settings", form={"spray_min_ips": str(st["settings"]["spray_min_ips"])})
+        if r.status != 200 or r.json()["settings"]["nc_max_attempts"] != 17 or stored() != "nc_max_attempts: 17":
+            raise Fail("panel save: HTTP %d, stored %r" % (r.status, stored()))
+        rc, out, _ = ctx.remote.run(occ_get, timeout=120)
+        if out.strip() != "17":
+            raise Fail("the save overwrote the value set by hand: %r" % out.strip())
+        admin_api(ctx, "POST", "system/fail2ban/settings", form={"nc_max_attempts": "10"})
+        if stored():
+            raise Fail("nc_max_attempts still stored after the reset to 10: %r" % stored())
+        # setup
+        hand_set(19)
+        cmd = "cd %s && management/nextcloud_throttle.py --setup" % shlex.quote(miab)
+        rc, out, err = ctx.remote.run("bash -c %s" % shlex.quote(cmd), sudo=True, timeout=300)
+        if "took over auth.bruteforce.max-attempts = 19" not in out or stored() != "nc_max_attempts: 19":
+            raise Fail("setup: %s, stored %r" % (out.strip()[:200], stored()))
+        rc, out, _ = ctx.remote.run(occ_get, timeout=120)
+        if out.strip() != "19":
+            raise Fail("setup overwrote the value set by hand: %r" % out.strip())
+    finally:
+        admin_api(ctx, "POST", "system/fail2ban/settings", form={"nc_max_attempts": "10"})
+    rc, out, _ = ctx.remote.run(occ_get, timeout=120)
+    if out.strip() or stored():
+        raise Fail("not restored: config.php %r, stored %r" % (out.strip(), stored()))
+    return "taken over by the panel (17) and by setup (19), not overwritten; restored to the default"
+
+
+def c_local_test(ctx, script):
+    # A local test of tests/fork (no box needed): ban-reasons.py (the
+    # masking of user names in the reasons of bans), nextcloud-throttle.py
+    # (the reader of Nextcloud's throttle, the stale failures, the takeover
+    # of values set by hand).
+    here = os.path.dirname(os.path.abspath(__file__))
+    p = subprocess.run([sys.executable, "-I", os.path.join(here, script)], capture_output=True, text=True, timeout=120)
+    last = (p.stdout.strip().splitlines() or [""])[-1]
+    if p.returncode != 0:
+        bad = [l for l in p.stdout.splitlines() if l.startswith("FAIL")]
+        raise Fail("%s: %s" % (last, "; ".join(bad)[:300]))
+    return last
+
+
+def c_nc_throttle_settings(ctx):
+    # nc_max_attempts goes into Nextcloud's config.php (which is read-only for
+    # Nextcloud itself) and back; a value out of range is refused.
+    if not ctx.remote.available():
+        raise Skip("needs --ssh (occ on the box)")
+    occ = "cd / && sudo -n -u www-data php /usr/local/lib/owncloud/occ config:system:get auth.bruteforce.max-attempts"
+    orig = admin_api(ctx, "GET", "system/fail2ban/settings").json()["settings"]["nc_max_attempts"]
+    new = orig + 2 if orig + 2 <= 1000 else orig - 2
+    try:
+        r = admin_api(ctx, "POST", "system/fail2ban/settings", form={"nc_max_attempts": str(new)})
+        if r.status != 200 or r.json()["settings"]["nc_max_attempts"] != new:
+            raise Fail("set: HTTP %d %s" % (r.status, r.text()[:200]))
+        if not (r.json().get("nextcloud") or {}).get("config_changed"):
+            raise Fail("config.php not written: %s" % r.json().get("nextcloud"))
+        rc, out, err = ctx.remote.run(occ, timeout=120)
+        if out.strip() != str(new):
+            raise Fail("auth.bruteforce.max-attempts is %r, expected %d %s" % (out.strip(), new, err.strip()[:100]))
+        j = admin_api(ctx, "GET", "system/nextcloud-throttle").json()
+        if j.get("max_attempts") != new or j.get("config_current") is not True:
+            raise Fail("overview: max_attempts %s, config_current %s" % (j.get("max_attempts"), j.get("config_current")))
+        r = admin_api(ctx, "POST", "system/fail2ban/settings", form={"nc_max_attempts": "2"})
+        if r.status != 400:
+            raise Fail("nc_max_attempts=2 accepted: HTTP %d" % r.status)
+    finally:
+        admin_api(ctx, "POST", "system/fail2ban/settings", form={"nc_max_attempts": str(orig)})
+    rc, out, _ = ctx.remote.run(occ, timeout=120)
+    want = "" if orig == 10 else str(orig) # the default is not written
+    if out.strip() != want:
+        raise Fail("auth.bruteforce.max-attempts is %r after the restore, expected %r" % (out.strip(), want))
+    return "nc_max_attempts %d -> %d (config.php) -> %d; 2 refused (400)" % (orig, new, orig)
+
+
+def c_nc_app_versions(ctx):
+    # The apps contacts, calendar and user_external at the versions that
+    # setup/nextcloud.sh pins (B176: before, a new pin reached an existing box
+    # only with the next Nextcloud update).
+    if not ctx.remote.available():
+        raise Skip("needs --ssh")
+    here = os.path.dirname(os.path.abspath(__file__))
+    try:
+        with open(os.path.join(here, "..", "..", "setup", "nextcloud.sh"), encoding="utf-8") as f:
+            src = f.read()
+    except OSError as e:
+        raise Skip("setup/nextcloud.sh not readable here: %s" % e)
+    pins = dict(re.findall(r"^(contacts|calendar|user_external)_ver=(\S+)$", src, re.M))
+    if len(pins) != 3:
+        raise Fail("pins not found in setup/nextcloud.sh: %s" % pins)
+    # The files (appinfo/info.xml) and the version Nextcloud has upgraded
+    # its database to (occ app:list): a swapped app without "occ upgrade"
+    # leaves Nextcloud needing an upgrade.
+    occ = "cd / && sudo -n -u www-data php /usr/local/lib/owncloud/occ "
+    rc, out, err = ctx.remote.run(occ + "app:list --output=json", timeout=120)
+    try:
+        listed = json.loads(out.strip().splitlines()[-1]).get("enabled") or {}
+    except (ValueError, IndexError):
+        raise Fail("unexpected output of occ app:list: %s %s" % (out.strip()[:200], err.strip()[:100]))
+    rc, out, _ = ctx.remote.run(occ + "status --output=json", timeout=120)
+    try:
+        needs = json.loads(out.strip().splitlines()[-1]).get("needsDbUpgrade")
+    except (ValueError, IndexError):
+        raise Fail("unexpected output of occ status: %s" % out.strip()[:200])
+    bad, have = [], []
+    for app, ver in sorted(pins.items()):
+        rc, out, _ = ctx.remote.run("sed -n 's:.*<version>\\([^<]*\\)</version>.*:\\1:p' /usr/local/lib/owncloud/apps/%s/appinfo/info.xml | head -n 1" % app, sudo=True)
+        v = out.strip()
+        have.append("%s %s" % (app, v))
+        if v != ver:
+            bad.append("%s is %s, setup pins %s" % (app, v or "missing", ver))
+        elif listed.get(app) != ver:
+            bad.append("%s %s installed, Nextcloud has %s (enabled apps)" % (app, v, listed.get(app) or "it not enabled"))
+    if needs is not False:
+        bad.append("Nextcloud needs an upgrade (needsDbUpgrade %s)" % needs)
+    if bad:
+        raise Fail("; ".join(bad))
+    return ", ".join(have) + "; enabled, no upgrade pending"
+
+
+def c_nc_backup_private(ctx):
+    # $STORAGE_ROOT/owncloud-backup, the copies of Nextcloud's database
+    # (every user's calendars and contacts), its code and config.php that
+    # setup makes before an update of Nextcloud or of its apps, is root's
+    # only (0700, B177). A box that never updated Nextcloud has none.
+    if not ctx.remote.available():
+        raise Skip("needs --ssh")
+    script = ("d=$(sed -n 's/^STORAGE_ROOT=//p' /etc/mailinabox.conf)/owncloud-backup; "
+        "if [ -L \"$d\" ]; then echo link; elif [ -d \"$d\" ]; then stat -c '%a %U' \"$d\"; else echo none; fi")
+    rc, out, _ = ctx.remote.run("bash -c %s" % shlex.quote(script), sudo=True)
+    state = out.strip()
+    if state == "none":
+        return "no owncloud-backup directory (no update of Nextcloud or its apps yet)"
+    if state != "700 root":
+        raise Fail("owncloud-backup is %s, expected mode 700 owned by root" % (state or "unreadable"))
+    return "owncloud-backup is 700, root"
 
 
 # Log lines for the installed fail2ban filters: (filter, line, expected host or
@@ -3068,6 +3655,26 @@ def c_imapsieve_result(ctx, which):
     return "n%s %d -> %d" % (which, r["before"].get("n" + which, 0), r[which]["n" + which])
 
 
+def c_imapsieve_no_phantom_folder(ctx):
+    # sa-learn, which IMAPSieve runs for a message moved into or out of Spam,
+    # created its state directory .spamassassin in the Maildir root, which
+    # IMAP listed as the folder "spamassassin" (B155); setup removes those of
+    # earlier versions. All test users: alice after imapsieve-move-run, the
+    # others for a box updated from such a version.
+    found, n = [], 0
+    for user in (ctx.alice, ctx.bob, ctx.carol):
+        M = imap_login(ctx, user)
+        try:
+            names = list_folders(M)
+        finally:
+            M.logout()
+        n += len(names)
+        found += ["%s: %s" % (user, x) for x in names if x.lower() == "spamassassin"]
+    if found:
+        raise Fail("folders of sa-learn's state directory: %s" % ", ".join(found))
+    return "%d folders of 3 users, none named spamassassin" % n
+
+
 # ---------------------------------------------------------------------------
 # cleanup
 # ---------------------------------------------------------------------------
@@ -3264,6 +3871,21 @@ def c_fail2ban(ctx, proto, jails, port, wait=30):
         if new:
             break
         time.sleep(3)
+    # The reason of the ban in the status (the failures and the log lines
+    # fail2ban kept), read before the unban.
+    reason_note = ""
+    if new and ctx.admin_auth:
+        try:
+            st = admin_api(ctx, "GET", "system/fail2ban").json()
+            j0, ip0 = sorted(new)[0]
+            reasons = [b.get("reason") for j in st["jails"] if j["name"] == j0 for b in j["banned"] if b["ip"] == ip0]
+            reason = reasons[0] if reasons else None
+            if reason and not reason.get("manual") and reason.get("lines") and (reason.get("failures") or 0) > 0:
+                reason_note = "; reason in %s: %d failures, %d log lines" % (j0, reason["failures"], len(reason["lines"]))
+            else:
+                reason_note = "; BAD reason in %s: %s" % (j0, reason)
+        except Exception as e:
+            reason_note = "; BAD reason: %s" % e
     for _j, ip in new:
         f2b_unban(ctx, ip)
     rec = f2b_banned(ctx, "recidive") or set()
@@ -3280,7 +3902,9 @@ def c_fail2ban(ctx, proto, jails, port, wait=30):
     ips = sorted({ip for _j, ip in new})
     if src and src not in ips:
         raise Fail("banned %s but attack source was %s" % (ips, src))
-    return "banned %s in %s (probe after: %s), unbanned" % (ips, sorted({j for j, _ in new}), res["probe_after"])
+    if "BAD reason" in reason_note:
+        raise Fail("banned %s in %s, but%s" % (ips, sorted({j for j, _ in new}), reason_note[1:]))
+    return "banned %s in %s (probe after: %s)%s, unbanned" % (ips, sorted({j for j, _ in new}), res["probe_after"], reason_note)
 
 
 def c_fail2ban_activesync_noauth(ctx):
@@ -3369,6 +3993,7 @@ API_READ_ONLY = [
     ("GET", "/system/fail2ban", "application/json"),
     ("GET", "/system/fail2ban/settings", "application/json"),
     ("GET", "/system/fail2ban/report", "application/json"),
+    ("GET", "/system/nextcloud-throttle", "application/json"),
     ("GET", "/system/munin/alerts", "application/json"),
     ("GET", "/ssl/status", "application/json"),
     ("POST", "/ssl/csr/{domain}", "text/html"),
@@ -3426,6 +4051,7 @@ API_NOT_CALLED = [
     ("POST", "/system/fail2ban/settings", "group admin (admin-fail2ban-settings) sets and restores it"),
     ("POST", "/system/fail2ban/unban", "releases real bans (group fail2ban unbans its own)"),
     ("POST", "/system/fail2ban/unban-all", "releases real bans"),
+    ("POST", "/system/nextcloud-throttle/reset", "group admin (admin-nextcloud-throttle) resets the failures of its own test logins"),
     ("POST", "/dns/custom/{qname}", "the view of /dns/custom/{qname}/{rtype} with type A, which needs an address"),
     ("PUT", "/dns/custom/{qname}", "the view of /dns/custom/{qname}/{rtype} with type A, which needs an address"),
     ("DELETE", "/dns/custom/{qname}", "the view of /dns/custom/{qname}/{rtype} with type A: would delete real A records"),
@@ -3568,6 +4194,11 @@ def api_shape(ctx, path, r):
         _need(isinstance(j.get("failures"), int) and isinstance(j.get("distinct_ips"), int) and _is_str_list(j.get("flagged_accounts")),
               "fail2ban report: keys missing")
         return "%d failures" % j["failures"]
+    if path == "/system/nextcloud-throttle":
+        _need(isinstance(j.get("available"), bool) and isinstance(j.get("entries"), list) and isinstance(j.get("bypass"), list),
+              "nextcloud throttle: keys missing")
+        _need(j["available"] or isinstance(j.get("error"), str), "nextcloud throttle: not available without an error")
+        return "%d addresses" % len(j["entries"]) if j["available"] else "not available"
     if path == "/system/munin/alerts":
         _need(j.get("recipient") in ("admin", "custom", "off") and j.get("level") in ("warning", "critical")
               and isinstance(j.get("address"), str) and isinstance(j.get("warnings"), list), "munin alerts: keys missing")
@@ -4028,6 +4659,7 @@ def main():
         run_check("submission-465-login", c_sub465, ctx)
         run_check("submission-587-login", c_sub587, ctx)
         run_check("managesieve-4190-login", c_sieve_login, ctx)
+        run_check("tls-key-exchange", c_tls_key_exchange, ctx)
         run_check("mail-log-logins", c_mail_log_logins, ctx)
         run_check("services-enabled", c_services_enabled, ctx)
     if want("migrated"):
@@ -4045,6 +4677,7 @@ def main():
         run_check("mig-roundcube-identity", c_mig_roundcube_identity, ctx)
     if want("admin"):
         run_check("admin-api-tmp-user-alias", c_admin_tmp_user_alias, ctx)
+        run_check("admin-login-non-ascii", c_admin_login_non_ascii, ctx)
         run_check("admin-backup-status", c_backup_status, ctx)
         run_check("admin-backup-saved", c_backup_saved, ctx)
         run_check("admin-fail2ban-status", c_fail2ban_api, ctx)
@@ -4052,6 +4685,18 @@ def main():
         run_check("admin-fail2ban-report", c_fail2ban_report, ctx)
         run_check("admin-fail2ban-filters", c_fail2ban_filters, ctx)
         run_check("admin-fail2ban-panel", c_fail2ban_panel, ctx)
+        run_check("admin-fail2ban-jail-values", c_fail2ban_jail_values, ctx)
+        run_check("admin-fail2ban-ban-reason", c_fail2ban_ban_reason, ctx)
+        run_check("admin-nextcloud-throttle", c_nc_throttle, ctx)
+        run_check("admin-nextcloud-throttle-settings", c_nc_throttle_settings, ctx)
+        run_check("admin-nextcloud-bypass-allowlist", c_nc_bypass_allowlist, ctx)
+        run_check("admin-nextcloud-protection-off", c_nc_protection_off, ctx)
+        run_check("admin-nextcloud-setup-no-drift", c_nc_setup_no_drift, ctx)
+        run_check("admin-nextcloud-hand-set", c_nc_hand_set, ctx)
+        run_check("admin-ban-reasons-masking", c_local_test, ctx, "ban-reasons.py")
+        run_check("admin-nextcloud-throttle-unit", c_local_test, ctx, "nextcloud-throttle.py")
+        run_check("admin-nextcloud-app-versions", c_nc_app_versions, ctx)
+        run_check("admin-nextcloud-backup-private", c_nc_backup_private, ctx)
     if want("api"):
         print("== api (management API as api/mailinabox.yml documents it)")
         run_check("api-auth", c_api_auth, ctx)
@@ -4114,6 +4759,7 @@ def main():
         run_check("imapsieve-move-run", c_imapsieve, ctx)
         run_check("imapsieve-spam-learn", c_imapsieve_result, ctx, "spam")
         run_check("imapsieve-ham-learn", c_imapsieve_result, ctx, "ham")
+        run_check("imapsieve-no-phantom-folder", c_imapsieve_no_phantom_folder, ctx)
         run_check("fts-search", c_fts, ctx)
     if not args.no_cleanup and (want("mail") or want("imapsieve")):
         run_check("cleanup-test-mail", c_cleanup, ctx)

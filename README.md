@@ -53,7 +53,8 @@ builds on that port. Its goals:
 * Protect the logins better than v78 does: repeat offenders get longer
   fail2ban bans (up to a week), slow jails catch attacks that stay below
   the normal limits, own networks can be put on an allowlist, and the status
-  checks report password spraying. Bans and settings are managed in the
+  checks report password spraying. Bans (with the reason of each),
+  Nextcloud's own login throttle and the settings are managed in the
   control panel (System > Intrusion Protection).
 * Keep the mail domains of a box apart in Nextcloud: in the web interface
   and the system address book, users only find and share with the accounts
@@ -69,9 +70,9 @@ builds on that port. Its goals:
 |---|---|---|
 | Ubuntu | 22.04 LTS (standard support until May 2027) | 26.04 LTS (standard support until May 2031) |
 | PHP | 8.0 from `ppa:ondrej/php` (no security support since 26 Nov 2023) | 8.5 from the Ubuntu archive (security support until 31 Dec 2029) |
-| Nextcloud ¹ | 27.1.11 (end of life June 2024) | 34.0.5 (supported until June 2027) ³ |
-| Nextcloud apps contacts / calendar / user_external ¹ | 5.5.4 / 4.7.20 / 3.4.0 | 8.9.2 / 6.6.4 / 4.0.0 |
-| Roundcube ¹ | 1.6.20 (LTS, security fixes only), CardDAV plugin 4.4.3 | 1.7.5 (current stable), CardDAV plugin 5.1.4 |
+| Nextcloud ¹ | 27.1.11 (end of life June 2024) | 34.0.6 (supported until June 2027) ³ |
+| Nextcloud apps contacts / calendar / user_external ¹ | 5.5.4 / 4.7.20 / 3.4.0 | 8.10.0 / 6.6.6 / 4.0.0 |
+| Roundcube ¹ | 1.6.20 (LTS, security fixes only), CardDAV plugin 4.4.3 | 1.7.6 (current stable), CardDAV plugin 5.1.5 |
 | Z-Push ¹ | 2.7.7 | 2.7.7 (unchanged) |
 | Dovecot | 2.3.16 | 2.4.2 |
 | Full-text search (Dovecot) | none | **new:** fts_xapian 1.9.3, on by default (`FTS=off` turns it off) |
@@ -83,7 +84,7 @@ builds on that port. Its goals:
 | Python (management daemon) | 3.10.12 | 3.14.4 |
 | duplicity (backups) ² | 3.2.2 | 3.2.2 (unchanged) |
 
-Versions as of `v78-r2604.1` (October 2026). For v78 the table shows the
+Versions as of `v78-r2604.4` (November 2026). For v78 the table shows the
 version pinned in v78's setup scripts or the current Ubuntu 22.04 package.
 
 ¹ Pinned by the setup scripts (download with checksum). These change only with
@@ -109,12 +110,17 @@ Ubuntu's main component, which gets security updates during standard support;
 > Tauberer for help with this fork. Use this repository's
 > [issues](https://github.com/LM1337/Mail-in-a-box-26/issues) instead.
 
-**Status: `v78-r2604.1`, a bug-fix release of the control panel's login
-after the first release `v78-r2604.0`.** The first release is tested on test
-machines, on a copy of a production box and on a box on the Internet; the
-bug-fix release only by a browser test and the API smoke test on a test box
-(which tests ran for each release, their results and what was not tested are
-in [TESTING-fork.md](TESTING-fork.md)). Make a backup, and try an update on a
+**Status: `v78-r2604.4`, the fourth small release after the first release
+`v78-r2604.0`.** The first release is tested on test machines, on a copy of
+a production box and on a box on the Internet; `v78-r2604.1` only by a
+browser test and the API smoke test on a test box; `v78-r2604.2` by a fresh
+install, an update of a copy of a production box, and a migration and an
+in-place upgrade from v78 on Ubuntu 22.04, on test machines; `v78-r2604.3`
+(post-quantum key exchange in Postfix, B175) and `v78-r2604.4` (Nextcloud's
+throttle and the reasons of bans in the control panel, B176, B177) each by a
+fresh install and an update of a copy of a production box (which tests ran
+for each release, their results and what was not tested are in
+[TESTING-fork.md](TESTING-fork.md)). Make a backup, and try an update on a
 copy or a spare machine before you run it on the box that holds your mail.
 
 All changes are in [CHANGELOG-fork.md](CHANGELOG-fork.md), every fixed bug
