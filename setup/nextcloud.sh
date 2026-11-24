@@ -707,29 +707,37 @@ if (\$tmp === false || dirname(\$tmp) !== dirname(\$path)
 ?>
 EOF
 
-# Update config.php in case S3 object storage backend if configured
-if [[ -n "${NEXTCLOUD_S3_BUCKET:-}" &&  -n "${NEXTCLOUD_S3_REGION:-}" ]]; then
-	php$PHP_VER <<EOF > $CONFIG_TEMP && mv $CONFIG_TEMP $STORAGE_ROOT/owncloud/config.php;
+# Update config.php in case S3 object storage backend is configured
+if [[ -n "${NEXTCLOUD_S3_BUCKET:-}" && -n "${NEXTCLOUD_S3_REGION:-}" ]]; then
+	sudo -u www-data php"$PHP_VER" <<EOF
 <?php
-include("$STORAGE_ROOT/owncloud/config.php");
+\$path = '$STORAGE_ROOT/owncloud/config.php';
+if ((include \$path) === false || !isset(\$CONFIG) || !is_array(\$CONFIG)) {
+  fwrite(STDERR, "Nextcloud: www-data cannot read \$path.\n");
+  exit(1);
+}
 
 \$CONFIG['objectstore'] = array(
-	'class' => '\\OC\\Files\\ObjectStore\\S3',
-    'arguments' => array(
-        'bucket' => '$NEXTCLOUD_S3_BUCKET',
-        'autocreate' => false,
-		'use_ssl' => true,
-		'region' => '$NEXTCLOUD_S3_REGION'
-	),
+  'class' => '\\OC\\Files\\ObjectStore\\S3',
+  'arguments' => array(
+    'bucket' => '$NEXTCLOUD_S3_BUCKET',
+    'autocreate' => false,
+    'use_ssl' => true,
+    'region' => '$NEXTCLOUD_S3_REGION',
+  ),
 );
 
-echo "<?php\n\\\$CONFIG = ";
-var_export(\$CONFIG);
-echo ";";
+\$tmp = tempnam(dirname(\$path), '.config.php.');
+if (\$tmp === false || dirname(\$tmp) !== dirname(\$path)
+    || file_put_contents(\$tmp, "<?php\n\\\$CONFIG = " . var_export(\$CONFIG, true) . ";\n") === false
+    || !rename(\$tmp, \$path)) {
+  if (\$tmp !== false) { @unlink(\$tmp); }
+  fwrite(STDERR, "Nextcloud: could not write \$path.\n");
+  exit(1);
+}
 ?>
 EOF
-	chown www-data.www-data $STORAGE_ROOT/owncloud/config.php
-	fi
+fi
 
 # Enable/disable apps. Note that this must be done after the Nextcloud setup.
 # The firstrunwizard gave Josh all sorts of problems, so disabling that.
