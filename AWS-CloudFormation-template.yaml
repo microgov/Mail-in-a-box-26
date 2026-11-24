@@ -27,7 +27,9 @@
 #   (e.g., mail-postfix.sh, nextcloud.sh, etc., as required in the Ubuntu 22.04 fork)
 # ==============================================================================
 
-# passes linting with codium as of 202611220012
+# passes linting with codium as of 202611232124
+# editing complete - i hope.
+# prolly will work now. 202611232154
 
 
 
@@ -307,16 +309,43 @@ Resources:
           hash -r
           # Ensure CloudFormation is signaled on exit/failure
           trap '/opt/aws/bin/cfn-signal -e $? --stack ${AWS::StackName} --resource EC2Instance --region ${AWS::Region}' EXIT
+
+          #
           # 4. Query IMDSv2 Metadata Safely (replaces deprecated ec2metadata)
-          IMDS_TOKEN=$(curl -s -X PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 21600")
-          export PRIVATE_IP=$(curl -s -H "X-aws-ec2-metadata-token: $IMDS_TOKEN" http://169.254.169.254/latest/meta-data/)
-          export INSTANCE_ID=$(curl -s -H "X-aws-ec2-metadata-token: $IMDS_TOKEN" http://169.254.169.254/latest/meta-data/)
+          # IMDS_TOKEN=$(curl -s -X PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 21600")
+          # export PRIVATE_IP=$(curl -s -H "X-aws-ec2-metadata-token: $IMDS_TOKEN" http://169.254.169.254/latest/meta-data/local-ipv4)
+          # export INSTANCE_ID=$(curl -s -H "X-aws-ec2-metadata-token: $IMDS_TOKEN" http://169.254.169.254/latest/meta-data/instance-id)
+          # if [[ -z "${InstanceEIP}" ]]; then
+          # export PUBLIC_IP=$(curl -s -H "X-aws-ec2-metadata-token: $IMDS_TOKEN" http://169.254.169.254/latest/meta-data/public-ipv4)
+          # else
+          # export PUBLIC_IP="${InstanceEIP}"
+          # fi
+          #
+          #
+          # lets recode the above
+          # btw - i think i also fixed the above - so if left in place it probably would work now too
+
+          # 4. Query IMDSv2 Metadata Safely (replaces deprecated ec2metadata)
+          # Get a token (valid for 6 hours)
+          IMDS_TOKEN=$(curl -s -X PUT "http://169.254.169.254/latest/api/token" \
+              -H "X-aws-ec2-metadata-token-ttl-seconds: 21600")
+
+          # Function to fetch metadata using the token
+          get_metadata() {
+          curl -s -H "X-aws-ec2-metadata-token: $IMDS_TOKEN" \
+          "http://169.254.169.254/latest/meta-data/$1"
+          }
+
+          export PRIVATE_IP=$(get_metadata "local-ipv4")
+          export INSTANCE_ID=$(get_metadata "instance-id")
           if [[ -z "${InstanceEIP}" ]]; then
-          export PUBLIC_IP=$(curl -s -H "X-aws-ec2-metadata-token: $IMDS_TOKEN" http://169.254.169.254/latest/meta-data/)
+          export PUBLIC_IP=$(get_metadata "public-ipv4")
           else
           export PUBLIC_IP="${InstanceEIP}"
           fi
+          #
 
+          #
           # 5. Mail-in-a-Box Unattended Environment Variables
           export NONINTERACTIVE=1
           export SKIP_NETWORK_CHECKS=1
@@ -354,7 +383,7 @@ Resources:
           id -u $STORAGE_USER &>/dev/null || useradd -m $STORAGE_USER
           mkdir -p $STORAGE_ROOT
           git clone "${MailInABoxCloneUrl}" /opt/mailinabox
-          ln -s /opt/mailinabox /root/mailinabox # not sure about this - needs review - see old-miab-servr-examination_202611231738.txt --> /root/mailinabox does not exist
+          ln -s /opt/mailinabox /root/mailinabox
           cd /opt/mailinabox && git checkout "${MailInABoxBranchOrTag}"
 
           # 7. Restore from S3 Backup (if RestorePrefix is provided)
