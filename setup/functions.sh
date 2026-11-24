@@ -96,6 +96,70 @@ function apt_install {
 	apt_get_quiet install "$@"
 }
 
+function apt_install_held {
+	# apt_install "$2"..., while the packages' own scripts may not start or
+	# restart the unit "$1" (B224). dovecot-core restarts Dovecot whenever a
+	# package adds a module of it (its dpkg trigger), and that restart comes
+	# with the old configuration, before setup has written the new one:
+	# setup's own restart (load_dovecot) follows a few seconds later. Each
+	# restart takes Dovecot's auth socket away for a moment, and every new
+	# submission process of Postfix that meets that moment exits ("no SASL
+	# authentication mechanisms"), after which Postfix's master throttles
+	# the service. Held this way, Dovecot is restarted once, by setup.
+	#
+	# Done with a policy-rc.d of our own (invoke-rc.d and deb-systemd-invoke
+	# ask it), only while the unit runs, and never over a policy-rc.d that
+	# is not ours (a container's): then this is apt_install. The file is
+	# removed right after apt-get, also when it fails; one left by a setup
+	# run that was killed in that moment is replaced and removed by the
+	# next. A unit whose package was updated in the same call keeps running
+	# the old program until setup restarts it (service_runs_current_package).
+	local unit=$1 policy=/usr/sbin/policy-rc.d rc=0
+	local mark="# mailinabox: setup holds $1 (apt_install_held in setup/functions.sh)"
+	shift
+	if [ -e "$policy" ] && ! grep -qxF "$mark" "$policy" 2> /dev/null; then
+		apt_install "$@"
+		return
+	fi
+	if ! systemctl is-active --quiet "$unit".service; then
+		rm -f "$policy"
+		apt_install "$@"
+		return
+	fi
+	# Its arguments: [--quiet] UNIT ACTION [RUNLEVEL] (invoke-rc.d passes
+	# --quiet first when it was given it).
+	printf '#!/bin/sh\n%s\nfor a; do case "$a" in %s|%s.service) exit 101 ;; esac; done\nexit 0\n' "$mark" "$unit" "$unit" > "$policy"
+	chmod 755 "$policy"
+	( apt_install "$@" ) || rc=$?
+	rm -f "$policy"
+	if [ "$rc" != 0 ]; then exit "$rc"; fi
+}
+
+function flush_local_deferred {
+	# Retries now the deferred mail that waited for a service on the box
+	# itself (B225): setup restarts spampd and Dovecot, and mail that
+	# Postfix handed to them in that moment (port 10025 refused, or the
+	# connection lost) would wait for Postfix's next try, up to 5 minutes
+	# (minimal_backoff_time). Only those mails: other deferred mail keeps
+	# its schedule, so a mail server that throttles the box is not asked
+	# again at once. Held mail (the sending limit) is not deferred mail and
+	# stays held.
+	systemctl is-active --quiet postfix || return 0
+	local id
+	{ postqueue -j 2> /dev/null || true; } | python3 -c '
+import json, sys
+for line in sys.stdin:
+	try:
+		m = json.loads(line)
+	except ValueError:
+		continue
+	if m.get("queue_name") == "deferred" and any("127.0.0.1[127.0.0.1]" in (r.get("delay_reason") or "") for r in m.get("recipients", [])):
+		print(m.get("queue_id", ""))
+' | while read -r id; do
+		[[ "$id" =~ ^[0-9A-Za-z]+$ ]] && postqueue -i "$id" > /dev/null 2>&1 || true
+	done
+}
+
 function get_default_hostname {
 	# Guess the machine's hostname. It should be a fully qualified
 	# domain name suitable for DNS. None of these calls may provide
@@ -245,17 +309,164 @@ function service_runs_current_package {
 	# python3), which the restarts of earlier versions picked up on every
 	# run: the kernel shows a replaced file of a process's mappings as
 	# "(deleted)" in /proc/PID/maps (what needrestart looks at, too).
-	local unit=$1 pkg=$2 started installed pid
+	#
+	# PACKAGE may name more packages after the unit's own, separated by
+	# spaces: libraries that the program reads rather than maps, such as the
+	# Perl modules of spampd, postgrey and munin-node (an update of
+	# SpamAssassin's modules changes nothing in spampd's package and shows no
+	# "(deleted)" mapping). These others count only when they are installed.
+	local unit=$1 pkg=$2 started installed pid p first=1
+	local pkgs=()
 	systemctl is-active --quiet "$unit" || return 1
 	started=$(systemctl show -P ActiveEnterTimestamp "$unit" 2> /dev/null || true)
 	[ -n "$started" ] || return 1
 	started=$(date -d "$started" +%s 2> /dev/null) || return 1
-	installed=$(dpkg-query -W -f='${db-fsys:Last-Modified}' "$pkg" 2> /dev/null || true)
-	[[ $installed =~ ^[0-9]+$ ]] || return 1
-	[ "$installed" -le "$started" ] || return 1
+	read -r -a pkgs <<< "$pkg" # empty: a service of no package of its own
+	for p in "${pkgs[@]}"; do
+		installed=$(dpkg-query -W -f='${db-fsys:Last-Modified}' "$p" 2> /dev/null || true)
+		if [[ ! $installed =~ ^[0-9]+$ ]]; then
+			[ -z "$first" ] || return 1
+		elif [ "$installed" -gt "$started" ]; then
+			return 1
+		fi
+		first=
+	done
 	pid=$(systemctl show -P MainPID "$unit" 2> /dev/null || true)
 	[[ $pid =~ ^[1-9][0-9]*$ ]] || return 1
 	! grep -qE ' /(usr/)?(lib|lib64|libexec|bin|sbin)/[^ ]* \(deleted\)$' "/proc/$pid/maps" 2> /dev/null
+}
+
+function unit_invocation {
+	# unit_invocation UNIT
+	# The InvocationID of UNIT's current run, or nothing. systemd gives a unit
+	# a new one each time it starts (at boot, at a restart by setup, an
+	# administrator, a package or a hook); a reload keeps it.
+	local id
+	id=$(systemctl show -P InvocationID "$1" 2> /dev/null || true)
+	if [[ $id =~ ^[0-9a-f]{32}$ ]]; then
+		echo "$id"
+	fi
+}
+
+function record_matches {
+	# record_matches UNIT RECORD SUM
+	# True when RECORD ("SUM INVOCATION", written by write_record right after
+	# setup restarted or reloaded UNIT) names SUM and the run of UNIT that is
+	# active now. Any other start of UNIT since makes it false: what the unit
+	# read then is not known. A downgrade to a version that keeps no record
+	# (v78-r2604.4 restarts these services on every run, with its own code
+	# and configuration) and the way back up give the same checksum as
+	# before the downgrade, also with a reboot in between (the services
+	# start at boot from the old checkout and the old files then), and the
+	# old version would have kept running. The start time of the unit cannot
+	# tell these apart from a plain reboot. The price: one more restart (or
+	# reload) at the first setup run after a reboot or after a restart by
+	# something else, unless that restart recorded itself (refresh_record).
+	local inv
+	inv=$(unit_invocation "$1")
+	[ -n "$inv" ] && [ "$(cat "$2" 2> /dev/null || true)" = "$3 $inv" ]
+}
+
+function write_record {
+	# write_record UNIT RECORD SUM
+	# Records SUM with the run of UNIT that is active now (record_matches).
+	mkdir -p "$(dirname "$2")"
+	echo "$3 $(unit_invocation "$1")" > "$2"
+}
+
+function refresh_record {
+	# refresh_record UNIT ARG...
+	# For a restart of UNIT by something of the box's own, such as spampd's
+	# sa-update hook: when UNIT's record names the checksum of what it reads
+	# now (ARG..., as for restart_on_change), the run of UNIT that is active
+	# now started with the files that setup recorded, and it is recorded
+	# (write_record), so that the next setup run does not restart it once
+	# more. Nothing otherwise (no record; other files, e.g. those of a
+	# downgrade; UNIT does not run): the next setup run restarts it then.
+	local unit=$1 sum record
+	shift
+	record=/var/lib/mailinabox/$unit-config.sha256
+	systemctl is-active --quiet "$unit.service" || return 0
+	sum=$(config_checksum "$@")
+	if [ "$(cut -d' ' -f1 "$record" 2> /dev/null || true)" = "$sum" ]; then
+		write_record "$unit.service" "$record" "$sum"
+	fi
+}
+
+function record_hook {
+	# record_hook UNIT ARG...
+	# Prints a bash script that runs refresh_record UNIT ARG..., with the
+	# functions it needs (from this file, so that it computes the checksum
+	# as setup does). It always exits with 0.
+	echo '#!/bin/bash'
+	echo "# Written by Mail-in-a-Box setup: records the run of $1 that a hook before this one started, see refresh_record in setup/functions.sh."
+	echo 'PATH=/usr/sbin:/usr/bin:/sbin:/bin'
+	declare -f config_checksum unit_invocation write_record refresh_record
+	printf 'refresh_record'
+	printf ' %q' "$@"
+	echo ' || true'
+	echo 'exit 0'
+}
+
+function config_checksum {
+	# The SHA-256 of what a service reads when it starts, for restart_on_change.
+	# Each argument is
+	#   FILE       its content ("missing" when it does not exist);
+	#   tree:DIR   the names and contents of the regular files below DIR
+	#              (without Python's __pycache__ directories);
+	#   dir:DIR    the names in DIR, with their types and the targets of the
+	#              symbolic links (Munin's plugins), not their contents;
+	#   stat:FILE  its name, inode, size and time, read without following a
+	#              symbolic link and without opening it (a file of another
+	#              account, such as the DKIM key, which root does not read).
+	# All of them are in directories of root's own, except the stat: ones.
+	local a
+	for a in "$@"; do
+		case "$a" in
+		tree:*)
+			echo "$a"
+			find "${a#tree:}" -name __pycache__ -prune -o -type f -print0 2> /dev/null | LC_ALL=C sort -z | xargs -0r sha256sum 2> /dev/null || true ;;
+		dir:*)
+			echo "$a"
+			find "${a#dir:}" -mindepth 1 -maxdepth 1 -printf '%f %y %l\n' 2> /dev/null | LC_ALL=C sort || true ;;
+		stat:*)
+			stat -c '%n %i %s %Y' -- "${a#stat:}" 2> /dev/null || echo "${a#stat:} missing" ;;
+		*)
+			if [ -f "$a" ]; then
+				echo "$a $(sha256sum < "$a" 2> /dev/null || echo unreadable)"
+			else
+				echo "$a missing"
+			fi ;;
+		esac
+	done | sha256sum | cut -d' ' -f1
+}
+
+function restart_on_change {
+	# restart_on_change UNIT "PACKAGE [LIBRARY-PACKAGE...]" ARG...
+	# Setup restarted OpenDKIM, OpenDMARC, spampd, postgrey, named,
+	# systemd-resolved, munin-node and the management daemon on every run,
+	# also when nothing had changed. While OpenDKIM restarts, Postfix passes
+	# mail unsigned (milter_default_action=accept); while OpenDMARC, spampd
+	# or postgrey restart, mail waits or is deferred. This restarts UNIT only
+	# when what it reads at its start (ARG..., see config_checksum) is not
+	# what it read at the last restart by setup (the checksum is kept in
+	# /var/lib/mailinabox/UNIT-config.sha256, as for Dovecot, see
+	# load_dovecot), or when it does not run or runs the program of an older
+	# PACKAGE (service_runs_current_package; empty PACKAGE: only the
+	# replaced files are checked), or when it was started since setup wrote
+	# the record, by anything else or at boot (record_matches: a downgrade
+	# and the way back up). A box updated to this version restarts each of
+	# them once more, as it has no checksums yet.
+	local unit=$1 pkg=$2 sum record
+	shift 2
+	record=/var/lib/mailinabox/$unit-config.sha256
+	sum=$(config_checksum "$@")
+	enable_service "$unit"
+	if service_runs_current_package "$unit.service" "$pkg" && record_matches "$unit.service" "$record" "$sum"; then
+		return 0
+	fi
+	hide_output service "$unit" restart
+	write_record "$unit.service" "$record" "$sum"
 }
 
 function reload_fail2ban {
@@ -295,17 +506,77 @@ function reload_postfix {
 
 function restart_php_fpm {
 	# setup/web.sh, webmail.sh, nextcloud.sh and zpush.sh each change PHP-FPM's
-	# configuration (php.ini, the pool, PHP modules). A restart ends the running
-	# requests, ActiveSync's long polls among them, and nginx answers 502 for
-	# a moment. setup/start.sh sets PHP_FPM_RESTART=later and restarts PHP-FPM
-	# once, after the last of them; a script run on its own restarts it at
-	# once. Not a reload: with process_control_timeout at 0 (the package's
-	# default) a reload ends the running requests just the same, and a reload
-	# that fails leaves PHP-FPM stopped.
+	# configuration (php.ini, the pool, PHP modules). setup/start.sh sets
+	# PHP_FPM_RESTART=later and loads it once, after the last of them; a
+	# script run on its own loads it at once (load_php_fpm).
 	if [ "${PHP_FPM_RESTART:-}" = later ]; then
 		return 0
 	fi
-	restart_service php"$PHP_VER"-fpm
+	load_php_fpm
+}
+
+function load_php_fpm {
+	# Setup restarted PHP-FPM once per run (B122). A restart ends every
+	# running request, ActiveSync's long polls among them, and nginx answers
+	# 502 for them and, for a second, for new ones (ActiveSync, CalDAV and
+	# CardDAV, webmail, Nextcloud).
+	#
+	# Now nothing is done when PHP-FPM runs the program of the current
+	# package, was not started since by anything else or at boot
+	# (record_matches), and its configuration is the one it loaded last: the files in
+	# /etc/php/VER/fpm (php.ini, php-fpm.conf, the pools, the modules in
+	# conf.d) and mods-available, as a checksum in
+	# /var/lib/mailinabox/php-fpm-config.sha256 (config_checksum). PHP code
+	# that setup replaces needs nothing: opcache checks the files' times
+	# (opcache.revalidate_freq=1, setup/nextcloud.sh).
+	#
+	# Otherwise a reload: PHP-FPM runs its program again in the same process
+	# (SIGUSR2), which reads php-fpm.conf, the pools, php.ini and the modules
+	# (conf.d) anew, as a restart does, and keeps the listening socket, so no
+	# connection is refused: new requests wait in its queue until the new
+	# workers take them. First the old workers finish their running
+	# requests, for up to process_control_timeout (setup/web.sh sets 5 s;
+	# with the package's 0 a reload ends them at once); a longer request,
+	# such as an ActiveSync Ping, is ended then (nginx answers it with 502,
+	# as at a restart), and new requests wait that long. php-fpm -t first: a
+	# reload with a configuration that PHP-FPM refuses would stop it, so the
+	# restart below shows the error then. The reload is asynchronous: setup
+	# waits until PHP-FPM logs that it is ready again ("ready to handle
+	# connections" in its log after the reload), and restarts it if it has
+	# not within 30 s or no longer runs.
+	#
+	# A restart also when PHP-FPM does not run (setup/nextcloud.sh stopped it
+	# for an upgrade of Nextcloud) or runs the program of an older package or
+	# a replaced module (service_runs_current_package).
+	local unit=php$PHP_VER-fpm log=/var/log/php$PHP_VER-fpm.log sum size i
+	local record=/var/lib/mailinabox/php-fpm-config.sha256
+	sum=$(config_checksum "tree:/etc/php/$PHP_VER/fpm" "dir:/etc/php/$PHP_VER/fpm/conf.d" \
+		"tree:/etc/php/$PHP_VER/mods-available" "tree:/etc/systemd/system/$unit.service.d")
+	enable_service "$unit"
+	if service_runs_current_package "$unit.service" "$unit"; then
+		if record_matches "$unit.service" "$record" "$sum"; then
+			return 0
+		fi
+		if "php-fpm$PHP_VER" -t > /dev/null 2>&1; then
+			size=$(stat -c %s "$log" 2> /dev/null || echo 0)
+			if systemctl reload "$unit" > /dev/null 2>&1; then
+				for i in $(seq 300); do
+					if [[ $(tail -c "+$((size + 1))" "$log" 2> /dev/null || true) == *"ready to handle connections"* ]]; then
+						if systemctl is-active --quiet "$unit"; then
+							write_record "$unit.service" "$record" "$sum"
+							return 0
+						fi
+						break
+					fi
+					systemctl is-active --quiet "$unit" || break
+					sleep 0.1
+				done
+			fi
+		fi
+		echo "PHP-FPM did not load its new configuration with a reload; restarting it."
+	fi
+	hide_output service "$unit" restart
+	write_record "$unit.service" "$record" "$sum"
 }
 
 function stop_php_fpm {
@@ -360,38 +631,75 @@ function load_dovecot {
 	# of the reload (it keeps the old configuration when the new one fails at
 	# runtime, e.g. a listener it cannot bind, which doveconf -n does not
 	# see), Dovecot is restarted, which fails loudly then.
-	local conf sum before i reloaded record=/var/lib/mailinabox/dovecot-config.sha256
+	#
+	# A second checksum covers only the passdbs and userdbs (their blocks in
+	# doveconf -n and the Lua scripts): when they change, Dovecot is
+	# restarted instead (B223). It is recorded in
+	# /var/lib/mailinabox/dovecot-auth.sha256 together with the checksum of
+	# the whole configuration it was loaded with: it counts only while the
+	# record of the whole configuration still names that one, so a box
+	# without the file (an update from v78-r2604.4 or older) and a box that
+	# an older version loaded since (a downgrade and the way back up) count
+	# as changed.
+	local conf sum auth_sum before i reloaded record=/var/lib/mailinabox/dovecot-config.sha256
+	local auth_record=/var/lib/mailinabox/dovecot-auth.sha256
 	conf=$(doveconf -n 2>&1) || { echo; echo "FAILED: doveconf -n"; echo "$conf"; exit 1; }
+	auth_sum=$( {
+		awk 'depth == 0 && /^(passdb|userdb)([ \t]|\{|$)/ { on = 1 }
+			on { print; n = gsub(/\{/, "{"); m = gsub(/\}/, "}"); depth += n - m; if (depth <= 0) { on = 0; depth = 0 } }' <<< "$conf"
+		sha256sum /usr/local/lib/mailinabox/dovecot-auth-guard/*.lua 2> /dev/null || true
+	} | sha256sum | cut -d' ' -f1)
 	sum=$( {
 		grep -v '^#' <<< "$conf"
 		sed -nE 's/^ *(ssl_server_)?(cert|key|dh)_file = //p' <<< "$conf" | while read -r f; do
 			stat -L -c '%n %i %s %Y' -- "$f" 2> /dev/null || echo "$f missing"
 		done
+		# The Lua scripts of the auth process (the limit of failed logins
+		# from the box itself, setup/mail-users.sh) are read when it starts:
+		# their content (lua_file, and the library they load).
+		sha256sum /usr/local/lib/mailinabox/dovecot-auth-guard/*.lua 2> /dev/null || true
 	} | sha256sum | cut -d' ' -f1)
 	enable_service dovecot
-	if service_runs_current_package dovecot.service dovecot-core && doveadm process status > /dev/null 2>&1; then
+	# The packages of Dovecot's modules count too: a module installed while
+	# Dovecot ran (its restart held back by apt_install_held, B224) needs a
+	# restart.
+	if service_runs_current_package dovecot.service "dovecot-core dovecot-imapd dovecot-pop3d dovecot-lmtpd dovecot-sqlite dovecot-sieve dovecot-managesieved dovecot-auth-lua dovecot-fts-xapian" \
+			&& doveadm process status > /dev/null 2>&1; then
 		if [ "$(cat "$record" 2> /dev/null || true)" = "$sum" ]; then
+			# Dovecot runs this configuration, so also these passdbs.
+			[ "$(cat "$auth_record" 2> /dev/null || true)" = "$auth_sum $sum" ] || echo "$auth_sum $sum" > "$auth_record"
 			return 0
 		fi
-		before=$(stat -c %Y.%i /run/dovecot/dovecot.conf.binary 2> /dev/null || true)
-		hide_output systemctl reload dovecot
-		reloaded=
-		for i in $(seq 100); do
-			if [ "$(stat -c %Y.%i /run/dovecot/dovecot.conf.binary 2> /dev/null || true)" != "$before" ]; then
-				reloaded=1
-				break
-			fi
-			sleep 0.1
-		done
-		if [ -z "$reloaded" ]; then
-			echo "Dovecot did not load its new configuration within 10 seconds of the reload; restarting it."
+		if [ "$(cat "$auth_record" 2> /dev/null || true)" != "$auth_sum $(cat "$record" 2> /dev/null || true)" ]; then
+			# A new passdb or userdb: a restart, not a reload (B223). On a
+			# reload, the auth processes that still answer logins with the
+			# old passdbs meet the new ones ("Auth worker sees different
+			# passdbs/userdbs than auth server"), the auth process of
+			# Dovecot 2.4 can then die on an assertion, and the logins in
+			# that moment fail.
 			hide_output service dovecot restart
+		else
+			before=$(stat -c %Y.%i /run/dovecot/dovecot.conf.binary 2> /dev/null || true)
+			hide_output systemctl reload dovecot
+			reloaded=
+			for i in $(seq 100); do
+				if [ "$(stat -c %Y.%i /run/dovecot/dovecot.conf.binary 2> /dev/null || true)" != "$before" ]; then
+					reloaded=1
+					break
+				fi
+				sleep 0.1
+			done
+			if [ -z "$reloaded" ]; then
+				echo "Dovecot did not load its new configuration within 10 seconds of the reload; restarting it."
+				hide_output service dovecot restart
+			fi
 		fi
 	else
 		hide_output service dovecot restart
 	fi
 	mkdir -p /var/lib/mailinabox
 	echo "$sum" > "$record"
+	echo "$auth_sum $sum" > "$auth_record"
 }
 
 function reload_nginx {
@@ -413,6 +721,40 @@ function reload_nginx {
 	fi
 	hide_output nginx -t
 	hide_output service nginx reload
+}
+
+function update_check_hint {
+	# A short hint at tools/update-check.sh at the end of a setup run on an
+	# existing box (setup/start.sh; not on a first install, and not when the
+	# in-place upgrade or the migration tool runs setup: they have their own
+	# reports). When the newest record in /root/update-check (as the tool,
+	# UPDATE_CHECK_DIR) has a state from before an update but none from after
+	# it, this run is most likely that update: name "after" and "mailcheck"
+	# with that record. Otherwise the general tip. It never stops setup.
+	local root=${UPDATE_CHECK_DIR:-/root/update-check} d newest='' tool
+	tool="$(pwd)/tools/update-check.sh"
+	if [ -d "$root" ] && [ ! -L "$root" ]; then
+		for d in "$root"/[0-9]*-[0-9]*; do
+			[ -d "$d" ] && [ ! -L "$d" ] || continue
+			[[ ${d##*/} =~ ^[0-9]{8}-[0-9]{6}$ ]] || continue
+			newest=$d # the glob is sorted, the last one is the newest
+		done
+	fi
+	echo
+	if [ -n "$newest" ] && [ -f "$newest/before/time.txt" ] && [ ! -e "$newest/after" ]; then
+		echo "tools/update-check.sh recorded the state of this box before an update,"
+		echo "but not yet after it ($newest)."
+		echo "To compare the state and to test the mail round trip now:"
+		echo
+		echo "  sudo $tool after --dir ${newest##*/}"
+		echo "  sudo $tool mailcheck --dir ${newest##*/}"
+	else
+		echo "Tip: tools/update-check.sh can check an update of this box: \"before\" and"
+		echo "\"backup\" before the next update, \"after\" and \"mailcheck\" after it"
+		echo "(optional; see \"Updating the fork\" in README-fork.md)."
+	fi
+	echo
+	return 0
 }
 
 ## Dialog Functions ##

@@ -16,23 +16,28 @@ source setup/preflight.sh
 # user) could have put it there (B147). Checked here first, with the same
 # rules (tools/write_conf.py --check-own), so that such a box stops before
 # setup has changed anything, not in the middle of the run; the checks at
-# those places stay. STORAGE_ROOT as questions.sh takes it below (the
+# those places stay. $STORAGE_ROOT/mail and users.sqlite must also belong to
+# root already (--check-own-root-only, as setup/mail-users.sh takes them only
+# then, B210). STORAGE_ROOT as questions.sh takes it below (the
 # environment, /etc/mailinabox.conf, /home/user-data).
 pf_conf() { { sed -n "s/^$1=//p" /etc/mailinabox.conf 2> /dev/null || true; } | tail -n 1; }
 pf_root=${STORAGE_ROOT:-$(pf_conf STORAGE_ROOT)}
 pf_user=${STORAGE_USER:-$(pf_conf STORAGE_USER)}
 pf_root=${pf_root:-/home/${pf_user:-user-data}}
-pf_problems=$(tools/write_conf.py --check-own "$pf_root/mail" "$pf_root/mail/users.sqlite" \
-	"$pf_root/mail/roundcube/roundcube.sqlite" "$pf_root/mail/postgrey" "$pf_root/mail/postgrey/db" \
-	"$pf_root/mail/dkim" "$pf_root/mail/spamassassin" 2>&1 || true)
+pf_problems=$( {
+	tools/write_conf.py --check-own-root-only "$pf_root/mail" "$pf_root/mail/users.sqlite" || true
+	tools/write_conf.py --check-own "$pf_root/mail/roundcube/roundcube.sqlite" "$pf_root/mail/postgrey" \
+		"$pf_root/mail/postgrey/db" "$pf_root/mail/dkim" "$pf_root/mail/spamassassin" || true
+} 2>&1 | awk '!seen[$0]++')
 if [ -L "$pf_root/mailinabox.version" ] || { [ -e "$pf_root/mailinabox.version" ] && [ ! -f "$pf_root/mailinabox.version" ]; }; then
 	pf_problems+="${pf_problems:+$'\n'}$pf_root/mailinabox.version is not a regular file"
 fi
 if [ -n "$pf_problems" ]; then
 	echo
 	echo "Setup stopped before it changed anything. It no longer follows a symbolic"
-	echo "link, or changes a database with a second hard link, in these places, as"
-	echo "another account could have put them there (B147):"
+	echo "link, changes a database with a second hard link, or takes over a mail/ or"
+	echo "users.sqlite of another owner, in these places, as another account could"
+	echo "have put them there (B147, B210):"
 	echo
 	echo "  ${pf_problems//$'\n'/$'\n'  }"
 	echo
@@ -41,6 +46,9 @@ if [ -n "$pf_problems" ]; then
 	echo "* A second hard link of users.sqlite or roundcube.sqlite: find its other name with"
 	echo "  \"find / -xdev -samefile FILE\" and remove that name, unless you made it on"
 	echo "  purpose (the account www-data can make such a link)."
+	echo "* $pf_root/mail or users.sqlite of another owner than root, e.g. a copy that did"
+	echo "  not keep the owner: check it (the storage user could have put it there), and"
+	echo "  give it to root with \"chown root:root PATH\" if it is the box's own."
 	echo "* mailinabox.version must be a regular file with the number of the last migration."
 	echo
 	echo "Then run setup again."
@@ -182,9 +190,12 @@ f=$STORAGE_ROOT
 while [[ $f != / ]]; do chmod a+rx "$f"; f=$(dirname "$f"); done;
 # The storage user may write in STORAGE_ROOT (its home), so the file is
 # written and given to it without following a symbolic link there (B147).
+# The number also goes into a record of root's own, which setup trusts over a
+# lower number in the file (setup/migrate.py, B211).
 if [ ! -f "$STORAGE_ROOT/mailinabox.version" ]; then
 	setup/migrate.py --current | tools/write_conf.py "$STORAGE_ROOT/mailinabox.version" 644
 	tools/write_conf.py --own "$STORAGE_ROOT/mailinabox.version" "$STORAGE_USER" "$STORAGE_USER" 644
+	setup/migrate.py --record "$STORAGE_ROOT" "$(setup/migrate.py --current)"
 fi
 
 # Save the global options in /etc/mailinabox.conf so that standalone
@@ -219,9 +230,9 @@ elif [ -n "$PROBE_ADDRESS" ]; then
 	echo "PROBE_ADDRESS=$PROBE_ADDRESS is not a plain mail address; it is left out of /etc/mailinabox.conf."
 fi
 
-# Start service configuration. PHP-FPM is restarted once, after zpush.sh, not
-# by each script that changes its configuration (restart_php_fpm in
-# setup/functions.sh).
+# Start service configuration. PHP-FPM loads its configuration once, after
+# zpush.sh, not for each script that changes it (restart_php_fpm and
+# load_php_fpm in setup/functions.sh).
 PHP_FPM_RESTART=later
 source setup/system.sh
 source setup/ssl.sh
@@ -279,6 +290,10 @@ if [ "$f2b_setup_rc" = 3 ]; then
 	reload_fail2ban --restart
 elif [ "$f2b_setup_rc" = 0 ]; then
 	reload_fail2ban
+elif [ "$f2b_setup_rc" = 4 ]; then
+	# Turned off under System > Intrusion Detection and Prevention (for tests).
+	echo "fail2ban is turned off (System > Intrusion Detection and Prevention): no address is banned after failed logins."
+	hide_output systemctl disable --now fail2ban
 else
 	exit "$f2b_setup_rc"
 fi
@@ -315,6 +330,10 @@ echo
 certbot register --register-unsafely-without-email --agree-tos --config-dir "$STORAGE_ROOT/ssl/lets_encrypt"
 fi
 
+# Mail to the box's users that waited for spampd or Dovecot while setup
+# restarted them goes on now, not after Postfix's backoff (B225).
+flush_local_deferred
+
 # Done.
 echo
 echo "-----------------------------------------------"
@@ -342,4 +361,11 @@ else
 	echo
 	echo "Then you can confirm the security exception and continue."
 	echo
+fi
+
+# On an existing box, point to tools/update-check.sh (not on a first install,
+# and not when tools/upgrade-in-place-to-2604.sh or tools/migrate-to-2604.sh
+# run setup: they set MIAB_SETUP_TOOL and have their own reports).
+if [ -z "${FIRST_TIME_SETUP:-}" ] && [ -z "${MIAB_SETUP_TOOL:-}" ]; then
+	update_check_hint
 fi

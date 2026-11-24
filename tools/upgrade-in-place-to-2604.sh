@@ -82,6 +82,14 @@
 #     warning (the upgrade is not undone).
 # After the hooks of local-ext, "doveconf -n" must succeed without warnings.
 #
+# Local changes to Roundcube (plugins that setup does not install, changes to
+# config/config.inc.php) do not block: setup installs a new Roundcube and
+# writes its own config.inc.php. The preflight check names them, the old
+# config.inc.php and those plugins are kept in /root/upgrade-2604/old-roundcube
+# (the whole old tree in the system archive), phase verify lists what is still
+# missing (also in etc-report.txt and, until --ack-local, in System Status).
+# They are not copied back on their own; a hook (see above) can do that.
+#
 # See --help.
 #########################################################
 
@@ -110,6 +118,12 @@ HOOK_DIR=/etc/mailinabox/upgrade-2604.d
 # Hook stages before (mail goes offline) and after (finish); see the header.
 HOOK_BEFORE_DIR=$HOOK_DIR/before
 HOOK_AFTER_DIR=$HOOK_DIR/after
+# Roundcube (setup/webmail.sh): what this tool keeps of the old one before
+# setup, and the local changes that are still open after the final check
+# (System Status warns while the file exists, see management/status_checks.py).
+RC_DIR=/usr/local/lib/roundcubemail
+OLD_RC=$STATE_DIR/old-roundcube
+LOCAL_CHANGES=$STATE_DIR/local-changes.json
 SCRIPT_NAME=upgrade-in-place-to-2604.sh
 RESUME_UNIT=mailinabox-upgrade-2604-resume.service
 RESUME_UNIT_FILE=/etc/systemd/system/$RESUME_UNIT
@@ -140,7 +154,7 @@ MOTD_END="### end $SCRIPT_NAME"
 DEFAULT_SOURCE=https://github.com/LM1337/Mail-in-a-box-26
 # Raw files of the branch main (GitHub serves them from another host).
 DEFAULT_RAW=https://raw.githubusercontent.com/LM1337/Mail-in-a-box-26/main
-DEFAULT_TAG=v78-r2604.4 # keep in sync with setup/bootstrap.sh
+DEFAULT_TAG=v78-r2604.5 # keep in sync with setup/bootstrap.sh
 CLONE_DIR=/root/mailinabox
 PHP_VER=8.5        # keep in sync with setup/functions.sh
 PHP_LEGACY_VER=8.2 # keep in sync with setup/system.sh
@@ -233,7 +247,7 @@ usage() {
 	cat <<'EOF'
 Usage: upgrade-in-place-to-2604.sh --check [options]     (start here)
        upgrade-in-place-to-2604.sh [options]
-       upgrade-in-place-to-2604.sh --status [--verbose] | --rollback | --finish
+       upgrade-in-place-to-2604.sh --status [--verbose] | --rollback | --finish | --ack-local
                                    | --cleanup-only [--old-checkout]
 
 Upgrades THIS Mail-in-a-Box in place to Ubuntu 26.04 and this fork: Ubuntu
@@ -297,6 +311,9 @@ Control:
                           services again, resume the backups
   --finish                accept a final check with differences: start the
                           remaining services, resume the backups
+  --ack-local             after the upgrade: end System Status's warning about
+                          local Roundcube changes that the upgrade did not
+                          carry over (removes /root/upgrade-2604/local-changes.json)
   --ssh-fallback-test     before the upgrade: start the fallback SSH server of
                           the release upgrades (see below) for 10 minutes, to
                           try a login on its port from where you work
@@ -425,7 +442,22 @@ on_exit() {
 			echo "The full output is in $LOG_FILE."
 			echo "Fix the cause and run the command again; it continues where it stopped."
 		fi
-		if downtime_active && [ -n "$(state_get SETUP_END_EPOCH)" ]; then
+		if downtime_active && [ -n "$(state_get REDO_EPOCH)" ]; then
+			# A redo (--redo-from) that stopped (B161).
+			echo
+			if [ -n "$(state_get SETUP_END_EPOCH)" ]; then
+				echo "Mail runs (setup has finished), but the redo (--redo-from $(state_get REDO_PHASE), since $(state_get REDO_AT)) is not finished."
+			else
+				echo "Setup runs again (--redo-from $(state_get REDO_PHASE), since $(state_get REDO_AT)) and has not finished:"
+				echo "mail may be offline until it has."
+			fi
+			if [ "$(state_get REDO_AFTER_FINISH)" = 1 ]; then
+				echo "The upgrade had finished before: cron jobs, update timers and backups run (the redo does not pause them)."
+			else
+				echo "Cron jobs, update timers and backups stay paused until the upgrade is finished."
+			fi
+			echo "Continue with: $SELF$([ "$(state_get VERIFY_RAN)" != 1 ] || echo " (or --finish)")"
+		elif downtime_active && [ -n "$(state_get SETUP_END_EPOCH)" ]; then
 			echo
 			echo "Mail runs again (setup has finished), but the upgrade is not finished: cron jobs,"
 			# --finish only accepts a final check that has run (B161).
@@ -673,7 +705,7 @@ rm -f "$env_file"
 printf "%s\n\n" "$hint"
 "$@"
 rc=$?
-echo "$rc" > "$rc_file"
+(umask 077 && echo "$rc" > "$rc_file")
 echo
 echo "The command ended with exit code $rc. Press Enter to close this window${close:+ (it closes by itself after $close seconds, --yes)}."
 wait_enter
@@ -1038,6 +1070,405 @@ for p in cache.packages:
 EOF
 )
 
+# Local changes to Roundcube: plugin directories that setup does not install,
+# and the plugin list and other settings of config/config.inc.php that differ
+# from what setup writes ("check"), or that the Roundcube after setup does
+# not have ("verify", which also writes the file for System Status). Keep
+# in sync with the other tool (tests/fork/roundcube-local.py compares the
+# copies of tools/upgrade-in-place-to-2604.sh and tools/migrate-to-2604.sh).
+ROUNDCUBE_PY=$(cat <<'EOF'
+import json, os, re, sys, time, unicodedata
+
+# Roundcube's own plugins (1.6 and 1.7) and the three that setup adds.
+SETUP_PLUGIN_DIRS = set("""acl additional_message_headers archive attachment_reminder autologon autologout
+database_attachments debug_logger emoticons enigma example_addressbook filesystem_attachments help
+hide_blockquote http_authentication identicon identity_select jqueryui krb_authentication managesieve
+markasjunk markdown_editor new_user_dialog new_user_identity newmail_notifier password reconnect
+redundant_attachments show_additional_headers squirrelmail_usercopy subscriptions_option userinfo
+vcard_attachments virtuser_file virtuser_query zipdownload persistent_login html5_notifier carddav""".split())
+# The settings that setup writes into config/config.inc.php (setup/webmail.sh,
+# normalized as by norm()). None: the value is the box's own (its key, name,
+# paths, the support link of upstream or this fork).
+SETUP_SETTINGS = {
+	"log_dir": "'/var/log/roundcubemail/'",
+	"temp_dir": "'/var/tmp/roundcubemail/'",
+	"db_dsnw": None,
+	"imap_host": "'ssl://localhost:993'",
+	"imap_conn_options": "array('ssl'=>array('verify_peer'=>false,'verify_peer_name'=>false))",
+	"imap_timeout": "15",
+	"smtp_host": "'tls://127.0.0.1'",
+	"smtp_conn_options": "array('ssl'=>array('verify_peer'=>false,'verify_peer_name'=>false))",
+	"support_url": None,
+	"product_name": None,
+	"cipher_method": "'AES-256-CBC'",
+	"des_key": None,
+	"plugins": "array('html5_notifier','archive','zipdownload','password','managesieve','jqueryui','persistent_login','carddav')",
+	"skin": "'elastic'",
+	"login_autocomplete": "2",
+	"login_username_filter": "'email'",
+	"password_charset": "'UTF-8'",
+	"junk_mbox": "'Spam'",
+	"session_path": "'/mail/'",
+	"session_samesite": "'Strict'",
+	"quota_zero_as_unlimited": "true",
+	"skin_logo": None,
+}
+NAME_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_.-]{0,99}$")
+MAX_ITEMS = 100
+
+
+def shown(s, n=120):
+	# Text for the terminal, the report and System Status: control and format
+	# characters (escape sequences, bidi overrides) become "?".
+	s = "".join("?" if unicodedata.category(c)[0] == "C" else c for c in s)
+	return s if len(s) <= n else s[:n - 3] + "..."
+
+
+class Unreadable(Exception):
+	pass
+
+
+def statements(text):
+	# The PHP statements of the file, normalized: comments removed, white space
+	# only where two words meet, strings as written. Returns (line, text) pairs.
+	out, cur, line, start, depth, i, n = [], [], 1, None, 0, 0, len(text)
+	space = False
+
+	def add(tok):
+		nonlocal space, start
+		if start is None:
+			start = line
+		if space and cur and re.match(r"[\w$]", tok[0]) and re.match(r"[\w$]", cur[-1][-1]):
+			cur.append(" ")
+		space = False
+		cur.append(tok)
+
+	def flush():
+		nonlocal cur, start, space
+		s = "".join(cur)
+		s = re.sub(r",([)\]])", r"\1", s)
+		if s:
+			out.append((start, s))
+		cur, start, space = [], None, False
+
+	php = False
+	while i < n:
+		if not php:
+			j = text.find("<?php", i)
+			rest = text[i:] if j < 0 else text[i:j]
+			if rest.strip():
+				raise Unreadable("text outside of PHP (line %d)" % (line + rest[:len(rest) - len(rest.lstrip())].count("\n")))
+			line += rest.count("\n")
+			if j < 0:
+				break
+			i, php = j + 5, True
+			continue
+		c = text[i]
+		if text.startswith("?>", i):
+			flush()
+			i, php = i + 2, False
+			continue
+		if c == "\n":
+			line += 1
+			space = True
+			i += 1
+		elif c.isspace():
+			space = True
+			i += 1
+		elif c == "#" or text.startswith("//", i):
+			j = text.find("\n", i)
+			k = text.find("?>", i)
+			if k >= 0 and (j < 0 or k < j):
+				i = k
+			else:
+				i = n if j < 0 else j
+			space = True
+		elif text.startswith("/*", i):
+			j = text.find("*/", i + 2)
+			if j < 0:
+				raise Unreadable("a comment that does not end (line %d)" % line)
+			line += text.count("\n", i, j)
+			i, space = j + 2, True
+		elif text.startswith("<<<", i):
+			raise Unreadable("a heredoc string (line %d)" % line)
+		elif c in "'\"":
+			j = i + 1
+			while j < n and text[j] != c:
+				j += 2 if text[j] == "\\" else 1
+			if j >= n:
+				raise Unreadable("a string that does not end (line %d)" % line)
+			tok = text[i:j + 1]
+			add(tok)
+			line += tok.count("\n")
+			i = j + 1
+		elif c == ";" and depth == 0:
+			flush()
+			i += 1
+		else:
+			if c in "([{":
+				depth += 1
+			elif c in ")]}":
+				depth -= 1
+			m = re.match(r"[\w$]+", text[i:])
+			tok = m.group(0) if m else c
+			add(tok)
+			i += len(tok)
+	if depth != 0 or (cur and "".join(cur).strip()):
+		raise Unreadable("a statement without its end at the end of the file")
+	return out
+
+
+SETTING_RE = re.compile(r"^\$config\[(['\"])([A-Za-z0-9_]+)\1\]=(.+)$")
+APPEND_RE = re.compile(r"^\$config\[(['\"])plugins\1\]\[\]=(['\"])([^'\"\\]*)\2$")
+INIT_RE = re.compile(r"^\$config=(array\(\)|\[\])$")
+# $config['ldap_public']['name'] = ...: a part of the setting ldap_public.
+PART_RE = re.compile(r"^\$config\[(['\"])([A-Za-z0-9_]+)\1\]\[")
+
+
+def plugin_list(value):
+	# The names in "array('a', 'b')" or "['a', 'b']", or None for anything else.
+	m = re.match(r"^(?:array\((.*)\)|\[(.*)\])$", value)
+	if not m:
+		return None
+	inner = m.group(1) if m.group(1) is not None else m.group(2)
+	if inner == "":
+		return []
+	names = []
+	for part in inner.split(","):
+		pm = re.match(r"^(['\"])([^'\"\\]*)\1$", part)
+		if not pm:
+			return None
+		names.append(pm.group(2))
+	return names
+
+
+def read_config(path):
+	# {"settings": {key: value}, "plugins": [names] or None, "other": [lines],
+	# "error": text or None}; None when there is no file.
+	try:
+		fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_NONBLOCK", 0))
+	except FileNotFoundError:
+		return None
+	except OSError as e:
+		return {"settings": {}, "plugins": None, "other": [], "error": "cannot be read (%s)" % e.strerror}
+	with os.fdopen(fd, "rb") as f:
+		data = f.read(1024 * 1024 + 1)
+	r = {"settings": {}, "plugins": None, "other": [], "error": None}
+	if len(data) > 1024 * 1024:
+		r["error"] = "is larger than 1 MB"
+		return r
+	try:
+		stmts = statements(data.decode("utf-8", "replace"))
+	except Unreadable as e:
+		r["error"] = "could not be read completely: %s" % e
+		return r
+	appended = []
+	for line, s in stmts:
+		m = SETTING_RE.match(s)
+		if m:
+			r["settings"][m.group(2)] = m.group(3)
+			if m.group(2) == "plugins":
+				appended = []
+			continue
+		m = APPEND_RE.match(s)
+		if m:
+			appended.append(m.group(3))
+			continue
+		if INIT_RE.match(s):
+			continue
+		m = PART_RE.match(s)
+		if m and m.group(2) != "plugins":
+			r["settings"][m.group(2)] = r["settings"].get(m.group(2), "") + "|" + s
+			continue
+		r["other"].append((line, s))
+	if "plugins" in r["settings"]:
+		r["plugins"] = plugin_list(r["settings"]["plugins"])
+		if r["plugins"] is not None:
+			r["plugins"] = r["plugins"] + appended
+	elif appended:
+		r["plugins"] = appended
+	return r
+
+
+def read_names(path):
+	try:
+		with open(path, encoding="utf-8", errors="replace") as f:
+			return sorted({l.rstrip("\n") for l in f if l.strip()})
+	except FileNotFoundError:
+		return []
+
+
+def name(s):
+	return s if NAME_RE.match(s) else shown(repr(s))
+
+
+def compare(old, old_dirs, new=None, new_dirs=None):
+	# The local changes of the old Roundcube that the new one does not have:
+	# against what setup installs and writes (new is None), or against the
+	# Roundcube after setup.
+	items = []
+	if new is None:
+		missing_dirs = [d for d in old_dirs if d not in SETUP_PLUGIN_DIRS]
+		items += ["plugin directory plugins/%s: setup does not install it" % name(d) for d in missing_dirs]
+	else:
+		items += ["plugin directory plugins/%s: missing now (only in the old Roundcube)" % name(d)
+			for d in old_dirs if d not in set(new_dirs)]
+	if old is None:
+		return items
+	cfg = "config/config.inc.php"
+	if old["error"]:
+		return items + ["%s %s" % (cfg, old["error"])]
+	if new is not None and new["error"]:
+		return items + ["the new %s %s" % (cfg, new["error"])]
+	if new is None:
+		ref_settings = {k: v for k, v in SETUP_SETTINGS.items()}
+		ref_plugins = plugin_list(SETUP_SETTINGS["plugins"])
+		ref_other = []
+	else:
+		ref_settings = new["settings"]
+		ref_plugins = new["plugins"]
+		ref_other = new["other"]
+	setup_plugins = plugin_list(SETUP_SETTINGS["plugins"])
+	now = "setup's list" if new is None else "the list now"
+	op = old["plugins"]
+	if op is None and "plugins" in old["settings"]:
+		items.append("plugin list: changed by hand in a form that this check does not read")
+	elif op is not None and ref_plugins is not None:
+		items += ["plugin list: %s (%s does not have it)" % (name(p), now) for p in op if p not in ref_plugins]
+		items += ["plugin list: %s is on again (the old list left it out)" % name(p)
+			for p in ref_plugins if p not in op and p in setup_plugins]
+	for k, v in sorted(old["settings"].items()):
+		if k == "plugins":
+			continue
+		if k not in SETUP_SETTINGS:
+			# Set by hand: only its name (the value may be a password).
+			if new is None:
+				items.append("setting %s: set by hand (setup does not write it)" % k)
+			elif k not in ref_settings:
+				items.append("setting %s: set by hand, missing now" % k)
+			elif ref_settings[k] != v:
+				items.append("setting %s: set by hand, has another value now" % k)
+			continue
+		# One of setup's settings, changed by hand (setup's values are no secrets).
+		if SETUP_SETTINGS[k] is None or v == SETUP_SETTINGS[k]:
+			continue
+		ref = SETUP_SETTINGS[k] if new is None else ref_settings.get(k)
+		if ref == v:
+			continue
+		if new is None:
+			items.append("setting %s: %s (setup writes %s)" % (k, shown(v, 80), shown(ref, 80)))
+		else:
+			items.append("setting %s: %s before, %s now" % (k, shown(v, 80), shown(ref, 80) if ref is not None else "not set"))
+	gone = [l for l, t in old["other"] if t not in {t2 for _, t2 in ref_other}]
+	if gone:
+		items.append("%d statement(s) that are not settings, %s (line %s of the old file)" % (
+			len(gone), "setup does not write them" if new is None else "missing now",
+			", ".join(str(l) for l in gone[:5]) + (", ..." if len(gone) > 5 else "")))
+	return items
+
+
+def web_unreadable(rc_dir, dirs, limit=20000):
+	# The local plugin directories of the Roundcube in rc_dir that the web
+	# server (www-data, which runs Roundcube) cannot read completely: a file
+	# without read permission, a directory without read and search
+	# permission for it (B186: a copy with the modes of old-roundcube/, root's
+	# only, is not loaded). Links are not followed.
+	import pwd, stat
+	try:
+		pw = pwd.getpwnam("www-data")
+		uid, groups = pw.pw_uid, set(os.getgrouplist("www-data", pw.pw_gid))
+	except (KeyError, OSError):
+		uid, groups = -1, set()
+
+	def ok(st, need):
+		bits = st.st_mode >> 6 if st.st_uid == uid else st.st_mode >> 3 if st.st_gid in groups else st.st_mode
+		return bits & need == need
+
+	items = []
+	for d in dirs:
+		if d in SETUP_PLUGIN_DIRS or not NAME_RE.match(d):
+			continue
+		top = os.path.join(rc_dir, "plugins", d)
+		if not os.path.isdir(top) or os.path.islink(top):
+			continue
+		bad, first, n = 0, None, 0
+		for root, subdirs, files in os.walk(top):
+			for entry in [None] + subdirs + files:
+				p = root if entry is None else os.path.join(root, entry)
+				n += 1
+				try:
+					st = os.lstat(p)
+				except OSError:
+					continue
+				if stat.S_ISLNK(st.st_mode):
+					continue
+				need = 5 if stat.S_ISDIR(st.st_mode) else 4
+				if (entry is None or not stat.S_ISDIR(st.st_mode)) and not ok(st, need):
+					bad += 1
+					first = first or os.path.relpath(p, os.path.join(rc_dir, "plugins"))
+			if n > limit:
+				break
+		if bad:
+			items.append("plugin directory plugins/%s: the web server (www-data) cannot read %d of its files and directories (%s%s), so Roundcube does not load it" % (
+				name(d), bad, shown(first, 80), ", ..." if bad > 1 else ""))
+	return items
+
+
+def write_json(path, tool, ack, items):
+	# Root's only, written next to it and renamed into place; the directory is
+	# root's own (0700).
+	d = os.path.dirname(path)
+	tmp = os.path.join(d, ".%s.%d" % (os.path.basename(path), os.getpid()))
+	doc = {"version": 1, "tool": tool, "ack": ack, "created": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+		"items": items[:MAX_ITEMS] + (["(%d more)" % (len(items) - MAX_ITEMS)] if len(items) > MAX_ITEMS else [])}
+	fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+	with os.fdopen(fd, "w", encoding="utf-8") as f:
+		json.dump(doc, f, indent=1, ensure_ascii=True)
+		f.write("\n")
+	os.rename(tmp, path)
+
+
+def main(argv):
+	# extra DIRS: the plugin directories that setup does not install (to keep a copy)
+	# check OLD_CONFIG OLD_DIRS
+	# verify OLD_CONFIG OLD_DIRS NEW_CONFIG NEW_DIRS [--json FILE TOOL ACK]
+	# (*_DIRS: files with the names of the plugin directories, one per line)
+	if len(argv) == 2 and argv[0] == "extra":
+		for d in read_names(argv[1]):
+			if d not in SETUP_PLUGIN_DIRS and NAME_RE.match(d) and d not in (".", ".."):
+				print(d)
+		return 0
+	if len(argv) == 3 and argv[0] == "check":
+		items = compare(read_config(argv[1]), read_names(argv[2]))
+	elif len(argv) in (5, 9) and argv[0] == "verify":
+		new = read_config(argv[3]) or {"settings": {}, "plugins": [], "other": [], "error": "is missing"}
+		# Each names file is read once: the tools pass NEW_DIRS as a pipe
+		# (process substitution), which a second read finds empty (B186).
+		old_dirs = read_names(argv[2])
+		new_dirs = read_names(argv[4])
+		items = compare(read_config(argv[1]), old_dirs, new, new_dirs)
+		items += web_unreadable(os.path.dirname(os.path.dirname(os.path.abspath(argv[3]))),
+			[d for d in new_dirs if d in old_dirs])
+		if len(argv) == 9 and argv[5] == "--json":
+			if items:
+				write_json(argv[6], argv[7], argv[8], items)
+			else:
+				try:
+					os.unlink(argv[6])
+				except FileNotFoundError:
+					pass
+	else:
+		print("usage: extra DIRS | check OLD_CONFIG OLD_DIRS | verify OLD_CONFIG OLD_DIRS NEW_CONFIG NEW_DIRS [--json FILE TOOL ACK]", file=sys.stderr)
+		return 2
+	for x in items:
+		print(shown(x, 300))
+	return 0
+
+
+sys.exit(main(sys.argv[1:]))
+EOF
+)
+
 # ---------------------------------------------------------------------------
 # Small helpers.
 
@@ -1352,6 +1783,26 @@ checkout_ref() { # DIR REF [--force]
 	fi
 }
 
+# A new shallow clone of REF from SOURCE in DIR: a tag or a branch, or a
+# full commit id (40 hex digits), which "git clone -b" does not take (B188);
+# GitHub and Gitea serve a commit of the repository by its full id. A short
+# commit id cannot be fetched: say so.
+clone_ref() { # SOURCE REF DIR
+	local src=$1 ref=$2 d=$3
+	if [[ $ref =~ ^[0-9a-f]{40}$ ]]; then
+		git -c init.defaultBranch=main init -q "$d" && git -C "$d" remote add origin "$src" \
+			&& git -C "$d" fetch -q --depth 1 origin "$ref" < /dev/null \
+			&& git -C "$d" -c advice.detachedHead=false checkout -q FETCH_HEAD && return 0
+		rm -rf "$d"
+		return 1
+	fi
+	git clone -q -b "$ref" --depth 1 "$src" "$d" < /dev/null && return 0
+	if [[ $ref =~ ^[0-9a-f]{7,39}$ ]]; then
+		warn "TAG=$ref looks like a short commit id; give a tag, a branch or the full commit id (40 hex digits)."
+	fi
+	return 1
+}
+
 # After a failed fetch or clone of the release tag: is the tag not published
 # in SOURCE (yes: the branch main may be used instead), or is it there (no:
 # the fetch failed for another reason)? Stops when SOURCE cannot be asked
@@ -1380,6 +1831,10 @@ reexec_from_clone() { # SCRIPT DIR ARGS...
 	shift 2
 	[ -z "${UPGRADE_REEXEC:-}" ] || die "Could not find tools/$script in $d."
 	local how="curl -so $script $DEFAULT_RAW/tools/$script && sudo bash $script"
+	if [ "$source" != "$DEFAULT_SOURCE" ]; then
+		# Not GitHub's copy when another source was given (B188).
+		how="sudo SOURCE=$source TAG=$tag bash $script   (tools/$script of $tag from $source, saved to a file)"
+	fi
 	command -v git > /dev/null || install_packages git
 	if [ -d "$d/.git" ]; then
 		# From an earlier run, possibly of an older release from another
@@ -1393,7 +1848,7 @@ reexec_from_clone() { # SCRIPT DIR ARGS...
 	if [ ! -d "$d/.git" ]; then
 		rm -rf "$d"
 		say "Downloading Mail-in-a-Box $tag from $source..."
-		git clone -q -b "$tag" --depth 1 "$source" "$d" < /dev/null || rm -rf "$d"
+		clone_ref "$source" "$tag" "$d" || rm -rf "$d"
 	fi
 	if [ ! -f "$d/tools/$script" ] && [ -z "${TAG:-}" ]; then
 		# The release tag may not contain this tool yet, or not be published
@@ -1491,7 +1946,7 @@ check_space() {
 		add_need /var $((3 * GIB)) "release upgrade downloads 3 GiB"
 	fi
 	# The system archive (compressed; the uncompressed size is the upper bound).
-	for p in /etc "${F[MIAB_DIR]:-/root/mailinabox}" /var/lib/z-push /var/lib/munin /usr/local/lib/owncloud /var/spool/cron /usr/local/bin; do
+	for p in /etc "${F[MIAB_DIR]:-/root/mailinabox}" /var/lib/z-push /var/lib/munin /usr/local/lib/owncloud /usr/local/lib/roundcubemail /var/spool/cron /usr/local/bin; do
 		total=$((total + $(size_of "$p")))
 	done
 	add_need "$STATE_DIR" "$total" "system archive $(human "$total")"
@@ -1845,6 +2300,7 @@ detect_extensions() {
 			# Written by setup/mail-postfix.sh and setup/spamassassin.sh of this fork.
 			case "$f" in
 				/etc/systemd/system/postfix.service.d/mailinabox-stale-db.conf) continue ;;
+				/etc/systemd/system/postfix.service.d/mailinabox-after-spampd.conf) continue ;;
 				/etc/systemd/system/spampd.service.d/mailinabox-stale-pid.conf) continue ;;
 			esac
 			if [ -e "$f" ]; then EXT_BLOCK+=("$f (systemd drop-in)"); fi
@@ -1931,6 +2387,115 @@ afterwards with hooks in $HOOK_DIR/*.sh (see the header of this script)."
 			for x in "${EXT_INFO[@]}"; do echo "INFO $x"; done
 		} > "$STATE_DIR/local-extensions.txt"
 	fi
+}
+
+# The names of the plugin directories of a Roundcube tree, one per line. The
+# tree is root's (setup/webmail.sh unpacks it as root).
+roundcube_plugin_dirs() { # DIR
+	[ -d "$1/plugins" ] || return 0
+	find "$1/plugins" -mindepth 1 -maxdepth 1 -type d -printf '%f\n' 2> /dev/null | LC_ALL=C sort
+}
+
+# Local changes to Roundcube that the upgrade does not carry over (setup
+# writes its own config.inc.php on every run, and a new Roundcube version
+# comes as a new tree). They do not block: reported here, kept before setup
+# (save_old_roundcube) and compared again in phase verify (verify_roundcube).
+# Keep in sync with tools/migrate-to-2604.sh.
+report_roundcube() {
+	section "Local changes to Roundcube"
+	if [ ! -d "$RC_DIR" ]; then
+		say "Roundcube is not installed in $RC_DIR."
+		return 0
+	fi
+	local items x
+	items=$(python3 -I -c "$ROUNDCUBE_PY" check "$RC_DIR/config/config.inc.php" <(roundcube_plugin_dirs "$RC_DIR")) \
+		|| { warn "Could not compare the Roundcube in $RC_DIR with what setup installs."; return 0; }
+	if [ -z "$items" ]; then
+		say "None found (only what setup installs and writes)."
+		return 0
+	fi
+	warn "Local changes to Roundcube that the upgrade does not carry over (they do not stop it):"
+	while IFS= read -r x; do say "  $x"; done <<< "$items"
+	say "Setup writes its own $RC_DIR/config/config.inc.php on every run and installs a new"
+	say "Roundcube version as a new tree, so these are gone afterwards. Before setup, this tool"
+	say "keeps the old config.inc.php and these plugin directories in $OLD_RC$([ "$(state_get MODE)" = rerun ] || echo " (the
+system archive keeps the whole old tree)"). The old plugins are not copied back on their own: a plugin for the old"
+	say "Roundcube can break the new one. Phase verify lists what is still missing, and System"
+	say "Status warns about it until '$SELF --ack-local'; a hook in $HOOK_DIR/*.sh"
+	say "can bring back what the new Roundcube supports (see README-fork.md)."
+}
+
+# Before setup replaces it: the old config.inc.php, the names of all plugin
+# directories and a copy of those that setup does not install, in OLD_RC
+# (once per upgrade; a redo of setup keeps the first copy).
+save_old_roundcube() {
+	[ -z "$(state_get ROUNDCUBE_SAVED_AT)" ] || return 0
+	[ -d "$RC_DIR" ] || return 0
+	local extra=() d
+	rm -rf "$OLD_RC.new"
+	(umask 077 && mkdir "$OLD_RC.new")
+	roundcube_plugin_dirs "$RC_DIR" > "$OLD_RC.new/plugins.txt"
+	if [ -f "$RC_DIR/config/config.inc.php" ] && [ ! -L "$RC_DIR/config/config.inc.php" ]; then
+		cp -p "$RC_DIR/config/config.inc.php" "$OLD_RC.new/config.inc.php"
+	fi
+	while IFS= read -r d; do
+		if [ -n "$d" ] && [ ! -L "$RC_DIR/plugins/$d" ]; then extra+=("plugins/$d"); fi
+	done < <(python3 -I -c "$ROUNDCUBE_PY" extra "$OLD_RC.new/plugins.txt")
+	if [ ${#extra[@]} -gt 0 ]; then
+		tar -C "$RC_DIR" -cf - -- "${extra[@]}" | tar -C "$OLD_RC.new" -xf - \
+			|| die "Could not copy the Roundcube plugins ${extra[*]} to $OLD_RC."
+	fi
+	# The directory is root's only (0700). The old config.inc.php holds
+	# Roundcube's key and maybe passwords; the plugin copies keep their modes,
+	# so that "cp -a" brings back a plugin that the web server can read
+	# (B186: with "chmod -R go=", Roundcube could not load it).
+	chmod go= "$OLD_RC.new" "$OLD_RC.new/plugins.txt"
+	if [ -f "$OLD_RC.new/config.inc.php" ]; then chmod go= "$OLD_RC.new/config.inc.php"; fi
+	rm -rf "$OLD_RC"
+	mv -T "$OLD_RC.new" "$OLD_RC"
+	state_set ROUNDCUBE_SAVED_AT "$(date -u +%FT%TZ)"
+	say "Kept the old Roundcube's config.inc.php${extra[*]:+ and ${extra[*]}} in $OLD_RC."
+}
+
+# Phase verify: what of the old Roundcube's local changes the new one does
+# not have. The open items go to LOCAL_CHANGES (root's only), which System
+# Status shows until --ack-local removes it; none: the file is removed.
+# Sets RC_ITEMS for etc_report.
+RC_ITEMS=
+verify_roundcube() {
+	RC_ITEMS=
+	[ -f "$OLD_RC/plugins.txt" ] || return 0
+	local x
+	RC_ITEMS=$(python3 -I -c "$ROUNDCUBE_PY" verify "$OLD_RC/config.inc.php" "$OLD_RC/plugins.txt" \
+		"$RC_DIR/config/config.inc.php" <(roundcube_plugin_dirs "$RC_DIR") \
+		--json "$LOCAL_CHANGES" "$SCRIPT_NAME" "$SELF --ack-local") \
+		|| { warn "Could not compare the new Roundcube with the old one ($OLD_RC)."; RC_ITEMS=; return 0; }
+	if [ -z "$RC_ITEMS" ]; then
+		say "Roundcube: the local changes of the old one are all there (or there were none)."
+		return 0
+	fi
+	warn "Local changes of the old Roundcube that the new one does not have:"
+	while IFS= read -r x; do say "  $x"; done <<< "$RC_ITEMS"
+	say "The old config.inc.php and plugin directories are in $OLD_RC$([ -z "$(state_get SYSTEM_ARCHIVE)" ] || echo " (and the
+whole old tree in the system archive)"). Bring back what the new Roundcube supports with a hook"
+	say "in $HOOK_DIR/*.sh, for example (then run '$SELF --redo-from local-ext'):"
+	say "  cp -a \"\$UPGRADE_STATE_DIR/old-roundcube/plugins/NAME\" $RC_DIR/plugins/"
+	say "  and add 'NAME' to \$config['plugins'] in $RC_DIR/config/config.inc.php"
+	say "(cp -a keeps the plugin's modes; the web server, www-data, must be able to read it,"
+	say "which phase verify checks.) Setup writes config.inc.php again on every run (also on"
+	say "later updates)."
+	say "System Status warns about these until '$SELF --ack-local' (or removing $LOCAL_CHANGES)."
+}
+
+# --ack-local: the open local changes are dealt with (or wanted no longer).
+do_ack_local() {
+	if [ ! -e "$LOCAL_CHANGES" ] && [ ! -L "$LOCAL_CHANGES" ]; then
+		say "No open local changes ($LOCAL_CHANGES does not exist)."
+		return 0
+	fi
+	rm -f "$LOCAL_CHANGES"
+	say "Removed $LOCAL_CHANGES: System Status no longer warns about the local changes."
+	say "(A new final check, --redo-from verify, lists what is still missing again.)"
 }
 
 phase_preflight() {
@@ -2053,12 +2618,14 @@ afterwards if they support Nextcloud 34 (setup keeps the app store off, see 'app
 			say "Postfix queue:       ${Q[QUEUE_TOTAL]} messages (stays in /var/spool/postfix and is sent after the upgrade)"
 		fi
 		report_extensions
+		report_roundcube
 		section "Console access"
 		say "Make sure you can reach the provider's console (VNC, KVM, serial) for this machine"
 		say "BEFORE you start: if the network does not come up after a reboot (changed interface"
 		say "names, old ifupdown configuration, firewall), SSH is gone and the console is the only way in."
 	else
 		report_extensions
+		report_roundcube
 	fi
 }
 
@@ -2092,10 +2659,23 @@ the command again, or go back with: $SELF --rollback"
 Nothing was changed. '$(start_command | sed 's/$/ --check/')' lists them again."
 }
 
+# The command that starts the upgrade: this script with the options of this
+# run, and SOURCE and TAG when they are set (B203; quoted for the shell).
+# Through curl | bash there is no file: the script of the default source, or
+# of SOURCE, saved to a file.
 start_command() {
-	local c=$SELF
-	if [ -z "$SELF_FILE" ]; then c="$DEFAULT_RAW/tools/$SCRIPT_NAME (saved to a file)"; else c=$SELF_FILE; fi
-	echo "$c$(resume_flags | sed 's/^/ /' | tr '\n' ' ' | sed 's/ $//')"
+	local c env=() pre=
+	if [ -n "${SOURCE:-}" ]; then env+=("SOURCE=$SOURCE"); fi
+	if [ -n "${TAG:-}" ]; then env+=("TAG=$TAG"); fi
+	if [ ${#env[@]} -gt 0 ]; then pre=$(printf '%q ' "${env[@]}"); fi
+	if [ -n "$SELF_FILE" ]; then
+		c=$(printf '%q' "$SELF_FILE")
+	elif [ -z "${SOURCE:-}" ] || same_repo "$SOURCE" "$DEFAULT_SOURCE"; then
+		c="$DEFAULT_RAW/tools/$SCRIPT_NAME (saved to a file)"
+	else
+		c="tools/$SCRIPT_NAME of $(printf '%q' "$SOURCE") (saved to a file)"
+	fi
+	echo "$pre$c$(resume_flags | sed 's/^/ /' | tr '\n' ' ' | sed 's/ $//')"
 }
 
 show_plan() {
@@ -2406,7 +2986,7 @@ masks of: $(state_get MASKED_UNITS)"
 			save_meta
 		fi
 
-		for p in etc "${miab#/}" var/lib/z-push var/lib/munin usr/local/lib/owncloud var/spool/cron usr/local/bin; do
+		for p in etc "${miab#/}" var/lib/z-push var/lib/munin usr/local/lib/owncloud usr/local/lib/roundcubemail var/spool/cron usr/local/bin; do
 			if [ -n "$p" ] && [ -e "/$p" ]; then paths+=("$p"); fi
 		done
 		arch=$STATE_DIR/system-$stamp.tar.gz
@@ -2521,7 +3101,9 @@ the settings from before the upgrade are in backup/custom.yaml.upgrade-saved (if
 # in the order in which they are stopped. Unlike LOCAL_UNITS in
 # tools/migrate-to-2604.sh, the PHP-FPM units are found, not named.
 quiesce_units() {
-	local u cand=(apt-daily.timer apt-daily-upgrade.timer cron.service mailinabox.service nginx.service)
+	# The services of the apt timers too, before the timers (B190, see mask_units).
+	local u cand=(apt-daily.service apt-daily-upgrade.service apt-daily.timer apt-daily-upgrade.timer
+		cron.service mailinabox.service nginx.service)
 	mapfile -t -O ${#cand[@]} cand < <(systemctl list-unit-files --type=service --no-legend --plain 'php*-fpm.service' 2> /dev/null | awk '{print $1}' || true)
 	cand+=(postfix.service postfix@-.service spampd.service postgrey.service opendkim.service opendmarc.service
 		dovecot.socket dovecot.service munin.service munin-node.service)
@@ -2546,6 +3128,16 @@ mask_units() {
 	done
 	# Recorded first: an interruption must not leave masks nobody removes.
 	state_add MASKED_UNITS "$@"
+	# The services of the apt timers first, in one call: every mask reloads
+	# systemd, and at the reload after the mask of one timer the other
+	# (Persistent=true) started its missed run, unattended-upgrade, which
+	# installed packages while mail went offline and after the system archive
+	# was made (B190). A masked service is not started by its timer.
+	local apt_units=()
+	for u in "$@"; do
+		case "$u" in apt-daily.service | apt-daily-upgrade.service) apt_units+=("$u") ;; esac
+	done
+	if [ ${#apt_units[@]} -gt 0 ]; then systemctl mask --quiet "${apt_units[@]}" 2> /dev/null || true; fi
 	for u in "$@"; do
 		systemctl mask --quiet "$u" 2> /dev/null || true
 		st=$(systemctl is-enabled "$u" 2> /dev/null || true)
@@ -2686,6 +3278,8 @@ and run the command again. Nothing was stopped yet."
 	say "Stopping and masking: ${units[*]}"
 	mask_units "${units[@]}"
 	systemctl stop "${units[@]}" 2> /dev/null || warn "Not all services stopped: ${units[*]}"
+	# A package run that started before the masks ends first (B190).
+	wait_apt_locks
 	wait_quiet
 }
 
@@ -4085,7 +4679,7 @@ resolve_fork_dir() {
 	else
 		command -v git > /dev/null || install_packages git
 		say "Downloading Mail-in-a-Box $tag from $source to $d..."
-		if ! git clone -q -b "$tag" --depth 1 "$source" "$d" < /dev/null; then
+		if ! clone_ref "$source" "$tag" "$d"; then
 			if [ -n "${TAG:-}" ] || ! tag_unpublished "$source" "$tag"; then die "Could not download $tag from $source."; fi
 			warn "The release tag $tag is not published yet. Using the branch main instead."
 			git clone -q -b main --depth 1 "$source" "$d" < /dev/null || die "Could not download $source."
@@ -4107,7 +4701,7 @@ run_setup() {
 	fi
 	local -A C=()
 	load_kv C < <(sed -n 's/^\([A-Z_][A-Z0-9_]*\)=/\1=/p' /etc/mailinabox.conf)
-	local envs=(NONINTERACTIVE=1 SKIP_NETWORK_CHECKS=1
+	local envs=(NONINTERACTIVE=1 SKIP_NETWORK_CHECKS=1 MIAB_SETUP_TOOL=upgrade-in-place-to-2604.sh
 		"PRIMARY_HOSTNAME=${C[PRIMARY_HOSTNAME]:-}"
 		"PUBLIC_IP=${C[PUBLIC_IP]:-}" "PUBLIC_IPV6=${C[PUBLIC_IPV6]:-}"
 		"STORAGE_USER=${C[STORAGE_USER]:-user-data}" "STORAGE_ROOT=${C[STORAGE_ROOT]:-$STORAGE_ROOT}")
@@ -4132,10 +4726,11 @@ phase_setup() {
 		state_set SETUP_STARTED_AT "$(date -u +%FT%TZ)"
 		# Setup starts what it needs; cron (backups, Nextcloud jobs) and the
 		# update timers stay off until it has finished.
-		unquiesce cron.service apt-daily.timer apt-daily-upgrade.timer
+		unquiesce cron.service apt-daily.timer apt-daily-upgrade.timer apt-daily.service apt-daily-upgrade.service
 	fi
 	# Nothing goes offline before (no quiesce): the before stage runs here.
 	if [ "$(state_get MODE)" = rerun ]; then run_hooks before "$HOOK_BEFORE_DIR"; fi
+	save_old_roundcube
 	local rc=0
 	run_setup || rc=$?
 	if [ "$rc" != 0 ]; then
@@ -4146,7 +4741,7 @@ Fix the cause and run this command again; it continues with setup."
 	state_set SETUP_END_EPOCH "$(date +%s)"
 	if grep -qsF "$MOTD_BEGIN" "$MOTD_FILE"; then motd_hint after-setup; fi
 	if [ "$(state_get MODE)" != rerun ]; then
-		unquiesce apt-daily.timer apt-daily-upgrade.timer
+		unquiesce apt-daily.timer apt-daily-upgrade.timer apt-daily.service apt-daily-upgrade.service
 		say "Mail is back online (setup has started the services)."
 	fi
 	# Setup does not start cron.
@@ -4355,6 +4950,9 @@ etc_report() {
 		echo
 		echo "== Root's crontab from before"
 		grep -vE '^[[:space:]]*(#|$)' "$STATE_DIR/meta/root-crontab.txt" 2> /dev/null | sed 's/^/  /' || true
+		echo
+		echo "== Local changes of the old Roundcube that the new one does not have (the old files are in $OLD_RC)"
+		if [ -n "$RC_ITEMS" ]; then sed 's/^/  /' <<< "$RC_ITEMS"; fi
 	} > "$out"
 	say "Configuration from before that is different or gone now: $out"
 	sed -n '1,80p' "$out"
@@ -4458,6 +5056,8 @@ phase_verify() {
 		if [ "$same" != "$n" ]; then VERIFY_PROBLEMS+=("DS records changed for $((n - same)) of $n zones (would break DNSSEC)"); fi
 	fi
 
+	say
+	verify_roundcube
 	say
 	say "Running the status checks..."
 	(cd "$MIAB_DIR" && management/status_checks.py) > "$STATE_DIR/status-checks.txt" 2>&1 || true
@@ -4664,9 +5264,34 @@ print_summary() {
 	now=$(date +%s)
 	f=$(state_get FINISHED_EPOCH)
 	e=$(state_get SETUP_END_EPOCH)
-	say "Mail offline:    $(state_get QUIESCED_AT)$([ -n "$e" ] && echo " until the end of setup ($(fmt_dur $((e - q))))" || echo ", for $(fmt_dur $((now - q))) so far")"
-	if [ -n "$f" ]; then
-		say "Downtime:        $(state_get QUIESCED_AT) -> $(state_get FINISHED_AT) ($(fmt_dur $((f - q))))"
+	# After a --redo-from, the downtime of the upgrade is the one up to its
+	# first setup and finish; the redo has a line of its own (B161).
+	local r e1 f1 fa
+	r=$(state_get REDO_EPOCH)
+	e1=$(state_get FIRST_SETUP_END_EPOCH)
+	f1=$(state_get FIRST_FINISHED_EPOCH)
+	fa=$(state_get FINISHED_AT)
+	if [ -n "$f1" ]; then fa=$(state_get FIRST_FINISHED_AT); fi
+	if [ -n "$r" ] && [ -n "$e1" ]; then
+		say "Mail offline:    $(state_get QUIESCED_AT) until the end of setup ($(fmt_dur $((e1 - q))))"
+	else
+		say "Mail offline:    $(state_get QUIESCED_AT)$([ -n "$e" ] && echo " until the end of setup ($(fmt_dur $((e - q))))" || echo ", for $(fmt_dur $((now - q))) so far")"
+	fi
+	if [ -n "$f1" ] || [ -n "$f" ]; then
+		say "Downtime:        $(state_get QUIESCED_AT) -> $fa ($(fmt_dur $((${f1:-$f} - q))))"
+	fi
+	if [ -n "$r" ]; then
+		case "$(state_get REDO_PHASE)" in
+			cleanup-etc | setup)
+				if [ -n "$e" ] && [ "$e" -ge "$r" ]; then
+					say "Redo:            --redo-from $(state_get REDO_PHASE) at $(state_get REDO_AT), setup ran again for $(fmt_dur $((e - r)))"
+				else
+					say "Redo:            --redo-from $(state_get REDO_PHASE) at $(state_get REDO_AT), setup runs again ($(fmt_dur $((now - r))) so far)"
+				fi
+				;;
+			*) say "Redo:            --redo-from $(state_get REDO_PHASE) at $(state_get REDO_AT)" ;;
+		esac
+		if [ -n "$f1" ] && [ -n "$f" ]; then say "Finished again:  $(state_get FINISHED_AT)"; fi
 	fi
 	if [ -n "$(state_get REBOOTS)" ]; then say "Reboots:         $(state_get REBOOTS)"; fi
 }
@@ -4865,6 +5490,21 @@ look at $LOG_FILE, fix the cause and run $SELF by hand."
 			cleanup-etc | setup | local-ext | verify)
 				phase_is_done release_2604 || [ "$(state_get MODE)" = rerun ] \
 					|| die "--redo-from $REDO_FROM only works after the release upgrades."
+				# What the messages of a redo need (on_exit, print_summary, B161):
+				# whether the upgrade had finished (then cron, the timers and the
+				# backups run, the redo does not pause them again), when the redo
+				# started, and the end of the first setup and of the first finish.
+				if phase_is_done finish; then state_set REDO_AFTER_FINISH 1; else state_set REDO_AFTER_FINISH ""; fi
+				state_set REDO_PHASE "$REDO_FROM"
+				state_set REDO_AT "$(date -u +%FT%TZ)"
+				state_set REDO_EPOCH "$(date +%s)"
+				if [ -z "$(state_get FIRST_FINISHED_EPOCH)" ] && [ -n "$(state_get FINISHED_EPOCH)" ]; then
+					state_set FIRST_FINISHED_AT "$(state_get FINISHED_AT)"
+					state_set FIRST_FINISHED_EPOCH "$(state_get FINISHED_EPOCH)"
+				fi
+				if [ -z "$(state_get FIRST_SETUP_END_EPOCH)" ] && [ -n "$(state_get SETUP_END_EPOCH)" ]; then
+					state_set FIRST_SETUP_END_EPOCH "$(state_get SETUP_END_EPOCH)"
+				fi
 				phases_reset_from "${REDO_FROM//-/_}"
 				state_set FINISHED_AT ""
 				state_set FINISHED_EPOCH ""
@@ -4983,6 +5623,7 @@ main() {
 			--rollback) COMMAND=rollback; shift ;;
 			--status) COMMAND=status; shift ;;
 			--finish) COMMAND=finish; shift ;;
+			--ack-local) COMMAND=ack_local; shift ;;
 			--ssh-fallback-test) COMMAND=ssh_fallback_test; shift ;;
 			# Internal: set by the resume unit after a reboot.
 			--resumed) RESUMED=1 ASSUME_YES=1; shift ;;
@@ -5003,6 +5644,10 @@ main() {
 
 	if [ "$COMMAND" = status ]; then
 		do_status
+		return 0
+	fi
+	if [ "$COMMAND" = ack_local ]; then
+		do_ack_local
 		return 0
 	fi
 	if [ "$COMMAND" = ssh_fallback_test ]; then

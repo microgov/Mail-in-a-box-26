@@ -16,7 +16,8 @@ Main differences from upstream v78 (Ubuntu 22.04):
 
 * Dovecot 2.4, Postfix and the rest of the mail stack from Ubuntu 26.04.
 * PHP 8.5 from Ubuntu. packages.sury.org is pinned to what Ubuntu lacks
-  (php8.2 for the Nextcloud upgrade chain, php8.5-imap, php-common).
+  (php8.2 for the Nextcloud upgrade chain, php8.5-imap, php-common). Some of
+  PHP's packages are in universe, see "Security updates and Ubuntu Pro".
 * Nextcloud 34.0.6. Existing installations are upgraded step by step from
   Nextcloud 26; older versions are refused.
 * Roundcube 1.7.6, Z-Push 2.7.7.
@@ -25,7 +26,7 @@ Main differences from upstream v78 (Ubuntu 22.04):
 * fail2ban: repeat offenders get longer bans, slow jails catch slow attacks,
   an allowlist for own networks, a report of password spraying, the reason
   of each ban, and Nextcloud's own login throttle in the control panel (see
-  "Intrusion protection" below).
+  "Intrusion detection and prevention" below).
 
 Diese Abspaltung (Fork) von Mail-in-a-Box läuft auf Ubuntu 26.04 LTS. Die
 Unterschiede zu upstream v78 stehen oben und in CHANGELOG-fork.md, die behobenen Fehler einzeln in BUGS-fork.md.
@@ -62,7 +63,9 @@ The environment variables `SOURCE` and `TAG` choose another repository or
 tag. They must be given to `bash` after `sudo` (sudo does not pass on the
 environment, and `TAG=main curl ...` only sets it for curl). Without `TAG`,
 bootstrap.sh installs the current release tag. `TAG=main` installs the
-development state of the branch `main`, for testing only:
+development state of the branch `main`, for testing only (`TAG` may also be
+another branch or a full commit id of 40 hex digits, as for the in-place
+and migration tools):
 
 	sudo TAG=main bash -c "$(curl -fsSL https://raw.githubusercontent.com/LM1337/Mail-in-a-box-26/main/setup/bootstrap.sh)"
 
@@ -82,7 +85,10 @@ wählen. Die Variablen gehören hinter `sudo` vor `bash` (sudo reicht die
 Umgebung nicht weiter, und `TAG=main curl ...` gilt nur für curl). Ohne `TAG`
 installiert bootstrap.sh den aktuellen Release-Tag; `TAG=main` holt den
 Entwicklungsstand des Zweigs `main`, nur zum Testen:
-`sudo TAG=main bash -c "$(curl -fsSL .../setup/bootstrap.sh)"`.
+`sudo TAG=main bash -c "$(curl -fsSL .../setup/bootstrap.sh)"` (`TAG` kann
+auch ein anderer Zweig oder eine vollständige Commit-Kennung aus 40
+Hex-Ziffern sein, wie bei den Werkzeugen für das Upgrade an Ort und Stelle
+und den Umzug).
 
 Die Upstream-Form `curl ... | sudo bash` taugt unter Ubuntu 26.04 nicht für
 ein Setup mit Rückfragen: Dessen sudo (sudo-rs) hält die Dialogfenster des
@@ -156,24 +162,30 @@ the tag it installs, with `--force`). To clean up, delete the old tags:
 `git fetch --tags` for this: the checkout is shallow, and it would download
 the history behind every upstream tag of the repository.
 
-One case does affect an update: a checkout whose current commit carries a
-local tag with the name of the release being installed, but another commit
-than on GitHub (an old pre-release or a mirror's tag of that name).
-bootstrap.sh compares the release name with `git describe` and, when they
-match, fetches nothing: setup then runs on the old code and still ends with
-exit code 0. After an update, check that the checkout is the release and
-its commit is GitHub's (here for v78-r2604.1; use the name of the release
-you install):
+One case did affect an update up to v78-r2604.4: a checkout whose current
+commit carries a local tag with the name of the release being installed, but
+another commit than on GitHub (an old pre-release or a mirror's tag of that
+name). bootstrap.sh compared the release name with `git describe` and, when
+they matched, fetched nothing: setup then ran on the old code and still
+ended with exit code 0. From v78-r2604.5 on, bootstrap.sh also asks the
+source for the commit of the tag (`git ls-remote`) and fetches the release
+when it is not the checkout's commit ("... is at a local tag ..., but ... has
+... on another commit"); if the source cannot be asked, it says so and uses
+the checkout as it is. The bootstrap command loads bootstrap.sh from the
+branch main, so every update with it does this check from the release of
+v78-r2604.5 on. To check by hand that the checkout is the release and its
+commit is GitHub's (here for v78-r2604.5; use the name of the release you
+install):
 
 	sudo git -C /root/mailinabox describe --always
 	sudo git -C /root/mailinabox rev-parse HEAD
-	git ls-remote https://github.com/LM1337/Mail-in-a-box-26 'refs/tags/v78-r2604.1^{}'
+	git ls-remote https://github.com/LM1337/Mail-in-a-box-26 'refs/tags/v78-r2604.5^{}'
 
 `describe` must print the release name, and the two commit ids must be
 the same. If they are not, delete the local tag and run the bootstrap
 command again:
 
-	sudo git -C /root/mailinabox tag -d v78-r2604.1
+	sudo git -C /root/mailinabox tag -d v78-r2604.5
 	sudo bash -c "$(curl -fsSL https://raw.githubusercontent.com/LM1337/Mail-in-a-box-26/main/setup/bootstrap.sh)"
 
 **Checks around the update** (rc7 and later, `tools/update-check.sh`, as
@@ -188,7 +200,10 @@ and the Docker stacks you name (`--docker-dir`, `--docker-volume`,
 checksum) or in `/root/update-check`. After the update, `after` records the
 state again and lists each change as EXPECTED (announced by the releases in
 between, `tools/expected-changes/`; for an update to a branch or commit
-after the newest release also `unreleased.txt` there) or UNEXPECTED, and runs the log audit
+after the newest release also `unreleased.txt` there) or UNEXPECTED (a
+Postfix or Dovecot setting that only the newer record has, because a newer
+version of the tool records it, is listed as "newly recorded (not judged)"
+and counted in the RESULT line), and runs the log audit
 against the baseline: only new message classes count (`--internet` accepts
 the usual noise of a public box). The lists cover updates of this fork on
 one Ubuntu release: after an in-place upgrade or a migration from upstream
@@ -236,6 +251,11 @@ step that failed.
 
 Everything lands in `/root/update-check/<stamp>/` (only root can read it).
 `--help` lists the options.
+At the end of a setup run on an existing box (not a first install, not
+the run of the in-place upgrade or the migration tool), setup points to
+the tool: when the newest record has a `before` but no `after`, it prints
+the `after` and `mailcheck` commands for that record, otherwise a short
+tip. It does not stop.
 
 **From rc7 to v78-r2604.0, step by step.** The steps of the release's
 upgrade note, in the order in which they were tested (TESTING-fork.md,
@@ -283,7 +303,7 @@ Right after the update:
   `sudo /root/mailinabox/management/fail2ban_admin.py --allow 192.0.2.0/24`.
   Otherwise a single phone with an old password can get the whole office
   banned from the mail ports, for longer each time (up to a week). See
-  [Intrusion protection](#intrusion-protection-adaptive-fail2ban--schutz-vor-anmeldeangriffen).
+  [Intrusion detection and prevention](#intrusion-protection-adaptive-fail2ban--schutz-vor-anmeldeangriffen).
 * **The nightly job moves.** Setup picks a new random minute between 01:00
   and 01:59 (system time) for the nightly backup and status checks on every
   run, as upstream does (`/etc/cron.d/mailinabox-nightly`). Check the time
@@ -294,8 +314,9 @@ Right after the update:
 * **Munin mails the administrator.** From rc6 on, Munin's alerts work:
   each change of state of a watched value (warning, critical, back to ok)
   is mailed to administrator@ of the box's name. Make sure that address
-  reaches someone. From rc7 on, System > Munin Monitoring sets another
-  address, critical only, or off (see [Munin alerts](#munin-alerts--warnungen-von-munin)).
+  reaches someone. From rc7 on, the control panel sets another
+  address, critical only, or off (see [Munin alerts](#munin-alerts--warnungen-von-munin);
+  since v78-r2604.5 under System > Notifications).
 * **fail2ban after the log rotation.** From rc6 on, Dovecot logs through
   syslog, and rsyslog writes its lines to `mail.log` (B85):
   `doveconf -h log_path` must say `syslog`. fail2ban's Dovecot jails then
@@ -377,25 +398,31 @@ Zum Aufräumen die alten Tags löschen:
 `git fetch --tags` dafür nehmen: Der Checkout ist flach (shallow) und würde
 die Historie hinter jedem Upstream-Tag des Repositorys herunterladen.
 
-Ein Fall wirkt sich doch auf ein Update aus: ein Checkout, dessen aktueller
-Commit einen lokalen Tag mit dem Namen des zu installierenden Release trägt,
-aber auf einen anderen Commit als auf GitHub (ein altes Vorab-Release oder
-der Tag eines Spiegels mit diesem Namen). bootstrap.sh vergleicht den
-Release-Namen mit `git describe` und holt bei Gleichheit nichts: Setup läuft
-dann mit dem alten Code und endet trotzdem mit Exit-Code 0. Nach einem
-Update prüfen, dass der Checkout das Release ist und sein Commit der von
-GitHub (hier für v78-r2604.1; den Namen des installierten Release
-einsetzen):
+Ein Fall wirkte sich bis v78-r2604.4 doch auf ein Update aus: ein Checkout,
+dessen aktueller Commit einen lokalen Tag mit dem Namen des zu
+installierenden Release trägt, aber auf einen anderen Commit als auf GitHub
+(ein altes Vorab-Release oder der Tag eines Spiegels mit diesem Namen).
+bootstrap.sh verglich den Release-Namen mit `git describe` und holte bei
+Gleichheit nichts: Setup lief dann mit dem alten Code und endete trotzdem
+mit Exit-Code 0. Ab v78-r2604.5 fragt bootstrap.sh zusätzlich die Quelle
+nach dem Commit des Tags (`git ls-remote`) und holt das Release, wenn es
+nicht der Commit des Checkouts ist („... is at a local tag ..., but ... has
+... on another commit“); ist die Quelle nicht erreichbar, sagt es das und
+nimmt den Checkout, wie er ist. Der Bootstrap-Befehl lädt bootstrap.sh
+aus dem Zweig main, also macht jedes Update damit diese Prüfung, sobald
+v78-r2604.5 veröffentlicht ist. Von Hand prüfen, dass der Checkout das
+Release ist und sein Commit der von GitHub (hier für v78-r2604.5; den Namen
+des installierten Release einsetzen):
 
 	sudo git -C /root/mailinabox describe --always
 	sudo git -C /root/mailinabox rev-parse HEAD
-	git ls-remote https://github.com/LM1337/Mail-in-a-box-26 'refs/tags/v78-r2604.1^{}'
+	git ls-remote https://github.com/LM1337/Mail-in-a-box-26 'refs/tags/v78-r2604.5^{}'
 
 `describe` muss den Release-Namen ausgeben, und die beiden Commit-IDs
 müssen gleich sein. Sonst den lokalen Tag löschen und den
 Bootstrap-Befehl noch einmal ausführen:
 
-	sudo git -C /root/mailinabox tag -d v78-r2604.1
+	sudo git -C /root/mailinabox tag -d v78-r2604.5
 	sudo bash -c "$(curl -fsSL https://raw.githubusercontent.com/LM1337/Mail-in-a-box-26/main/setup/bootstrap.sh)"
 
 **Prüfungen rund um das Update** (ab rc7, `tools/update-check.sh`, als
@@ -411,7 +438,10 @@ Sicherungen (rsync-Ziele; per Prüfsumme kontrolliert) oder nach
 `/root/update-check`. Nach dem Update hält `after` den Zustand erneut fest,
 führt jede Änderung als EXPECTED (von den Releases dazwischen angekündigt,
 `tools/expected-changes/`; bei einem Update auf einen Zweig oder Commit nach
-dem neuesten Release auch `unreleased.txt` dort) oder UNEXPECTED auf und lässt das Log-Audit gegen
+dem neuesten Release auch `unreleased.txt` dort) oder UNEXPECTED auf (eine
+Postfix- oder Dovecot-Einstellung, die nur die neuere Aufzeichnung hat, weil
+eine neuere Version des Werkzeugs sie aufzeichnet, steht unter „newly
+recorded (not judged)“ und wird in der RESULT-Zeile mitgezählt) und lässt das Log-Audit gegen
 die Vergleichsbasis laufen: Es zählen nur neue Meldungsklassen
 (`--internet` nimmt das übliche Rauschen einer öffentlichen Box hin). Die
 Listen decken Updates dieses Forks auf einem Ubuntu-Release ab: Nach einem
@@ -464,6 +494,11 @@ scheiterte.
 
 Alles landet in `/root/update-check/<Zeitstempel>/` (nur für root lesbar).
 `--help` zeigt die Optionen.
+Am Ende eines Setup-Laufs auf einer bestehenden Box (keine
+Neuinstallation, nicht der Lauf des In-place-Upgrades oder des
+Umzugswerkzeugs) weist setup auf das Werkzeug hin: Hat der neueste Eintrag
+ein `before`, aber kein `after`, nennt es die Befehle `after` und
+`mailcheck` für diesen Eintrag, sonst einen kurzen Tipp. Es hält nicht an.
 
 **Von rc7 auf v78-r2604.0, Schritt für Schritt.** Die Schritte des
 Upgrade-Hinweises des Releases, in der getesteten Reihenfolge
@@ -507,7 +542,7 @@ Gleich nach dem Update:
   Freigabeliste (allowlist), wenn die Box noch keine hatte (eine unter rc4
   oder später gespeicherte bleibt); einzuschalten ist nichts. Die Netze, aus denen
   die Benutzer arbeiten (Büro, VPN), sofort freigeben, unter System >
-  Intrusion Protection oder mit
+  Intrusion Detection and Prevention oder mit
   `sudo /root/mailinabox/management/fail2ban_admin.py --allow 192.0.2.0/24`.
   Sonst kann ein einziges Telefon mit altem Passwort das ganze Büro von den
   Mail-Ports aussperren, jedes Mal länger (bis zu einer Woche). Siehe
@@ -525,8 +560,9 @@ Gleich nach dem Update:
   von Munin: Jeder Zustandswechsel eines überwachten Werts (Warnung,
   kritisch, wieder in Ordnung) geht per Mail an administrator@ des
   Box-Namens. Sicherstellen, dass diese Adresse jemanden erreicht. Ab rc7
-  stellt System > Munin Monitoring eine andere Adresse, nur kritisch oder
-  aus ein (siehe [Warnungen von Munin](#munin-alerts--warnungen-von-munin)).
+  stellt das Control Panel eine andere Adresse, nur kritisch oder aus ein
+  (siehe [Warnungen von Munin](#munin-alerts--warnungen-von-munin); ab
+  v78-r2604.5 unter System > Notifications).
 * **fail2ban nach der Log-Rotation.** Ab rc6 protokolliert Dovecot über
   syslog, und rsyslog schreibt seine Zeilen in `mail.log` (B85):
   `doveconf -h log_path` muss `syslog` sagen. Die Dovecot-Jails von
@@ -538,6 +574,177 @@ Gleich nach dem Update:
   bis er gelöscht ist (in den Kontakten von Nextcloud der Kontakt, der als
   „This is an example contact“ markiert ist); nach rc7 gleicht Z-Push ihn
   wie jeden anderen Kontakt ab (B128), er kann bleiben oder gelöscht werden.
+
+
+Security / Sicherheit
+---------------------
+
+### English
+
+**The user database belongs to root (B210).** `$STORAGE_ROOT/mail/users.sqlite`
+holds every mail account with its password hash, its privileges and its
+aliases. Upstream (and this fork up to v78-r2604.4) gave it to root:www-data
+with mode 0664, in a directory that www-data could write, because Roundcube's
+password plugin wrote the new password into it with SQL. Any code running as
+www-data, the account of Roundcube, Nextcloud, Z-Push and PHP, could therefore
+set the password of any account (also an administrator's), give itself the
+admin privilege, or add an alias that forwards a user's mail to the outside;
+and every local account could read all password hashes.
+
+That needs code running as www-data first, but such holes are real and
+recent: the PHP security releases of October 2026 ("PHP2Shell",
+CVE-2026-109618 and CVE-2026-109619, remote code execution, fixed in PHP
+8.5.12, 8.4.27, 8.3.36 and 8.2.35) and of 19 November 2026 (PHP 8.5.13 and
+others, several remote code execution issues), and Roundcube's
+post-authentication remote code execution CVE-2025-49113 (fixed in 1.6.11 and
+1.5.10, exploited in the wild). Each of them gives code as www-data on a
+Mail-in-a-Box. Before this release that code could take over every mail
+account; now it reaches the user database only through the management
+daemon, with an account's current password.
+
+Since this release:
+
+* `users.sqlite` is root:root 0600 and `$STORAGE_ROOT/mail` root:root 755.
+  Dovecot, Postfix, the management daemon, the backup and the tools all open
+  the database as root. The path is the same, so backups and the migration
+  and in-place tools work as before.
+* Roundcube's Settings > Password calls the management daemon
+  (`POST /me/password` on 127.0.0.1, see api/mailinabox.yml) through the
+  fork's password driver. The daemon checks the current password, applies
+  the same password rules as the control panel and changes only that
+  account's password. Failed attempts are logged for fail2ban
+  (`miab-management`), and after 5 for an account or 10 for an address
+  within 10 minutes, more are refused for a while. Webmail cannot change the
+  password of an account with two-factor authentication: an administrator
+  changes it in the control panel (Mail & Users > Users), which has no
+  password form for other users.
+* Going back to v78-r2604.4 works: its setup gives the database and the
+  directory back to www-data and Roundcube's plugin back to its SQL driver.
+
+**The migration number cannot be lowered (B211).** `$STORAGE_ROOT` is the
+home of the storage user, who owns `mailinabox.version` there, the number of
+the last data migration. A lower number made the next setup run run the
+migrations again as root, and some of them delete data when they run twice
+(the DKIM key, Roundcube's CardDAV tables). Setup now also keeps the number
+in `/var/lib/mailinabox/storage-migration` (root's own) and stops before any
+migration when `mailinabox.version` says less. After restoring an older
+backup of `$STORAGE_ROOT` on the same box, setup stops with that message:
+remove `/var/lib/mailinabox/storage-migration` and run setup again, so that
+the backup's migrations run. A restore on a new box needs nothing, and the
+migration tool removes the record itself before each of its setup runs.
+
+**Backup and DNS settings only from root's directories (B212).** The backup
+target and passphrase (`backup/custom.yaml`, `backup/secret_key.txt`) and the
+custom DNS records (`dns/custom.yaml`) are read, and the two `custom.yaml`
+written, only through a checked directory of root's own: the storage user
+could otherwise replace `backup/` or `dns/` in its home and send the backups
+to a server of its own, encrypted with a passphrase it knows, or add DNS
+records. If one of the two directories is not root's own (owner root, mode
+755), backups or DNS updates stop with the reason, shown in the nightly mail
+and the status checks.
+
+**Nextcloud takes a forwarded address only from nginx's proxy (B213).** The
+proxy of `/caldav`, `/carddav` and `/webdav` connects to Nextcloud from
+127.0.0.1 and passes the client's address in `X-Forwarded-For`. nginx now
+passes that header to Nextcloud only from this proxy, which proves itself
+with a secret from `/etc/nginx/miab-nextcloud-proxy.conf` (root's
+only, made once by setup), so another process on the box can no longer
+have a failed login logged and banned under an address of its choice. A
+proxy of your own in `www/custom.yaml` to the box's own `/cloud` is seen as
+127.0.0.1, and so loses all protection against password guessing:
+Nextcloud does not throttle 127.0.0.1, fail2ban does not ban it, and
+Dovecot answers the IMAP logins with which Nextcloud checks the passwords
+at once (B126). Do not use such a proxy on a box reachable from the
+Internet; the box's own paths (`/cloud`, `/caldav`, `/carddav`,
+`/webdav`) are not affected.
+
+### Deutsch
+
+**Die Benutzerdatenbank gehört root (B210).**
+`$STORAGE_ROOT/mail/users.sqlite` enthält alle Mailkonten mit ihren
+Passwort-Hashes, Rechten und Aliasen. Upstream (und dieser Fork bis
+v78-r2604.4) gab sie root:www-data mit dem Modus 0664, in einem Verzeichnis,
+in das www-data schreiben durfte, weil das Passwort-Plugin von Roundcube das
+neue Passwort per SQL selbst hineinschrieb. Jeder Code, der als www-data
+läuft, dem Konto von Roundcube, Nextcloud, Z-Push und PHP, konnte deshalb das
+Passwort jedes Kontos setzen (auch das eines Administrators), sich selbst
+Administratorrechte geben oder einen Alias anlegen, der die Mails eines
+Benutzers nach außen weiterleitet; und jedes lokale Konto konnte alle
+Passwort-Hashes lesen.
+
+Dafür muss zuerst Code als www-data laufen, aber solche Lücken gibt es, und
+sie sind neu: die PHP-Sicherheitsupdates vom Oktober 2026 („PHP2Shell“,
+CVE-2026-109618 und CVE-2026-109619, Ausführung von Code aus der Ferne,
+behoben in PHP 8.5.12, 8.4.27, 8.3.36 und 8.2.35) und vom 19. November 2026
+(PHP 8.5.13 und weitere, mehrere Lücken dieser Art) sowie die Lücke
+CVE-2025-49113 in Roundcube (Ausführung von Code nach der Anmeldung, behoben in
+1.6.11 und 1.5.10, aktiv ausgenutzt). Jede davon bringt Code als www-data auf
+eine Mail-in-a-Box. Vor diesem Release konnte dieser Code jedes Mailkonto
+übernehmen; jetzt kommt er an die Benutzerdatenbank nur noch über den
+Management-Dienst und nur mit dem aktuellen Passwort eines Kontos.
+
+Seit diesem Release:
+
+* `users.sqlite` ist root:root 0600, `$STORAGE_ROOT/mail` root:root 755.
+  Dovecot, Postfix, der Management-Dienst, die Sicherung und die Werkzeuge
+  öffnen die Datenbank alle als root. Der Pfad ist derselbe, Sicherungen und
+  die Werkzeuge für Umzug und Upgrade an Ort und Stelle funktionieren wie
+  bisher.
+* Einstellungen > Passwort in Roundcube ruft über den Passwort-Treiber des
+  Forks den Management-Dienst auf (`POST /me/password` auf 127.0.0.1, siehe
+  api/mailinabox.yml). Der Dienst prüft das aktuelle Passwort, wendet
+  dieselben Passwortregeln an wie das Control Panel und ändert nur das
+  Passwort dieses Kontos. Fehlversuche werden für fail2ban protokolliert
+  (`miab-management`); nach 5 für ein Konto oder 10 für eine Adresse innerhalb
+  von 10 Minuten werden weitere eine Zeit lang abgewiesen. Das Passwort eines
+  Kontos mit Zwei-Faktor-Anmeldung lässt sich im Webmail nicht ändern: Ein
+  Administrator ändert es im Control Panel (Mail & Users > Users), das für
+  andere Benutzer kein Passwortformular hat.
+* Der Weg zurück zu v78-r2604.4 funktioniert: Dessen setup gibt Datenbank
+  und Verzeichnis wieder www-data und das Plugin von Roundcube wieder seinem
+  SQL-Treiber.
+
+**Die Migrationsnummer lässt sich nicht herabsetzen (B211).**
+`$STORAGE_ROOT` ist das Heimatverzeichnis des Speicherbenutzers, dem dort
+`mailinabox.version` gehört, die Nummer der letzten Datenmigration. Mit einer
+kleineren Nummer führte der nächste Lauf von setup die Migrationen erneut als
+root aus, und manche löschen Daten, wenn sie zweimal laufen (den DKIM-Schlüssel,
+die CardDAV-Tabellen von Roundcube). Setup hält die Nummer jetzt zusätzlich in
+`/var/lib/mailinabox/storage-migration` (gehört root) fest und bricht vor jeder
+Migration ab, wenn `mailinabox.version` weniger angibt. Nach dem
+Zurückspielen einer älteren Sicherung von `$STORAGE_ROOT` auf derselben Box
+bricht setup mit dieser Meldung ab: `/var/lib/mailinabox/storage-migration`
+löschen und setup erneut starten, damit die Migrationen der Sicherung laufen.
+Auf einer neuen Box ist dafür nichts zu tun, und das Umzugswerkzeug löscht
+die Datei vor jedem seiner Läufe von setup selbst.
+
+**Einstellungen von Sicherung und DNS nur aus Verzeichnissen von root (B212).**
+Ziel und Passphrase der Sicherung (`backup/custom.yaml`,
+`backup/secret_key.txt`) und die eigenen DNS-Einträge (`dns/custom.yaml`)
+werden nur über ein geprüftes Verzeichnis gelesen, das root gehört, und die
+beiden `custom.yaml` nur so geschrieben: Sonst könnte der Speicherbenutzer
+`backup/` oder `dns/` in seinem Heimatverzeichnis ersetzen und die Sicherungen
+an einen eigenen Server schicken, verschlüsselt mit einer Passphrase, die er
+kennt, oder DNS-Einträge hinzufügen. Gehört eines der beiden Verzeichnisse
+nicht root (Besitzer root, Modus 755), halten Sicherungen bzw.
+DNS-Aktualisierungen mit dem Grund an, zu sehen in der nächtlichen Mail und in
+den Statusprüfungen.
+
+**Nextcloud übernimmt eine weitergereichte Adresse nur vom Proxy von nginx
+(B213).** Der Proxy von `/caldav`, `/carddav` und `/webdav` verbindet sich
+von 127.0.0.1 aus mit Nextcloud und reicht die Adresse des Clients in
+`X-Forwarded-For` weiter. nginx gibt diesen Header jetzt nur noch von diesem
+Proxy an Nextcloud weiter; der Proxy weist sich mit einem Geheimnis aus
+`/etc/nginx/miab-nextcloud-proxy.conf` aus (nur für root lesbar, von
+setup einmal erzeugt). Ein anderer Prozess auf der Box kann so keine
+fehlgeschlagene Anmeldung mehr unter einer Adresse seiner Wahl protokollieren
+und sperren lassen. Ein eigener Proxy in `www/custom.yaml` auf das `/cloud`
+der Box selbst erscheint als 127.0.0.1 und verliert damit jeden Schutz gegen
+das Erraten von Passwörtern: Nextcloud bremst 127.0.0.1 nicht, fail2ban
+sperrt es nicht, und Dovecot beantwortet die IMAP-Anmeldungen, mit denen
+Nextcloud die Passwörter prüft, sofort (B126). Einen solchen Proxy auf einer
+Box, die aus dem Internet erreichbar ist, nicht verwenden; die eigenen Pfade
+der Box (`/cloud`, `/caldav`, `/carddav`, `/webdav`) sind nicht betroffen.
 
 
 Setup output / Ausgaben von setup
@@ -567,6 +774,12 @@ harmless; setup goes on and ends with "Your Mail-in-a-Box is running.":
   name...": setup fixing a provider's host name (B60, B68).
 * "Cleaning up legacy php version": setup removing PHP 8.2, which it only
   needs for the step-by-step upgrade of an old Nextcloud.
+* `postconf: warning: /etc/postfix/main.cf: support for parameter
+  "smtpd_tls_dh1024_param_file" will be removed`, in the output of the
+  in-place upgrade (while the release upgrade installs Postfix 3.10) and of
+  a box on rc3 or older: their `main.cf` still sets the parameter, which
+  setup comments out (B59, since rc4). It is gone after setup's run; a box
+  on a current release prints no such warning.
 
 ### Deutsch
 
@@ -594,7 +807,308 @@ is running.“:
   name...“: setup ersetzt den Hostnamen eines Anbieters (B60, B68).
 * „Cleaning up legacy php version“: setup entfernt PHP 8.2, das es nur für
   das schrittweise Upgrade einer alten Nextcloud braucht.
+* `postconf: warning: /etc/postfix/main.cf: support for parameter
+  "smtpd_tls_dh1024_param_file" will be removed` in der Ausgabe des
+  In-place-Upgrades (während das Release-Upgrade Postfix 3.10 installiert)
+  und einer Box auf rc3 oder älter: Deren `main.cf` setzt den Parameter
+  noch, den setup auskommentiert (B59, seit rc4). Nach dem Lauf von setup
+  ist sie verschwunden; eine Box auf einem aktuellen Release gibt keine
+  solche Warnung aus.
 
+
+Known issues / Bekannte Einschränkungen
+---------------------------------------
+
+### English
+
+These issues of the current release are known and not fixed. The fixed bugs
+are in [BUGS-fork.md](BUGS-fork.md), whose section "Known limitations (not
+fixed)" lists a few more.
+
+* **A Dovecot reload ends open IMAP sessions (B122).** Setup reloads
+  Dovecot only when its configuration changed, which most updates do not
+  do. A reload keeps the listening sockets, so no connection is refused,
+  but Dovecot ends the open IMAP sessions, and their clients log in again.
+* **A Dovecot reload still causes two client-visible failures (B122, B121,
+  B137).** A login that the old login process hands to the new auth
+  process at that moment fails as an internal failure; Nextcloud's IMAP
+  login (`user_external`) counts it as a failed login of the client
+  (harmless for 127.0.0.1 since B121). A FolderSync or Ping that Z-Push
+  answers during the reload gets a server error when Z-Push cannot
+  connect to Dovecot again (B137); the phone tries again.
+* **A race in the migration of Roundcube's CardDAV plugin after an
+  upgrade.** When two sessions log in at the same moment for the first
+  time after an upgrade of the plugin, its schema migration runs twice and
+  logs "duplicate column name: account_id", "no such column: active" or
+  "UNIQUE constraint failed: carddav_migrations.filename", and one of the
+  logins fails once. After an update from rc7 or earlier,
+  `update-check.sh after` accepts the last form. To be reported to the
+  plugin project.
+* **Nextcloud on SQLite answers a CardDAV write with HTTP 500 now and
+  then while its cron job runs.** Nextcloud logs "database is locked",
+  and the client writes again later (seen once in the tests). Nextcloud
+  already keeps its SQLite database in WAL mode (its default), and PHP
+  waits up to 60 s for a lock (pdo_sqlite's default timeout), so no
+  setting of Nextcloud or SQLite helps here: the likely cause is a
+  transaction that read first and then wants to write after another
+  connection wrote meanwhile, which SQLite refuses at once, whatever the
+  timeout. Setup supports only SQLite for Nextcloud.
+* **Failed logins from the box itself (B126).** Dovecot answers a failed
+  login from the box itself at once and does not slow down later logins
+  from there: those logins come from Z-Push, Roundcube and Nextcloud, which
+  fail2ban protects with the client's own address, and the delay made a
+  wrong ActiveSync password take up to 50 s and slowed down every other
+  user. "From the box" is every address of 127.0.0.0/8, ::1 and every
+  address of the box's interfaces, as a process on the box can use any of
+  them. Only wrong passwords count, a login with the right password never. Instead
+  Dovecot counts these failures per account: an account with 30 different
+  wrong passwords from the box within 30 minutes (System > Intrusion
+  Protection changes both numbers) is refused for logins from the box
+  (ActiveSync, Autodiscover, webmail, Nextcloud, and IMAP, POP3,
+  ManageSieve or SMTP submission from the box) until it has fewer, even
+  with its right password. A password sent again counts once: a phone that
+  keeps sending an old password, or a repeated typo, does not lock the
+  account (Dovecot keeps only a 16-bit tag of a salted hash of each wrong
+  password, never the password). Only real accounts are counted, so
+  made-up names change nothing for the others. The other accounts are not
+  slowed down, and the account's own mail programs that log in from
+  outside are not refused. So a process on the box (any local account, or
+  code running as www-data after a hole in PHP or a web app) can try at
+  most 30 passwords of each account per 30 minutes (a burst of many connections at the same moment can get more through
+  in one window, as the passwords are checked in parallel, but then counts
+  against the next windows too, so over time only a little more than 30
+  per window, about 33 in the lab's worst case;
+  the lock then lasts up to 4 windows, 2 hours, and the number of windows
+  can be set from 1 to 4 under System > Intrusion Detection and Prevention). Such a process can still raise Dovecot's penalty of
+  127.0.0.1 with a login whose authorization name differs from its login
+  name (it fails before these checks) and so slow down the others. The
+  other side: someone who tries the passwords of one account through
+  ActiveSync, webmail or Nextcloud from one or more addresses that fail2ban
+  does not ban (fewer than 20 failures within 30 to 120 s each) locks that
+  account's phones, webmail and Nextcloud out while they keep trying. The
+  box mails each new lock to the report recipient (System > Notifications,
+  at most one mail an hour); System > Intrusion Detection and Prevention lists the
+  counted and refused accounts with a button to end a lock (also `sudo
+  management/auth_guard.py --status` and `--unlock ADDRESS`). If Dovecot
+  cannot write its counts (`/run/miab-auth-guard`), failed logins from the
+  box get Dovecot's delay again. Logins from other addresses keep
+  Dovecot's delay. Guesses through Microsoft's servers once they are on the
+  allowlist (System > Intrusion Detection and Prevention): fail2ban no longer bans them,
+  and only this limit per account remains.
+* **Spamhaus checks of a fresh install through some public resolvers
+  (B136).** Through some public resolvers (8.8.8.8 in the tests) Spamhaus
+  answers NXDOMAIN, also for its own test entries. That looks like "not
+  listed", so setup's network checks of a fresh install can neither see a
+  listing nor say that they could not check. Check the hostname and the
+  address on https://check.spamhaus.org/; once the box runs, its status
+  checks ask through its own resolver.
+* **The storage user can still replace $STORAGE_ROOT/mail (B210).**
+  `$STORAGE_ROOT` is the storage user's home, so that account can rename
+  `mail/` there and put a directory of its own in its place, with a
+  `users.sqlite` of its choice (accounts, password hashes, the admin
+  privilege) and links back to the mailboxes. Dovecot, Postfix and the
+  management daemon open the database by its path and would use that
+  copy. It needs code running as the storage user, which no service of the
+  box runs; the real accounts then no longer work, so it does not go
+  unnoticed. Setup stops at such a directory or database, before it
+  changes anything, instead of making it root's ("not taken over").
+  `ssl/` (the private keys) can be replaced the same way, and setup does
+  not check it: the services would read the keys of the storage user's
+  directory.
+
+### Deutsch
+
+Diese Einschränkungen des aktuellen Releases sind bekannt und nicht behoben.
+Die behobenen Fehler stehen in [BUGS-fork.md](BUGS-fork.md); dessen Abschnitt
+„Known limitations (not fixed)“ nennt noch einige mehr.
+
+* **Ein Reload von Dovecot beendet offene IMAP-Sitzungen (B122).** setup
+  lädt Dovecot nur neu, wenn sich seine Konfiguration geändert hat, was bei
+  den meisten Updates nicht der Fall ist. Beim Reload bleiben die
+  Listening-Sockets offen, keine Verbindung wird abgewiesen, aber Dovecot
+  beendet die offenen IMAP-Sitzungen, und ihre Clients melden sich neu an.
+* **Ein Reload von Dovecot führt noch zu zwei Fehlern, die Clients sehen
+  (B122, B121, B137).** Eine Anmeldung, die der alte Login-Prozess genau in
+  diesem Moment an den neuen Auth-Prozess übergibt, scheitert als interner
+  Fehler; die IMAP-Anmeldung von Nextcloud (`user_external`) zählt das als
+  fehlgeschlagene Anmeldung des Clients (für 127.0.0.1 seit B121 harmlos).
+  Ein FolderSync oder Ping, den Z-Push während des Reloads beantwortet,
+  bekommt einen Serverfehler, wenn Z-Push keine neue Verbindung zu Dovecot
+  bekommt (B137); das Telefon versucht es erneut.
+* **Eine Wettlaufsituation in der Migration des CardDAV-Plugins von
+  Roundcube nach einem Upgrade.** Melden sich nach einem Upgrade des
+  Plugins zwei Sitzungen im selben Moment zum ersten Mal an, läuft seine
+  Schema-Migration zweimal und protokolliert „duplicate column name:
+  account_id“, „no such column: active“ oder „UNIQUE constraint failed:
+  carddav_migrations.filename“, und eine der Anmeldungen scheitert einmal.
+  Nach einem Update von rc7 oder älter akzeptiert `update-check.sh after`
+  die letzte Form. Eine Meldung an das Plugin-Projekt steht noch aus.
+* **Nextcloud mit SQLite beantwortet gelegentlich einen CardDAV-Schreibzugriff
+  mit HTTP 500, während sein Cron-Job läuft.** Nextcloud protokolliert
+  „database is locked“, und der Client schreibt später erneut (einmal in den
+  Tests gesehen). Nextcloud führt seine SQLite-Datenbank bereits im
+  WAL-Modus (seine Voreinstellung), und PHP wartet bis zu 60 s auf eine
+  Sperre (die Voreinstellung von pdo_sqlite); keine Einstellung von
+  Nextcloud oder SQLite hilft hier also: Die wahrscheinliche Ursache ist eine
+  Transaktion, die zuerst gelesen hat und dann schreiben will, nachdem eine
+  andere Verbindung inzwischen geschrieben hat; das lehnt SQLite sofort ab,
+  unabhängig von der Wartezeit. setup unterstützt für Nextcloud nur SQLite.
+* **Fehlgeschlagene Anmeldungen von der Box selbst (B126).** Dovecot
+  beantwortet eine fehlgeschlagene Anmeldung von der Box selbst sofort und
+  bremst spätere Anmeldungen von dort nicht: Diese Anmeldungen kommen von
+  Z-Push, Roundcube und Nextcloud, die fail2ban mit der eigenen Adresse des
+  Clients schützt, und die Verzögerung ließ ein falsches
+  ActiveSync-Passwort bis zu 50 s dauern und bremste alle anderen Benutzer.
+  „Von der Box“ heißt jede Adresse aus 127.0.0.0/8, ::1 und jede Adresse
+  der Netzwerkschnittstellen der Box, denn ein Prozess auf der Box kann
+  jede davon benutzen. Es zählen nur falsche Passwörter, eine Anmeldung mit
+  dem richtigen Passwort nie.
+  Stattdessen zählt Dovecot diese Fehlversuche pro Konto: Ein Konto mit 30
+  verschiedenen falschen Passwörtern von der Box innerhalb von 30 Minuten
+  (beide Zahlen lassen sich unter System > Intrusion Detection and Prevention ändern)
+  wird für Anmeldungen von der Box (ActiveSync, Autodiscover, Webmail,
+  Nextcloud sowie IMAP, POP3, ManageSieve oder SMTP-Versand von der Box)
+  abgewiesen, bis es weniger hat, auch mit dem richtigen Passwort. Ein
+  erneut gesendetes Passwort zählt nur einmal: Ein Handy, das immer wieder
+  ein altes Passwort schickt, oder ein wiederholter Tippfehler sperrt das
+  Konto nicht (Dovecot behält von jedem falschen Passwort nur ein
+  16-Bit-Kennzeichen eines Hashes mit Zufallswert, nie das Passwort).
+  Gezählt werden nur echte Konten, erfundene Namen ändern für die anderen
+  also nichts. Die anderen Konten werden nicht gebremst, und die eigenen
+  Mailprogramme des Kontos, die sich von außen anmelden, werden nicht
+  abgewiesen. Ein Prozess auf der Box (jedes lokale Konto oder Code, der
+  nach einer Lücke in PHP oder einer Web-Anwendung als www-data läuft)
+  kann also höchstens 30 Passwörter pro Konto und 30 Minuten
+  durchprobieren (ein Schub sehr vieler gleichzeitiger Verbindungen kann in einem
+  Fenster mehr durchbringen, weil die Passwörter parallel geprüft werden,
+  zählt dann aber auch gegen die folgenden Fenster, sodass auf Dauer nicht
+  mehr als 30 pro Fenster durchkommen; die Sperre dauert dann bis zu 4
+  Fenster, also 2 Stunden, und die Zahl der Fenster lässt sich unter
+  System > Intrusion Detection and Prevention von 1 bis 4 einstellen). Ein solcher
+  Prozess kann den Strafzähler von Dovecot für 127.0.0.1 weiterhin mit
+  einer Anmeldung erhöhen, deren Autorisierungsname vom Anmeldenamen
+  abweicht (sie scheitert vor diesen Prüfungen), und so die anderen
+  bremsen. Die Kehrseite: Wer die Passwörter eines Kontos über ActiveSync,
+  Webmail oder Nextcloud von einer oder mehreren Adressen aus
+  durchprobiert, die fail2ban nicht sperrt (je weniger als 20
+  Fehlversuche in 30 bis 120 s), sperrt die Handys, das Webmail und
+  Nextcloud dieses Kontos aus, solange er weitermacht. Die Box schickt jede
+  neue Sperre an den Empfänger der Berichte (System > Notifications,
+  höchstens eine Mail pro Stunde); System > Intrusion Detection and Prevention listet die
+  gezählten und abgewiesenen Konten mit einem Knopf, der eine Sperre beendet
+  (auch `sudo management/auth_guard.py --status` und `--unlock ADRESSE`).
+  Kann Dovecot seine Zähler nicht schreiben (`/run/miab-auth-guard`),
+  bekommen fehlgeschlagene Anmeldungen von der Box wieder die Verzögerung
+  von Dovecot. Anmeldungen von anderen Adressen behalten die Verzögerung
+  von Dovecot. Versuche über die Server von Microsoft, sobald sie in der
+  Freigabeliste stehen (System > Intrusion Detection and Prevention): fail2ban sperrt sie
+  nicht mehr, und es bleibt nur diese Grenze pro Konto.
+* **Spamhaus-Prüfungen einer Neuinstallation über manche öffentliche
+  Resolver (B136).** Über manche öffentliche Resolver (in den Tests
+  8.8.8.8) antwortet Spamhaus mit NXDOMAIN, auch für seine eigenen
+  Testeinträge. Das sieht aus wie „nicht gelistet“; die Netzwerkprüfungen
+  von setup bei einer Neuinstallation können dort also weder einen Eintrag
+  sehen noch melden, dass sie nicht prüfen konnten. Hostname und Adresse
+  auf https://check.spamhaus.org/ selbst prüfen; sobald die Box läuft,
+  fragen ihre Statusprüfungen über ihren eigenen Resolver.
+* **Der Speicherbenutzer kann $STORAGE_ROOT/mail noch ersetzen (B210).**
+  `$STORAGE_ROOT` ist das Heimatverzeichnis des Speicherbenutzers; dieses
+  Konto kann `mail/` dort umbenennen und ein eigenes Verzeichnis an seine
+  Stelle setzen, mit einer `users.sqlite` nach seiner Wahl (Konten,
+  Passwort-Hashes, Administratorrechte) und Links zurück auf die Postfächer.
+  Dovecot, Postfix und der Management-Dienst öffnen die Datenbank über
+  ihren Pfad und nähmen diese Kopie. Dafür muss Code als Speicherbenutzer
+  laufen, und kein Dienst der Box läuft so; die echten Konten funktionieren
+  dann nicht mehr, es bleibt also nicht unbemerkt. setup bricht bei einem
+  solchen Verzeichnis oder einer solchen Datenbank ab, bevor es etwas
+  ändert, statt sie root zu geben („not taken over“). Auch `ssl/` (die
+  privaten Schlüssel) lässt sich so ersetzen, und setup prüft es nicht:
+  Die Dienste läsen dann die Schlüssel aus dem Verzeichnis des
+  Speicherbenutzers.
+
+Security updates and Ubuntu Pro / Sicherheitsupdates und Ubuntu Pro
+-------------------------------------------------------------------
+
+### English
+
+PHP 8.5 from Ubuntu 26.04 runs the webmail (Roundcube), Nextcloud and
+Z-Push. Some of its packages are in Ubuntu's "universe" component,
+among them `php8.5-fpm`, which runs all PHP code of the box, and some of
+the modules setup installs (such as `php8.5-intl`); others, such as
+`php8.5-cli`, are in "main". Other packages of the box are in universe
+too: `nsd`, `opendkim`, `opendmarc`, `spampd`, `postgrey`, `fail2ban`,
+`munin`, `certbot` and `dovecot-auth-lua` (the limit of failed logins from
+the box itself; it comes from the source package `dovecot`, whose other
+packages are in main). Canonical guarantees security updates during the
+standard support of an LTS release only for "main" (and "restricted"); for
+"universe" they are guaranteed only with Ubuntu Pro, service `esm-apps`
+(Expanded Security Maintenance for Applications). Without it, an update
+of a universe package comes when someone in the Ubuntu community provides
+it, or not at all. So far PHP's security updates reached `php8.5-fpm`
+together with `php8.5-cli` (both come from the source package `php8.5`),
+but that is not promised. `php8.5-imap` comes from packages.sury.org, not
+from Ubuntu; Ubuntu Pro does not cover it.
+
+For a box this means: without Ubuntu Pro, a security hole in PHP-FPM, one
+of the PHP modules or one of the other universe packages may stay open on
+the box. With Ubuntu Pro, these updates come through apt like the others,
+and the box's automatic security updates (unattended-upgrades, which
+setup turns on) install them: their standard sources include those of
+`esm-apps`.
+
+To turn it on, get a token at <https://ubuntu.com/pro> (Canonical offers a
+free personal subscription for a few machines; the conditions are on that
+page), then:
+
+	sudo pro attach TOKEN
+	sudo pro status            # esm-apps: enabled
+	sudo pro enable esm-apps   # only if it is not
+	sudo apt update && sudo apt upgrade
+
+`pro status` before the attach shows what the machine could use. Setup
+does not change the attachment; the box stays attached through setup runs
+and updates of the fork.
+
+### Deutsch
+
+PHP 8.5 aus Ubuntu 26.04 betreibt das Webmail (Roundcube), Nextcloud und
+Z-Push. Ein Teil seiner Pakete liegt in der Ubuntu-Komponente „universe“,
+darunter `php8.5-fpm`, das den gesamten PHP-Code der Box ausführt, und
+einige der Module, die setup installiert (etwa `php8.5-intl`); andere wie
+`php8.5-cli` liegen in „main“. Auch weitere Pakete der Box liegen in
+universe: `nsd`, `opendkim`, `opendmarc`, `spampd`, `postgrey`,
+`fail2ban`, `munin`, `certbot` und `dovecot-auth-lua` (die Grenze für
+fehlgeschlagene Anmeldungen von der Box selbst; es stammt aus dem
+Quellpaket `dovecot`, dessen andere Pakete in main liegen). Canonical garantiert
+Sicherheitsupdates während der Standardunterstützung eines LTS-Releases
+nur für „main“ (und „restricted“); für „universe“ sind sie nur mit Ubuntu
+Pro garantiert, Dienst `esm-apps` (Expanded Security Maintenance for
+Applications). Ohne ihn kommt ein Update eines universe-Pakets, wenn
+jemand aus der Ubuntu-Gemeinschaft es bereitstellt, oder gar nicht. Bisher
+erreichten die Sicherheitsupdates von PHP `php8.5-fpm` zusammen mit
+`php8.5-cli` (beide entstehen aus dem Quellpaket `php8.5`), zugesagt ist
+das aber nicht. `php8.5-imap` stammt von packages.sury.org, nicht von
+Ubuntu; Ubuntu Pro deckt es nicht ab.
+
+Für eine Box heißt das: Ohne Ubuntu Pro kann eine Sicherheitslücke in
+PHP-FPM, in einem der PHP-Module oder in einem der anderen universe-Pakete
+auf der Box offen bleiben. Mit Ubuntu Pro kommen diese Updates wie die
+anderen über apt, und die automatischen Sicherheitsupdates der Box
+(unattended-upgrades, die setup einschaltet) spielen sie ein: Deren
+Standardquellen enthalten die von `esm-apps`.
+
+Zum Einschalten auf <https://ubuntu.com/pro> ein Token holen (Canonical
+bietet ein kostenloses persönliches Abonnement für einige Maschinen an; die
+Bedingungen stehen auf dieser Seite), dann:
+
+	sudo pro attach TOKEN
+	sudo pro status            # esm-apps: enabled
+	sudo pro enable esm-apps   # nur falls nicht
+	sudo apt update && sudo apt upgrade
+
+`pro status` vor dem Attach zeigt, was die Maschine nutzen könnte. setup
+ändert die Anbindung nicht; die Box bleibt über Setup-Läufe und Updates des
+Forks hinweg angebunden.
 
 Greylisting exceptions / Ausnahmen vom Greylisting
 --------------------------------------------------
@@ -858,6 +1372,99 @@ es noch das des Forks ist). Das Control Panel und `/favicon.ico` der
 Webdomains betrifft das nicht.
 
 
+Notifications / Benachrichtigungen
+----------------------------------
+
+### English
+
+The box mails its administrator: the daily status check changes, the
+backup status, the results of TLS certificate requests, the weekly usage
+report, Munin's alerts, and the mail of root, of cron jobs and to
+postmaster@, abuse@, admin@ and hostmaster@ of its domains. The control
+panel shows and sets where these mails go, under System > Notifications:
+
+* **Send reports to**: Standard (administrator@ of the box's name) or a
+  custom address, also of another provider (a plain address: ASCII letters,
+  digits and `_ + - .` before the @). It is the recipient of the status
+  check changes, backup status, TLS results and usage report, and of
+  Munin's alerts while they are set to "Same as the reports". The mails
+  come from administrator@ of the box's name. **Send test mail** sends one
+  mail to it the way the reports are sent (subject "Test of the
+  administrator mail", header `X-Miab-Test: 1`).
+* **Munin alerts**: the settings that were on the Munin page in rc7 to
+  v78-r2604.4 (see [Munin alerts](#munin-alerts--warnungen-von-munin)). The
+  menu entry System > Munin Monitoring opens Munin directly again.
+* **administrator@ and the addresses of the domains**: the alias
+  administrator@ itself is not changed by this setting. It is an address
+  of domain control validation (certificate authorities send their
+  confirmation mails there), so its destinations may only be
+  administrators of the box (Mail & Users > Aliases). It also gets the
+  mail to abuse@, postmaster@, hostmaster@ and admin@ of all domains
+  (unless such an address is set by hand) and of root and cron jobs. The
+  page shows where it leads, followed through the aliases as Postfix does,
+  and warns when it cannot work (a loop of aliases, an address of the box
+  that does not exist). If nobody reads that mailbox, complaints about
+  spam from your domains, for example, go unnoticed: look at it regularly,
+  or set up a forwarding filter in its webmail (Settings > Filters).
+* **What the box mails** and **Last deliveries**: each kind of mail with
+  where it goes, and the last deliveries to administrator@ or the report
+  recipient from the mail log (sent, deferred, bounced).
+
+The setting is stored as `admin_mail` in `$STORAGE_ROOT/settings.yaml`;
+without it the reports go to administrator@ as before. The same through
+the API: `/system/notifications` (see `api/mailinabox.yml`), or on the box:
+
+	sudo /root/mailinabox/management/admin_mail.py --status   # where the mails go
+	sudo /root/mailinabox/management/admin_mail.py --test     # a test mail
+
+### Deutsch
+
+Die Box schreibt ihrem Administrator: die täglichen Änderungen der
+Statusprüfungen, den Backup-Status, die Ergebnisse der TLS-Zertifikate, den
+wöchentlichen Nutzungsbericht, die Warnungen von Munin sowie die Mails von
+root, von cron-Jobs und an postmaster@, abuse@, admin@ und hostmaster@
+ihrer Domains. Wohin diese Mails gehen, zeigt und stellt das Control Panel
+unter System > Notifications ein:
+
+* **Send reports to**: Standard (administrator@ des Box-Namens) oder eine
+  eigene Adresse, auch bei einem anderen Anbieter (eine einfache Adresse:
+  ASCII-Buchstaben, Ziffern und `_ + - .` vor dem @). Sie ist der Empfänger
+  der Änderungen der Statusprüfungen, des Backup-Status, der TLS-Ergebnisse
+  und des Nutzungsberichts sowie der Munin-Warnungen, solange diese auf
+  „Same as the reports“ stehen. Absender ist administrator@ des
+  Box-Namens. **Send test mail** schickt eine Mail auf demselben Weg wie die
+  Berichte (Betreff „Test of the administrator mail“, Kopfzeile
+  `X-Miab-Test: 1`).
+* **Munin alerts**: die Einstellungen, die in rc7 bis v78-r2604.4 auf der
+  Munin-Seite standen (siehe [Warnungen von Munin](#munin-alerts--warnungen-von-munin)).
+  Der Menüpunkt System > Munin Monitoring öffnet Munin wieder direkt.
+* **administrator@ und die Adressen der Domains**: Der Alias
+  administrator@ selbst ändert sich durch diese Einstellung nicht. Er ist
+  eine Adresse der Domain-Validierung (Zertifizierungsstellen schicken ihre
+  Bestätigungen dorthin), deshalb darf er nur zu Administratoren der Box
+  führen (Mail & Users > Aliases). Er bekommt auch die Mails an abuse@,
+  postmaster@, hostmaster@ und admin@ aller Domains (außer eine solche
+  Adresse ist von Hand gesetzt) sowie von root und cron-Jobs. Die Seite
+  zeigt, wohin er führt, so aufgelöst wie Postfix es tut, und warnt, wenn
+  das nicht funktionieren kann (eine Alias-Schleife, eine Adresse der Box,
+  die es nicht gibt). Liest niemand dieses Postfach, bleiben zum Beispiel
+  Spam-Beschwerden über die eigenen Domains unbemerkt: regelmäßig
+  hineinschauen oder im Webmail einen Weiterleitungsfilter einrichten
+  (Einstellungen > Filter).
+* **What the box mails** und **Last deliveries**: jede Art von Mail mit
+  ihrem Ziel und die letzten Zustellungen an administrator@ oder den
+  Berichtsempfänger aus dem Mail-Log (zugestellt, verzögert,
+  zurückgewiesen).
+
+Die Einstellung steht als `admin_mail` in `$STORAGE_ROOT/settings.yaml`;
+ohne sie gehen die Berichte wie bisher an administrator@. Dasselbe über
+die API: `/system/notifications` (siehe `api/mailinabox.yml`), oder auf der
+Box:
+
+	sudo /root/mailinabox/management/admin_mail.py --status   # wohin die Mails gehen
+	sudo /root/mailinabox/management/admin_mail.py --test     # eine Testmail
+
+
 Munin alerts / Warnungen von Munin
 ----------------------------------
 
@@ -869,17 +1476,26 @@ watched value reaches its warning or critical limit, or is back to normal,
 all changes of that run. A value that stays in warning or critical is not
 mailed again; `/var/lib/munin/limits` lists the current states.
 
-The admin panel sets who gets these mails, under System > Munin Monitoring
-(from rc7):
+The admin panel sets who gets these mails, under System > Notifications
+(rc7 to v78-r2604.4: on the page System > Munin Monitoring):
 
-* **Send alerts to**: Standard (administrator@ of the box's name, an alias
-  of the first administrator by default), a custom address, or Off. A
+* **Send alerts to**: Same as the reports (the report recipient of
+  [Notifications](#notifications--benachrichtigungen), administrator@ of
+  the box's name by default), a custom address, or Off. A
   custom address must be a plain address: ASCII letters, digits and
   `_ + - .` before the @, no name, quotes or spaces. The mails come from
   administrator@ of the box's name in every case.
 * **Level**: warning and critical (the default), or critical only. Critical
   only mails the changes of plugins that have a critical value and lists
   only those values; warnings and the return to normal are not mailed.
+  Munin's text template can name the values that are critical, warning or
+  unknown now and those that are back to normal in this run, but not the
+  state a value had before. So critical only cannot mail the end of a
+  critical state alone (it would have to mail every return to normal, also
+  of values that were only in warning, which this level leaves out), and a
+  value that drops from critical to warning is not mailed either. To be
+  told when a value is back to normal, choose warning and critical;
+  `/var/lib/munin/limits` shows the current state of each value.
 * **Send test mail** sends one notification to the saved recipient through
   the same command as the alerts (subject "Munin test notification", header
   `X-Miab-Test: 1`).
@@ -904,18 +1520,29 @@ Lauf (alle 5 Minuten) mit allen Änderungen dieses Laufs. Ein Wert, der in
 Warnung oder kritisch bleibt, wird nicht noch einmal gemeldet;
 `/var/lib/munin/limits` listet die aktuellen Zustände.
 
-Wer diese Mails bekommt, stellt das Control Panel unter System > Munin
-Monitoring ein (ab rc7):
+Wer diese Mails bekommt, stellt das Control Panel unter System >
+Notifications ein (rc7 bis v78-r2604.4: auf der Seite System > Munin
+Monitoring):
 
-* **Send alerts to**: Standard (administrator@ des Box-Namens, standardmäßig
-  ein Alias des ersten Administrators), eine eigene Adresse oder Off. Eine
+* **Send alerts to**: Same as the reports (der Berichtsempfänger von
+  [Benachrichtigungen](#notifications--benachrichtigungen), standardmäßig
+  administrator@ des Box-Namens), eine eigene Adresse oder Off. Eine
   eigene Adresse muss eine einfache Adresse sein: ASCII-Buchstaben, Ziffern
   und `_ + - .` vor dem @, kein Name, keine Anführungszeichen, keine
   Leerzeichen. Absender ist in jedem Fall administrator@ des Box-Namens.
 * **Level**: Warnung und kritisch (Standard) oder nur kritisch. Nur kritisch
   meldet die Änderungen der Plugins mit einem kritischen Wert und listet nur
   diese Werte; Warnungen und die Rückkehr zum Normalzustand werden nicht
-  gemeldet.
+  gemeldet. Munins Textvorlage kann die Werte nennen, die jetzt kritisch,
+  in Warnung oder unbekannt sind, und die Werte, die in diesem Lauf wieder
+  normal sind, aber nicht den Zustand, den ein Wert vorher hatte. Deshalb
+  kann „nur kritisch“ das Ende eines kritischen Zustands nicht allein
+  melden (es müsste jede Rückkehr zum Normalzustand melden, auch die von
+  Werten, die nur in Warnung waren, die diese Stufe auslässt), und ein
+  Wert, der von kritisch auf Warnung sinkt, wird auch nicht gemeldet. Wer
+  erfahren will, wann ein Wert wieder normal ist, wählt Warnung und
+  kritisch; `/var/lib/munin/limits` zeigt den aktuellen Zustand jedes
+  Werts.
 * **Send test mail** schickt eine Benachrichtigung an den gespeicherten
   Empfänger, über denselben Befehl wie die Warnungen (Betreff „Munin test
   notification“, Kopfzeile `X-Miab-Test: 1`).
@@ -933,7 +1560,7 @@ der Box:
 	sudo /root/mailinabox/management/munin_admin.py --test    # eine Testmail
 
 
-Intrusion protection (adaptive fail2ban) / Schutz vor Anmeldeangriffen
+Intrusion detection and prevention (adaptive fail2ban) / Schutz vor Anmeldeangriffen
 ---------------------------------------------------------------------
 
 ### English
@@ -1009,7 +1636,22 @@ the following, on by default:
   addresses banned for all of them. Anyone can do that on purpose: an
   account name and a wrong password entered in the app are enough. Repeated,
   such bans lead to recidive's one-week ban of these addresses on all ports.
-  If your users sync that way, put those networks on the allowlist. `/var/log/z-push` belongs to root (group
+  If your users sync that way, put those networks on the allowlist.
+  System > Intrusion Detection and Prevention recognises a banned address of these
+  servers by Microsoft's published IP ranges of Exchange Online and of its
+  AutoDetect service (shipped in `conf/fail2ban/microsoft-relays.txt`,
+  refreshed with `tools/update-microsoft-relays.py` for a release; the box
+  downloads nothing), shows a hint and offers a button that puts the
+  network on the allowlist after a question; nothing is put there on its
+  own. On the allowlist, password guesses through these servers are no
+  longer banned: Z-Push checks each password with an IMAP login from
+  127.0.0.1, which Dovecot answers at once and limits only per account
+  (30 different wrong passwords in 30 minutes unless set otherwise, B126,
+  "Known issues"). The
+  address's reverse DNS name is shown only as extra information, and only
+  when it resolves back to the address: the owner of an address sets its
+  PTR record. Other apps that sync through their provider's servers are
+  not recognised. `/var/log/z-push` belongs to root (group
   www-data, which may write the four log files but not replace them), so
   that fail2ban never opens a link or a FIFO there; setup and logrotate
   create the log files.
@@ -1115,7 +1757,7 @@ the old files back if fail2ban rejects it, and reloads fail2ban only if a file
 changed. `--print` shows the files, `--allow 192.0.2.0/24` adds a network,
 `--report` prints the failed-login report.
 
-In the control panel, **System > Intrusion Protection** shows whether
+In the control panel, **System > Intrusion Detection and Prevention** shows whether
 fail2ban runs, the banned addresses (per address: the jails, time left, length
 and start of each ban and why, with the log lines; with a filter), the
 addresses that Nextcloud's own throttle counts (with a "Reset" button, and a
@@ -1240,7 +1882,22 @@ eingeschaltet:
   Ein Kontoname und ein falsches Passwort in der App genügen. Wiederholt
   führen solche Sperren zur einwöchigen recidive-Sperre dieser Adressen auf
   allen Ports. Wenn die Nutzer so synchronisieren, diese Netze in die
-  Freigabeliste setzen.
+  Freigabeliste setzen. System > Intrusion Detection and Prevention erkennt eine
+  gesperrte Adresse dieser Server an Microsofts veröffentlichten
+  IP-Bereichen von Exchange Online und seines AutoDetect-Dienstes
+  (mitgeliefert in `conf/fail2ban/microsoft-relays.txt`, für ein Release
+  erneuert mit `tools/update-microsoft-relays.py`; die Box lädt nichts
+  herunter), zeigt einen Hinweis und bietet eine Schaltfläche an, die das
+  Netz nach einer Rückfrage in die Freigabeliste setzt; von selbst kommt
+  nichts hinein. In der Freigabeliste werden Passwortversuche über diese
+  Server nicht mehr gesperrt: Z-Push prüft jedes Passwort mit einer
+  IMAP-Anmeldung von 127.0.0.1 aus, die Dovecot sofort beantwortet und nur
+  pro Konto begrenzt (30 verschiedene falsche Passwörter in 30 Minuten,
+  sofern nicht anders eingestellt, B126, „Bekannte Einschränkungen“). Den Namen aus
+  dem Reverse-DNS zeigt die Seite nur als Zusatzinformation und nur, wenn er wieder auf die
+  Adresse auflöst: Den PTR-Eintrag setzt der Inhaber der Adresse. Andere
+  Apps, die über die Server ihres Anbieters synchronisieren, erkennt sie
+  nicht.
   `/var/log/z-push` gehört root (Gruppe www-data, die die vier Logdateien
   beschreiben, aber nicht ersetzen darf), damit fail2ban dort nie einen Link
   oder eine FIFO öffnet; Setup und logrotate legen die Logdateien an.
@@ -1336,7 +1993,7 @@ Dateien wieder her und lädt fail2ban nur neu, wenn sich eine Datei geändert
 hat. `--print` zeigt die Dateien, `--allow 192.0.2.0/24` fügt ein Netz hinzu,
 `--report` gibt den Bericht über Fehlanmeldungen aus.
 
-In der Admin-Oberfläche zeigt **System > Intrusion Protection**, ob fail2ban
+In der Admin-Oberfläche zeigt **System > Intrusion Detection and Prevention**, ob fail2ban
 läuft, die gesperrten Adressen (je Adresse die Jails mit Restdauer, Länge und
 Beginn jeder Sperre und ihrem Grund samt Logzeilen; mit Filter), die Adressen,
 die die eigene Drossel von Nextcloud zählt (mit Knopf „Reset“ und einem
@@ -1467,6 +2124,37 @@ again in finish. Write hooks so that they can run twice. For example:
     # /etc/mailinabox/upgrade-2604.d/after/10-myapp.sh
     cd /opt/myapp && docker compose up -d
 
+**Local changes to Roundcube** (webmail) do not stop the upgrade: setup
+installs the new Roundcube as a new tree in `/usr/local/lib/roundcubemail`
+and writes its own `config/config.inc.php` (on every run, also on later
+updates). The preflight check (also `--check`) names plugin directories that
+setup does not install, plugins added to or left out of the plugin list, and
+other settings of `config.inc.php` that differ from what setup writes (of a
+setting that setup does not write only its name: its value may be a
+password). Before setup the tool keeps the old `config.inc.php` and those
+plugin directories in `/root/upgrade-2604/old-roundcube` (the system archive
+keeps the whole old tree). They are not copied back on their own: a plugin
+for the old Roundcube can break the new one. Phase verify lists what the new
+Roundcube does not have (also in `etc-report.txt`) and writes it to
+`/root/upgrade-2604/local-changes.json` (root's only); while that file exists,
+System Status shows a warning with the items under "show more", so the daily
+status mail names it too. Bring back what the new Roundcube supports with a
+hook, for example:
+
+    # /etc/mailinabox/upgrade-2604.d/50-roundcube.sh
+    RC=/usr/local/lib/roundcubemail
+    cp -a "$UPGRADE_STATE_DIR/old-roundcube/plugins/contextmenu" "$RC/plugins/"
+    grep -q "'contextmenu'" "$RC/config/config.inc.php" \
+      || sed -i "s/^\(\$config\['plugins'\] = array(\)/\1'contextmenu', /" "$RC/config/config.inc.php"
+
+and run `--redo-from local-ext`, which checks again. `cp -a` keeps the
+plugin's modes as they were in the old Roundcube; the web server (www-data)
+must be able to read the plugin, and phase verify names one that it cannot
+read (Roundcube does not load it then). When everything is dealt
+with (or not wanted), `upgrade-in-place-to-2604.sh --ack-local` (or removing
+the file) ends the warning. Setup writes `config.inc.php` again on the next
+update, so keep such a change in a script of your own.
+
 **How long an in-place upgrade takes.** Times of the in-place test runs
 (test VMs with 2 vCPUs and 4-6 GB RAM on one host with HDD storage):
 
@@ -1575,7 +2263,9 @@ run on the old box before the upgrade, through `curl ... | sudo bash -s --
 STEP`; they find its checkout in `/mailinabox`. After the upgrade `after`
 lists the changes without judging them ("RESULT: NOT JUDGED", exit code 3),
 since a release upgrade changes almost everything, and still runs the log
-audit against the baseline (a new message class: exit code 1); `mailcheck` works as after an update.
+audit against the baseline (a new message class: exit code 1), with
+`tests/fork/log-audit-allow-old-box.txt` for what the old release logged
+before the upgrade stopped mail; `mailcheck` works as after an update.
 
 Full-text search with fts_xapian is part of the fork (on by default, `FTS=off`
 in `/etc/mailinabox.conf` turns it off). Boxes that added fts_xapian by hand
@@ -1679,6 +2369,41 @@ noch einmal. Hooks so schreiben, dass sie zweimal laufen dürfen. Beispiel:
 
     # /etc/mailinabox/upgrade-2604.d/after/10-myapp.sh
     cd /opt/myapp && docker compose up -d
+
+**Lokale Änderungen an Roundcube** (Webmail) halten das Upgrade nicht an:
+Setup installiert das neue Roundcube als neuen Baum in
+`/usr/local/lib/roundcubemail` und schreibt seine eigene
+`config/config.inc.php` (bei jedem Lauf, auch bei späteren Updates). Die
+Vorabprüfung (auch `--check`) nennt Plugin-Verzeichnisse, die setup nicht
+installiert, Plugins, die der Plugin-Liste hinzugefügt oder aus ihr
+weggelassen wurden, und andere Einstellungen der `config.inc.php`, die von
+dem abweichen, was setup schreibt (bei einer Einstellung, die setup nicht
+schreibt, nur ihren Namen: ihr Wert kann ein Passwort sein). Vor setup
+bewahrt das Werkzeug die alte `config.inc.php` und diese
+Plugin-Verzeichnisse in `/root/upgrade-2604/old-roundcube` auf (das
+Systemarchiv enthält den ganzen alten Baum). Sie werden nicht von selbst
+zurückkopiert: Ein Plugin für das alte Roundcube kann das neue stören. Die
+Phase verify listet, was dem neuen Roundcube fehlt (auch in
+`etc-report.txt`), und schreibt es in `/root/upgrade-2604/local-changes.json`
+(nur für root lesbar); solange es diese Datei gibt, zeigt der Systemstatus
+eine Warnung mit den Punkten unter „show more“, die tägliche Statusmail
+nennt sie also auch. Was das neue Roundcube unterstützt, holt ein Hook
+zurück, zum Beispiel:
+
+    # /etc/mailinabox/upgrade-2604.d/50-roundcube.sh
+    RC=/usr/local/lib/roundcubemail
+    cp -a "$UPGRADE_STATE_DIR/old-roundcube/plugins/contextmenu" "$RC/plugins/"
+    grep -q "'contextmenu'" "$RC/config/config.inc.php" \
+      || sed -i "s/^\(\$config\['plugins'\] = array(\)/\1'contextmenu', /" "$RC/config/config.inc.php"
+
+und danach `--redo-from local-ext`, das erneut prüft. `cp -a` behält die
+Rechte des Plugins aus dem alten Roundcube; der Webserver (www-data) muss das
+Plugin lesen können, und die Phase verify nennt eines, das er nicht lesen
+kann (Roundcube lädt es dann nicht). Ist alles erledigt
+(oder nicht mehr gewünscht), beendet `upgrade-in-place-to-2604.sh
+--ack-local` (oder das Löschen der Datei) die Warnung. Setup schreibt
+`config.inc.php` beim nächsten Update wieder neu; eine solche Änderung also
+in einem eigenen Skript aufbewahren.
 
 **Wie lange ein Upgrade an Ort und Stelle dauert.** Zeiten der
 In-place-Testläufe (Test-VMs mit 2 vCPUs und 4-6 GB RAM auf einem Host mit
@@ -1799,8 +2524,9 @@ laufen auch auf der alten Box vor dem Upgrade, über `curl ... | sudo bash
 führt `after` die Änderungen auf, ohne sie zu bewerten („RESULT: NOT
 JUDGED“, Exit-Code 3), weil ein Release-Upgrade fast alles ändert, und
 lässt das Log-Audit trotzdem gegen die Vergleichsbasis laufen (eine neue
-Meldungsklasse: Exit-Code 1); `mailcheck`
-geht wie nach einem Update.
+Meldungsklasse: Exit-Code 1), mit `tests/fork/log-audit-allow-old-box.txt`
+für das, was das alte Release vor dem Anhalten der Mail protokolliert hat;
+`mailcheck` geht wie nach einem Update.
 
 Die Volltextsuche mit fts_xapian gehört zum Fork (standardmäßig an, `FTS=off`
 in `/etc/mailinabox.conf` schaltet sie ab). Auf Boxen, die fts_xapian von Hand
@@ -2040,7 +2766,7 @@ map a whole range to an offset). Instead:
 * Setup re-owns its own directories by name: `mail/mailboxes` and
   `mail/sieve` (mail), `mail/dkim` (opendkim), `mail/postgrey` (postgrey),
   `mail/spamassassin` (spampd), `mail/roundcube`, `owncloud` (www-data),
-  `mail/users.sqlite` (root:www-data), `www` (owner `user-data`).
+  `mail/users.sqlite` (root:root 0600, B210), `www` (owner `user-data`).
 * After setup, every parked owner is mapped by its old name (from the old
   `/etc/passwd` and `/etc/group`) to the new ID. An owner whose name does
   not exist on the new machine keeps its old number only if that number is
@@ -2074,6 +2800,23 @@ containers do not, the tool checks).
   mail to the new box later.
 * Logs (`/var/log`, so the usage reports start empty) and ACL entries with
   named users (none in a normal box).
+* Local changes to Roundcube (webmail; it is not part of the data, setup
+  installs its own and writes its own `config/config.inc.php`). The check
+  (also `--check`) names plugin directories of the old box that setup does
+  not install and changes of its `config.inc.php` (the plugin list, and other
+  settings; of a setting that setup does not write only its name). The tool
+  keeps the old `config.inc.php` and those plugin directories in
+  `/root/migration/old-roundcube`, but does not install them (a plugin for
+  the old Roundcube can break the new one). Phase verify lists what the new
+  Roundcube does not have (also in `etc-report.txt`) and writes it to
+  `/root/migration/local-changes.json` (root's only); while that file exists,
+  System Status shows a warning with the items under "show more", and so
+  does the daily status mail. Bring back what the new Roundcube supports
+  (copy the plugin directory to `/usr/local/lib/roundcubemail/plugins/` and
+  add it to `$config['plugins']`; setup writes the file again on every run;
+  the web server, www-data, must be able to read the plugin, which phase
+  verify checks), then end the warning with `migrate-to-2604.sh --ack-local` (or remove the
+  file). Not with `--from-backup`: a backup has no Roundcube.
 
 #### After the migration
 
@@ -2443,7 +3186,7 @@ Stattdessen:
 * Das Setup setzt seine eigenen Verzeichnisse nach Namen: `mail/mailboxes` und
   `mail/sieve` (mail), `mail/dkim` (opendkim), `mail/postgrey` (postgrey),
   `mail/spamassassin` (spampd), `mail/roundcube`, `owncloud` (www-data),
-  `mail/users.sqlite` (root:www-data), `www` (Besitzer `user-data`).
+  `mail/users.sqlite` (root:root 0600, B210), `www` (Besitzer `user-data`).
 * Nach dem Setup wird jeder geparkte Besitzer über seinen alten Namen (aus
   `/etc/passwd` und `/etc/group` der alten Box) auf die neue Kennung gesetzt.
   Gibt es den Namen auf der neuen Maschine nicht, behält der Besitzer seine
@@ -2479,6 +3222,26 @@ das, manche Container nicht; das Werkzeug prüft es).
   und zeigt, wie man sie später an die neue Box zustellt.
 * Protokolle (`/var/log`, die Nutzungsberichte beginnen leer) und
   ACL-Einträge mit benannten Benutzern (in einer normalen Box keine).
+* Lokale Änderungen an Roundcube (Webmail; es gehört nicht zu den Daten,
+  setup installiert sein eigenes und schreibt seine eigene
+  `config/config.inc.php`). Die Prüfung (auch `--check`) nennt
+  Plugin-Verzeichnisse der alten Box, die setup nicht installiert, und
+  Änderungen an ihrer `config.inc.php` (die Plugin-Liste und andere
+  Einstellungen; bei einer Einstellung, die setup nicht schreibt, nur den
+  Namen). Das Werkzeug bewahrt die alte `config.inc.php` und diese
+  Plugin-Verzeichnisse in `/root/migration/old-roundcube` auf, installiert sie
+  aber nicht (ein Plugin für das alte Roundcube kann das neue stören). Die
+  Phase verify listet, was dem neuen Roundcube fehlt (auch in
+  `etc-report.txt`), und schreibt es in `/root/migration/local-changes.json`
+  (nur für root lesbar); solange es diese Datei gibt, zeigt der Systemstatus
+  eine Warnung mit den Punkten unter „show more“, ebenso die tägliche
+  Statusmail. Was das neue Roundcube unterstützt, zurückholen (das
+  Plugin-Verzeichnis nach `/usr/local/lib/roundcubemail/plugins/` kopieren
+  und in `$config['plugins']` eintragen; setup schreibt die Datei bei jedem
+  Lauf neu; der Webserver, www-data, muss das Plugin lesen können, was die
+  Phase verify prüft), danach die Warnung mit `migrate-to-2604.sh --ack-local` beenden
+  (oder die Datei löschen). Nicht bei `--from-backup`: Eine Sicherung enthält
+  kein Roundcube.
 
 #### Nach dem Umzug
 

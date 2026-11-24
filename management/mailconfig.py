@@ -714,6 +714,17 @@ def get_required_aliases(env):
 def kick(env, mail_result=None):
 	results = []
 
+	# The list of accounts for Dovecot's limit of failed logins from the box
+	# itself (management/auth_guard.py): the accounts on it are always
+	# counted. A failure here must not stop the change: until the cron job
+	# of auth_guard.py writes the list again (every 10 minutes), a new
+	# account is counted in the Lua code's pool of names not on the list.
+	try:
+		from auth_guard import write_accounts
+		write_accounts(env)
+	except Exception as e:
+		results.append(f"the list of accounts for the limit of failed logins could not be written: {e}\n")
+
 	# Include the current operation's result in output.
 
 	if mail_result is not None:

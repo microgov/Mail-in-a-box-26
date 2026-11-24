@@ -110,16 +110,58 @@ tools/editconf.py /etc/opendkim.conf -s \
 # The OpenDMARC milter is skipped in the SMTP submission listener by
 # configuring smtpd_milters there to only list the OpenDKIM milter
 # (see mail-postfix.sh).
-tools/editconf.py /etc/postfix/main.cf \
-	"smtpd_milters=inet:127.0.0.1:8891 inet:127.0.0.1:8893"\
-	non_smtpd_milters=\$smtpd_milters \
-	milter_default_action=accept
+#
+# The sending limit of the box (inet:127.0.0.1:8895, see mail-postfix.sh) comes
+# last, and it fails closed: when it does not answer (stopped, crashed, hung),
+# Postfix refuses the mail with a temporary error ("451 4.7.1"; default_action
+# tempfail for this milter only) instead of letting it out without a limit.
+# The sender sends it again; sendmail's mail waits in the maildrop queue until
+# the milter is back (systemd restarts it within seconds). OpenDKIM and
+# OpenDMARC keep milter_default_action=accept. On port 25 it is asked only for
+# mail from the box itself (127.0.0.0/8, ::1, which mynetworks lets relay),
+# through smtpd_milter_maps, so that mail from other servers never depends on
+# it; through sendmail (non_smtpd_milters) for all mail; the submission ports
+# list it in master.cf ($sendlimit_submission_milters of mail-postfix.sh).
+#
+# When the sending limit is turned off (System > Intrusion Detection and
+# Prevention; "enabled 0" in the milter's settings file, which
+# management/send_limit.py --apply writes and which then also sets these
+# values when it is turned on or off in the control panel), Postfix does not
+# ask the milter at all, so nothing depends on it. The same values are in
+# send_limit.py (POSTFIX).
+sendlimit_milter="{ inet:127.0.0.1:8895, default_action=tempfail }"
+tools/write_conf.py /etc/postfix/sendlimit-milters.cidr << EOF;
+# Mail-in-a-Box (setup/dkim.sh): the milters of mail from the box itself on port 25.
+127.0.0.0/8	inet:127.0.0.1:8891 inet:127.0.0.1:8893 $sendlimit_milter
+::ffff:127.0.0.0/104	inet:127.0.0.1:8891 inet:127.0.0.1:8893 $sendlimit_milter
+::1/128	inet:127.0.0.1:8891 inet:127.0.0.1:8893 $sendlimit_milter
+EOF
+if grep -qx 'enabled 0' /usr/local/lib/mailinabox/miab-sendlimit/settings 2> /dev/null; then
+	tools/editconf.py /etc/postfix/main.cf \
+		"smtpd_milters=inet:127.0.0.1:8891 inet:127.0.0.1:8893" \
+		smtpd_milter_maps= \
+		"non_smtpd_milters=inet:127.0.0.1:8891 inet:127.0.0.1:8893" \
+		milter_default_action=accept
+else
+	tools/editconf.py /etc/postfix/main.cf \
+		"smtpd_milters=inet:127.0.0.1:8891 inet:127.0.0.1:8893" \
+		smtpd_milter_maps=cidr:/etc/postfix/sendlimit-milters.cidr \
+		"non_smtpd_milters=inet:127.0.0.1:8891 inet:127.0.0.1:8893 $sendlimit_milter" \
+		milter_default_action=accept
+fi
 
 # We need to explicitly enable the opendmarc service, or it will not start
 hide_output systemctl enable opendmarc
 
-# Restart services. Postfix only reads the milter settings again (B122).
-restart_service opendkim
-restart_service opendmarc
+# Restart OpenDKIM and OpenDMARC only when their configuration (or package)
+# changed: while OpenDKIM restarts, Postfix passes mail unsigned. The key and
+# signing tables are not part of it: the management daemon restarts OpenDKIM
+# when it writes them (management/dns_update.py). Postfix only reads the
+# milter settings again (B122).
+restart_on_change opendkim opendkim /etc/opendkim.conf /etc/default/opendkim \
+	/etc/opendkim/TrustedHosts "stat:$STORAGE_ROOT/mail/dkim/mail.private" \
+	tree:/etc/systemd/system/opendkim.service.d
+restart_on_change opendmarc opendmarc /etc/opendmarc.conf /etc/default/opendmarc \
+	tree:/etc/systemd/system/opendmarc.service.d
 reload_postfix
 

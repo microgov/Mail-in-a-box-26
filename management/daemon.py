@@ -17,8 +17,8 @@ from functools import wraps
 
 from flask import Flask, request, render_template, Response, send_from_directory, make_response
 
-import auth, utils
-from mailconfig import get_mail_users, get_mail_users_ex, get_admins, add_mail_user, set_mail_password, remove_mail_user
+import auth, utils, self_password
+from mailconfig import get_mail_users, get_mail_users_ex, get_admins, add_mail_user, set_mail_password, remove_mail_user, get_mail_password
 from mailconfig import get_mail_user_privileges, add_remove_mail_user_privilege
 from mailconfig import get_mail_aliases, get_mail_aliases_ex, get_mail_domains, add_mail_alias, remove_mail_alias
 from mailconfig import get_mail_quota, set_mail_quota
@@ -186,6 +186,27 @@ def session_me(): # not "me": that name holds this file's path (above)
 		"privileges": privs,
 	})
 
+# A mail user changes their own password with the current one (B210):
+# Roundcube's password plugin uses this, as www-data may no longer write
+# users.sqlite. See management/self_password.py.
+self_password_limiter = self_password.FailureLimiter()
+
+def mail_user_exists(email, env):
+	try:
+		get_mail_password(email, env)
+	except ValueError:
+		return False
+	return True
+
+@app.route('/me/password', methods=["POST"])
+def session_me_password():
+	body, status = self_password.change_own_password(request, env,
+		auth_service.check_user_auth, set_mail_password,
+		self_password_limiter, log_failed_login, mail_user_exists)
+	if status == 200:
+		app.logger.info("%s changed their own password", self_password.parse_basic_auth(request.headers.get("Authorization", ""))[0])
+	return Response(body.rstrip("\n") + "\n", status=status, mimetype='text/plain')
+
 @app.route('/logout', methods=["POST"])
 def logout():
 	try:
@@ -318,7 +339,12 @@ def dns_update():
 @authorized_personnel_only
 def dns_get_secondary_nameserver():
 	from dns_update import get_custom_dns_config, get_secondary_dns
-	return json_response({ "hostnames": get_secondary_dns(get_custom_dns_config(env), mode=None) })
+	try:
+		records = list(get_custom_dns_config(env))
+	except ValueError as e:
+		# dns/ or its custom.yaml cannot be trusted (B212): the reason, not a traceback.
+		return (str(e), 500)
+	return json_response({ "hostnames": get_secondary_dns(records, mode=None) })
 
 @app.route('/dns/secondary-nameserver', methods=['POST'])
 @authorized_personnel_only
@@ -334,7 +360,11 @@ def dns_set_secondary_nameserver():
 def dns_get_records(qname=None, rtype=None):
 	# Get the current set of custom DNS records.
 	from dns_update import get_custom_dns_config, get_dns_zones
-	records = get_custom_dns_config(env, only_real_records=True)
+	try:
+		records = list(get_custom_dns_config(env, only_real_records=True))
+	except ValueError as e:
+		# dns/ or its custom.yaml cannot be trusted (B212): the reason, not a traceback.
+		return (str(e), 500)
 
 	# Filter per the arguments for the more complex GET routes below.
 	records = [r for r in records
@@ -782,17 +812,44 @@ def privacy_status_set():
 	utils.write_settings(config, env)
 	return "OK"
 
-# Intrusion protection (adaptive fail2ban, see fail2ban_admin.py)
+# Intrusion detection and prevention (adaptive fail2ban, see fail2ban_admin.py)
 
 @app.route('/system/fail2ban', methods=["GET"])
 @authorized_personnel_only
 def fail2ban_status():
-	from fail2ban_admin import get_status, client_info
-	status = get_status(env)
+	# The overview: counters, how many addresses are banned, the networks with
+	# the most of them, the relay hints, the settings. The bans are paged by
+	# /system/fail2ban/bans, their reasons read by /system/fail2ban/ban-reason.
+	from fail2ban_admin import get_status
 	# nginx puts the client's address in X-Forwarded-For (see log_failed_login).
 	ip = request.headers.getlist("X-Forwarded-For")[0] if request.headers.getlist("X-Forwarded-For") else request.remote_addr
-	status["client"] = client_info(env, ip, status["settings"])
-	return json_response(status)
+	return json_response(get_status(env, client_ip=ip))
+
+@app.route('/system/fail2ban/bans', methods=["GET"])
+@authorized_personnel_only
+def fail2ban_bans():
+	# filter (part of an address or a jail, or a network in CIDR notation),
+	# offset, limit (1 to 200, default 50): one page of the banned addresses,
+	# newest ban first.
+	from fail2ban_admin import list_bans
+	try:
+		return json_response(list_bans(request.args.get('filter', ''), request.args.get('offset'), request.args.get('limit')))
+	except ValueError as e:
+		return (str(e), 400)
+	except Exception as e:
+		return (str(e), 500)
+
+@app.route('/system/fail2ban/ban-reason', methods=["GET"])
+@authorized_personnel_only
+def fail2ban_ban_reason():
+	# ip: why that address is banned, per jail that bans it now.
+	from fail2ban_admin import ban_reason
+	try:
+		return json_response(ban_reason(env, request.args.get('ip', '')))
+	except ValueError as e:
+		return (str(e), 400)
+	except Exception as e:
+		return (str(e), 500)
 
 @app.route('/system/fail2ban/settings', methods=["GET"])
 @authorized_personnel_only
@@ -815,7 +872,7 @@ def fail2ban_settings_set():
 		return (str(e), 400)
 	except Exception as e:
 		return (str(e), 500)
-	app.logger.warning("fail2ban: %s %s the intrusion protection settings", request.user_email, "reset" if reset else "saved")
+	app.logger.warning("fail2ban: %s %s the intrusion detection and prevention settings", request.user_email, "reset" if reset else "saved")
 	result["status"] = "ok"
 	return json_response(result)
 
@@ -849,6 +906,113 @@ def fail2ban_unban_all():
 	result["status"] = "ok"
 	return json_response(result)
 
+# Dovecot's limit of failed logins from the box itself (see auth_guard.py):
+# its setting (part of System > Intrusion Detection and Prevention), the accounts it
+# counts or refuses, and the end of a lock.
+
+@app.route('/system/auth-guard', methods=["GET"])
+@authorized_personnel_only
+def auth_guard_get():
+	import auth_guard
+	try:
+		return json_response(auth_guard.status(env))
+	except Exception as e:
+		return (str(e), 500)
+
+@app.route('/system/auth-guard', methods=["POST"])
+@authorized_personnel_only
+def auth_guard_set():
+	# limit (different wrong passwords), window (minutes) and span (windows a
+	# burst counts against, 1 to 4); fields that are
+	# not sent keep their value. reset=1 restores the defaults.
+	import auth_guard
+	values = { k: request.form[k] for k in ("limit", "window", "span") if k in request.form }
+	reset = request.form.get('reset') == '1'
+	try:
+		result = auth_guard.update_settings(env, values, reset=reset)
+	except auth_guard.AuthGuardError as e:
+		return (str(e), 400)
+	except Exception as e:
+		return (str(e), 500)
+	app.logger.warning("auth-guard: %s set the limit of failed logins from the box itself to %d in %d minutes, %d windows",
+		request.user_email, result["settings"]["limit"], result["settings"]["window"], result["settings"]["span"])
+	result["status"] = "ok"
+	return json_response(result)
+
+@app.route('/system/auth-guard/unlock', methods=["POST"])
+@authorized_personnel_only
+def auth_guard_unlock():
+	# key: an entry of the list of GET /system/auth-guard.
+	import auth_guard
+	try:
+		result = auth_guard.unlock(request.form.get('key', ''))
+	except auth_guard.AuthGuardError as e:
+		return (str(e), 400)
+	except Exception as e:
+		return (str(e), 500)
+	app.logger.warning("auth-guard: %s ended the count of %s", request.user_email, result["name"])
+	result["status"] = "ok"
+	return json_response(result)
+
+# The sending limit of the box (see send_limit.py): its setting (part of
+# System > Intrusion Detection and Prevention) and the minutes in which
+# outgoing mail had to wait.
+
+@app.route('/system/send-limit', methods=["GET"])
+@authorized_personnel_only
+def send_limit_get():
+	import send_limit
+	try:
+		return json_response(send_limit.status(env))
+	except Exception as e:
+		return (str(e), 500)
+
+@app.route('/system/send-limit', methods=["POST"])
+@authorized_personnel_only
+def send_limit_set():
+	# enabled (1/0), rate (mails) and per (seconds); fields that are not sent
+	# keep their value. reset=1 restores the defaults.
+	import send_limit
+	values = { k: request.form[k] for k in ("enabled", "rate", "per", "stop", "brake_rate", "brake_per", "calm",
+		"long_enabled", "long_rate", "long_per") if k in request.form }
+	reset = request.form.get('reset') == '1'
+	try:
+		result = send_limit.update_settings(env, values, reset=reset)
+	except send_limit.SendLimitError as e:
+		return (str(e), 400)
+	except Exception as e:
+		return (str(e), 500)
+	s = result["settings"]
+	app.logger.warning("send-limit: %s set the sending limit to %d mails in %d s%s%s, the brake to %s",
+		request.user_email, s["rate"], s["per"],
+		" and %d mails in %d s" % (s["long_rate"], s["long_per"]) if s["long_enabled"] else " (no long limit)",
+		"" if s["enabled"] else " (turned off)",
+		"stop" if s["stop"] else "%d mails in %d s, ending after %d calm minutes" % (s["brake_rate"], s["brake_per"], s["calm"]))
+	result["status"] = "ok"
+	return json_response(result)
+
+@app.route('/system/send-limit/held', methods=["POST"])
+@authorized_personnel_only
+def send_limit_held():
+	# action: release (now, past the limit), delete, or end (the brake);
+	# sender: one of the senders of GET /system/send-limit's "held", or empty
+	# for all held mail.
+	import send_limit
+	sender = request.form.get('sender', '') or None
+	try:
+		result = send_limit.act_on_held(request.form.get('action', ''), sender)
+	except send_limit.SendLimitError as e:
+		return (str(e), 400)
+	except Exception as e:
+		return (str(e), 500)
+	if result["action"] == "end":
+		app.logger.warning("send-limit: %s ended the brake", request.user_email)
+	else:
+		app.logger.warning("send-limit: %s %s %d held mails of %s", request.user_email,
+			"released" if result["action"] == "release" else "deleted", result["mails"], sender or "all senders")
+	result["status"] = "ok"
+	return json_response(result)
+
 @app.route('/system/fail2ban/report', methods=["GET"])
 @authorized_personnel_only
 def fail2ban_report():
@@ -859,7 +1023,7 @@ def fail2ban_report():
 		return (str(e), 500)
 
 # Nextcloud's brute-force throttle (see nextcloud_throttle.py). Its settings
-# are part of the intrusion protection settings above.
+# are part of the intrusion detection and prevention settings above.
 
 @app.route('/system/nextcloud-throttle', methods=["GET"])
 @authorized_personnel_only
@@ -891,6 +1055,47 @@ def nextcloud_throttle_reset():
 	app.logger.warning("nextcloud: %s reset the brute-force failures of %s", request.user_email, result["ip"] or "all addresses (stale)")
 	result["status"] = "ok"
 	return json_response(result)
+
+# The administrator's mail (System > Notifications, see admin_mail.py): the
+# recipient of the box's reports, where administrator@ leads, the last
+# deliveries, a test mail.
+
+@app.route('/system/notifications', methods=["GET"])
+@authorized_personnel_only
+def notifications_get():
+	from admin_mail import status
+	return json_response(status(env))
+
+@app.route('/system/notifications', methods=["POST"])
+@authorized_personnel_only
+def notifications_set():
+	# Form fields recipient (admin, custom) and address (for custom); fields
+	# that are not sent keep their value.
+	from admin_mail import update_settings, status, AdminMailError
+	values = { k: request.form[k] for k in ("recipient", "address") if k in request.form }
+	try:
+		result = update_settings(env, values)
+	except AdminMailError as e:
+		return (str(e), 400)
+	except Exception as e:
+		return (str(e), 500)
+	if result["changed"]:
+		app.logger.warning("notifications: %s set the report recipient to %s", request.user_email,
+			result["settings"]["address"] or "the standard address")
+	ret = status(env)
+	ret.update({ "status": "ok", "changed": result["changed"] })
+	return json_response(ret)
+
+@app.route('/system/notifications/test', methods=["POST"])
+@authorized_personnel_only
+def notifications_test():
+	# One test mail to the report recipient, sent as the reports are.
+	from admin_mail import send_test, AdminMailError
+	try:
+		to, message_id = send_test(env)
+	except AdminMailError as e:
+		return (str(e), 400)
+	return json_response({ "status": "ok", "to": to, "message_id": message_id })
 
 # Munin's alerts (recipient and level of munin-limits' mails, see munin_admin.py)
 

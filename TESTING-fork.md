@@ -58,6 +58,20 @@ signature; a local backup. It writes a manifest (POP3 UIDLs, folder counts,
 Bayes counts, Sieve scripts, DKIM key, Nextcloud items) that the smoke test
 compares against after a migration or upgrade.
 
+A preparation that should leave the state of a box after its users trained
+the spam filter (sa-learn through IMAPSieve) uses `tests/fork/spam-move.py`:
+it appends a marked test mail (`X-Miab-Test: 1`, a Message-ID
+`@smoketest.invalid`) to a user's INBOX, moves that mail to Spam and back
+and deletes it, and checks that the other mails keep their UIDs. Moving a
+seeded mail instead gives it a new UID and so a new POP3 UIDL, which the
+manifest no longer matches: the start snapshot of T5b from v78-r2604.2 to
+v78-r2604.4 was prepared that way, so `mig-pop3-uidl-alice` failed on every
+run from it, and the lab used a corrected copy of the manifest for that VM.
+A start snapshot prepared with `spam-move.py` works with the original
+manifest. The start snapshot of v78-r2604.5 (the box copy at the published
+v78-r2604.4) got the moved mail's seeded UID back in the lab and works with
+the original manifest too.
+
 ## Scenarios
 
 | ID | Start state | Path | Tool / command | Smoke mode |
@@ -68,6 +82,7 @@ compares against after a migration or upgrade.
 | T4 | the 22.04 test VM | in place, 22.04 → 24.04 → 26.04, two release upgrades | `curl …/tools/upgrade-in-place-to-2604.sh \| sudo bash -s -- --yes` | migrated |
 | T5 | the 24.04 test VM after an in-place upgrade with rc3 | update of a box that already runs the fork | `git remote set-url` to GitHub, then `sudo bash -c "$(curl -fsSL …/setup/bootstrap.sh)"`; the setup dialogs answered with Enter | migrated |
 | T6 | a box on the Internet (public DNS, open port 25), before a final release | fresh install, then an update of it | as T1, then as T5; `tools/update-check.sh` around the update, `mailcheck` with a real external probe address | fresh |
+| T7 | a test VM with the published release before, given a copy of the configuration of a production box (users, aliases, settings, custom DNS/web settings; no mail, cloud data, keys or backups; all passwords replaced), isolated from the Internet for mail and DNS | update to the release under test, as on that box | `bootstrap.sh` with `TAG=<commit>`; `tools/update-check.sh before`/`after` | none (logins, maps and the panel checked one by one) |
 | T1n | the installed T1 box (from v78-r2604.2) | setup's network checks, `setup/network-checks.sh` of the release before and of the release under test, each under setup's shell options (`set -euo pipefail`) | the script run on the box through its own resolver; cases: not listed, a listed hostname, a listed IP address, a public resolver, a failing resolver | none |
 
 Variants: **T3b** is a clean T3 run from the tag after a first run had found
@@ -214,7 +229,7 @@ report. The groups:
   twice, is a FAIL.
 * **admin**: admin API login, creating and deleting a user and an alias,
   backup status; from rc4 the fail2ban API, settings, report, filters (with
-  injected user names) and the Intrusion Protection page; after rc7 the
+  injected user names) and the Intrusion Detection and Prevention page; after rc7 the
   status wants `miab-zpush`, the filter cases cover it (B126), and the
   saved backup status (`admin-backup-saved`, B125): a refresh in the
   background, polled until it ends, with the control panel answering
@@ -264,12 +279,228 @@ report. The groups:
   `management/daemon.py` is documented and every documented operation has a
   route, that `smoke.py` calls or excludes each of them, and the content
   types it expects.
+  `tests/fork/panel-fragments.py` (B178; no box needed) checks that no
+  HTML fragment of the control panel's templates has a self-closing tag of
+  a non-void element followed by more markup, which jQuery 3 reads as an
+  opening tag.
+  `tests/fork/admin-mail.py` (System > Notifications; no box needed)
+  checks how administrator@ is followed through the aliases (mailbox,
+  outside address, loop, unknown address of the box, catch-all, domain
+  alias, an alias that names itself, which Postfix delivers to its
+  mailbox and does not take for a loop), the report recipient and its invalid values, that Munin's
+  standard recipient follows, the list of deliveries and the test mail.
+  `tests/fork/nginx-hsts.py` (B180; no box needed) builds the nginx
+  configuration of the box's name and of another domain with
+  `management/web_update.py` for each HSTS setting of `custom.yaml`
+  (`yes`, the default, `preload`, off) and checks that every block of the
+  HTTPS server with `add_header` lines of its own has the server's HSTS
+  line (nginx inherits a server's `add_header` only into blocks that have
+  none), and none when HSTS is off.
+  `tests/fork/panel-assets.py` (no box needed) checks that every file the
+  control panel's templates name under `/admin/assets/` is one that
+  `setup/management.sh` installs (its downloads, Bootstrap 3.4.1's archive,
+  its copy of `branding/`), that the icons it copies are in the repository
+  and that nginx serves `/admin/assets` from that directory;
+  `admin-panel-assets` fetches each of them from the box (HTTP 200, the
+  icons the same as the files of `branding/`).
+  `tests/fork/status-changes.py` (B179; no box needed) checks that the
+  daily status change notice shows a changed check with all of its lines
+  and leaves unchanged checks out.
+  `api-self-password` (B210): `POST /admin/me/password` from outside gets
+  404 from nginx (the endpoint is on 127.0.0.1:10222 only) and changes
+  nothing; a test user (`smokepw-<token>`) changes their own password
+  through Roundcube's Settings > Password, whose driver calls the
+  endpoint (Roundcube's own "Current password incorrect." for a wrong
+  current password, the change and the change back, IMAP takes only the
+  new password). The user, its archived mailbox
+  and (with `--ssh`) its Roundcube record are removed.
+  `tests/fork/auth-guard.py` (B126; no box needed) checks
+  `management/auth_guard.py`, the reporter of Dovecot's limit of failed
+  logins from the box itself: the values it reads from
+  `conf/dovecot-auth-guard/guard.lua`, the file names of account names
+  (the same as the Lua code's: only A-Z lowered, other bytes as %XX), the
+  scan of the state directory (different tags of wrong passwords within
+  the window, a tag sent again counted once, files of names
+  without failures and old temporary files removed, a symbolic link left
+  alone, a directory of another mode refused, events read once, also a
+  leftover), `--unlock`, the setting of the control panel (defaults 30 in
+  30 minutes, the ranges, invalid values refused, the settings file
+  written through its directory's descriptor and read back as the Lua code
+  reads it, values out of range ignored), the status and the unlock of the
+  API, and the mail of new locks (at once, then at most
+  hourly, a name without an account marked, the pending events capped).
+  The smoke check `login-auth-guard` (needs `--ssh`) makes 150 IMAP logins
+  of a test account with the same wrong password from 127.0.0.1 on the box
+  (it must not lock the account), sets the limit to 5 through
+  `POST /system/auth-guard` (a limit of 2 must be refused), makes 40
+  logins of another test account with different wrong passwords from
+  changing addresses of 127.0.0.0/8 (answered at once), then expects that account refused from there with its right
+  password, the first account logging in from there in under 3 s, the
+  refused account logging in from outside, `GET /system/auth-guard` and
+  `--status` naming it and `POST /system/auth-guard/unlock` ending the
+  lock; it restores the setting. The Lua code itself was checked with Dovecot 2.4.2 of
+  Ubuntu 26.04 in a container (BUGS-fork.md, B126), also against the gaps a
+  security review found: rotating 127.x addresses and the box's own
+  address (also without a "local" line), a flood of made-up names, a full
+  pool of names not on the list, user names with "+", bursts of 200 and 300
+  parallel guesses (the rule over 4 windows), the flag of a full pool
+  (set, removed after pruning and at a restart), and right passwords in
+  parallel (never refused).
+  `tests/fork/self-password.py` (B210; no box needed) checks the endpoint's
+  logic with stand-ins for the login check and the password change: HTTP
+  Basic credentials in UTF-8 and Latin-1, only the caller's password
+  changed, the policy, two-factor authentication (no code: 403 and not
+  counted; a wrong code: counted), the limits per account and per address
+  and their expiry, and that forged addresses, also with made-up account
+  names (which count only for the address), do not flush an account's
+  failures from the limiter; group admin runs it (`admin-self-password-unit`).
+  `tests/fork/migration-record.py` (B211; no box needed) runs
+  setup/migrate.py with its migrations replaced by recorders against a
+  temporary `STORAGE_ROOT` and record: no record, the same number, a lower
+  number in `mailinabox.version` (setup stops before any migration), a
+  higher one, one above the newest migration (setup stops unless the
+  record has the same number, a downgrade; a later release's migration
+  still runs after the right number is written back; a record never
+  lowered), a missing file (taken from the record), the record of another
+  `STORAGE_ROOT`, a record that is a link, writable by others or broken, and
+  a failed migration; group admin runs it (`admin-migration-record-unit`).
+  `tests/fork/storage-dirs.py` (B212; no box needed) checks the reads and
+  writes of `backup/` and `dns/` below `STORAGE_ROOT` through a checked
+  directory (management/utils.py): the helpers (a link, a group-writable
+  directory, another owner, a FIFO, the size limit, a link at the name
+  replaced without touching its target), backup.py and dns_update.py with
+  the directory replaced by a link or a group-writable copy with another
+  account's settings (not used, nothing written there, the nightly backup
+  stops with the reason), with `custom.yaml` a link, web_update.py
+  without the records of a replaced `dns/`, and
+  `tools/write_conf.py --own-root-only` (setup's owner of
+  `$STORAGE_ROOT/mail` and `users.sqlite`) refusing a directory that root
+  does not own already, and `--check-own-root-only` naming such a
+  directory or database (also as a command, exit code 1), which
+  setup/start.sh runs before setup changes anything, and the KSK's public
+  key that the status checks read only through a checked `dns/` and
+  `dns/dnssec/` (B183), and the zone signing, which reads the keys
+  only through them and writes their patched copies only into its
+  temporary directory, also with a key name that holds a path (B191);
+  group admin runs it (`admin-storage-dirs-unit`).
+  `tests/fork/update-check-compare.py` (B201; no box needed) runs the
+  comparison of `tools/update-check.sh after` on states in a temporary
+  directory: Postfix and Dovecot settings that only the record after the
+  update has are "newly recorded (not judged)" and counted in the RESULT
+  line, a changed value of a setting in both records is still judged (with
+  and without a rule), a new line of another file is still unexpected,
+  every drop-in that setup writes is in a list of expected changes, and
+  `after` adds the old-box allowlist after a change of the Ubuntu release
+  (B187).
+  `tests/fork/roundcube-local.py` (B200; no box needed) checks the report
+  of local Roundcube changes that the in-place and migration tools share
+  (the two copies must be the same): its idea of setup's settings against
+  the configuration that setup/webmail.sh writes, an unchanged
+  configuration of the fork and of upstream (nothing to report), extra
+  plugin directories, a changed plugin list (also `$config['plugins'][]`),
+  changed values of setup's settings, settings set by hand (named without
+  their values), comments and strings with `;` and `?>`, files it cannot
+  read completely, control characters in names, the comparison with the
+  Roundcube after setup and its file `local-changes.json` (0600, removed
+  when nothing is open), and System Status's warning from that file
+  (which ignores a link and files that another account can write); a
+  local plugin that the web server cannot read, the modes of the kept
+  copy (B186), and both tools' preflight reports run as bash with `set -u`
+  (B185).
+  `tests/fork/clone-ref.py` (B188; no box needed) clones a tag, a branch
+  and a full commit id from a repository in a temporary directory with the
+  tools' `clone_ref` and bootstrap.sh's first clone, and refuses a short or
+  unknown commit id without leaving a directory.
+  `tests/fork/quiesce-order.py` (B190; no box needed) runs the in-place
+  tool's `quiesce_units` and `mask_units` with a stand-in systemctl: the
+  services of the apt timers are masked first, together.
+  `tests/fork/old-side-filter.py` (B154; no box needed) runs the migration
+  tool's filter of the old box's messages: escape sequences shown with
+  "?", the CR of a CR LF line end dropped, the command's output and exit
+  code kept.
+  `tests/fork/owncloud-backup-prune.py` (no box needed) checks the removal
+  of old Nextcloud backup copies in a temporary `STORAGE_ROOT`: the three
+  newest copies and those of the last 14 days stay (also after three
+  failed upgrade runs), older ones go with everything in them, other names
+  and a file or link with a copy's name stay, a symbolic link in the place
+  of `owncloud-backup` or inside an old copy is not followed, a directory
+  that others may write is left alone, and bad arguments are refused.
+  `tests/fork/update-check-hint.py` (no box needed) runs setup's hint at
+  `tools/update-check.sh` against temporary record directories: the
+  commands `after` and `mailcheck` with the stamp when the newest record
+  has a `before` but no `after`, the general tip otherwise (no records,
+  a complete newest record, a link in the place of a record or of the
+  directory), exit code 0 always; and that setup/start.sh shows it only
+  without `FIRST_TIME_SETUP` and `MIAB_SETUP_TOOL`, which both tools set.
+  `tests/fork/restart-on-change.py` (no box needed) checks the checksum
+  that decides whether setup restarts OpenDKIM, OpenDMARC, spampd,
+  postgrey, named, systemd-resolved, munin-node and the management daemon:
+  a changed file, a new file in a tree, a new name or link target in a
+  directory and a new inode of a file it only looks at change it,
+  `__pycache__` does not, missing files give no error; and, with stand-ins
+  for the service commands, a restart on the first call, on a change and
+  for a service that does not run or runs another invocation than the
+  record names (started since by something else or at boot: a downgrade,
+  a reboot and the way back up), has no readable invocation or a record
+  of the earlier format, none without a change, and nothing
+  recorded after a failed restart. The same for PHP-FPM (B122): nothing
+  without a change of its configuration, a reload on a change or in
+  another invocation, a restart
+  when the reload brings no "ready to handle connections", when
+  `php-fpm8.5 -t` refuses the configuration, or when PHP-FPM does not run
+  before or after the reload. The package check counts the unit's own
+  package and the library packages after it (an update of SpamAssassin's
+  Perl modules for spampd; one that is not installed does not count).
+  spampd's sa-update hook (`record_hook`, `refresh_record`) runs with a
+  stand-in for systemctl: it records the new invocation when the record
+  names the files of now (also a record of the earlier format), after
+  which setup does not restart, and leaves the record alone with other
+  files (a downgrade's), without a record or when the unit does not run.
+  `tests/fork/status-dns.py` (B181; no box needed) runs the status
+  checks' `query_dns()` against a stand-in for dnspython: records,
+  NXDOMAIN and NoAnswer, a failed lookup, a timeout, YXDOMAIN and a name
+  too long for DNS (no exception, `[error]`), a nameserver of its own;
+  and the Spamhaus DBL check of a mail domain (not listed, listed, a
+  failed lookup, a name too long with `.dbl.spamhaus.org`); and the
+  DNSSEC DS check (B182): a DS lookup that timed out or failed gives
+  "Could not check" without the DS records to set, no, a correct and a
+  wrong DS record give the messages as before, a zone's checks look its
+  DS records up once and suggest DNSSEC only when none is set, and the
+  box's name checks its zone's DS records only when they are set; an
+  unreadable KSK key gives the DS records without it (B183), and the test
+  of outbound port 25 discards nc's output (B184). Group admin runs it
+  (`admin-status-dns-unit`).
+  `tests/fork/cloud-relays.py` (B126; no box needed) checks how System >
+  Intrusion Detection and Prevention recognises Microsoft's servers: the shipped list
+  `conf/fail2ban/microsoft-relays.txt` (header, IPv4 and IPv6, the
+  AutoDetect ranges, every network accepted by the allowlist; a list
+  changed by hand is refused), addresses inside and just outside the
+  ranges, forward-confirmed reverse DNS with stand-in lookups (a spoofed
+  PTR name without a forward match, also one naming Microsoft, gives no
+  name; an address outside the ranges gets no hint), the limit of lookups
+  per request, and that `tools/update-microsoft-relays.py` takes only the
+  service area Exchange of Microsoft's answer. Group admin runs it
+  (`admin-cloud-relays-unit`); `admin-fail2ban-status` checks that the box
+  reads the list and gives hints only for banned addresses.
   `tests/fork/ban-reasons.py` (v78-r2604.4; no box needed) checks that the
-  reasons of bans in System > Intrusion Protection show no user name that
+  reasons of bans in System > Intrusion Detection and Prevention show no user name that
   is not an account of the box: the log lines of each jail's filter, also
   with names that the line repeats or that have spaces, and lines of
   Nextcloud's log that are not valid JSON, and long lines that must not
-  take long. `tests/fork/nextcloud-throttle.py` (v78-r2604.4; no box
+  take long. `tests/fork/fail2ban-switch.py` (no box needed) checks the
+  switch that turns fail2ban off for tests: the setting, starting and
+  stopping the service (systemctl replaced by a stand-in), setup's exit
+  code 4, the status checks' warning and the page's checkbox.
+  `tests/fork/ban-list.py` (B220; no box needed) checks the
+  banned addresses of that page with a stand-in for fail2ban-client and
+  10,000 synthetic bans: the overview without per-ban lists (counters, the
+  networks with the most banned addresses, the jails that ban the
+  browser's own address, relay hints), the pages (newest ban first, paging,
+  the filter by part of an address or jail and by network, bad parameters
+  refused), the reasons of one address, fail2ban not running, and that
+  each of these answers within a second or so; group admin runs it
+  (`admin-ban-list-unit`), and `admin-fail2ban-bans` checks the pages and
+  the refused parameters on the box. `tests/fork/nextcloud-throttle.py` (v78-r2604.4; no box
   needed) checks the reader of Nextcloud's throttle on a temporary
   database (no account of the box goes to it, no login name comes back),
   the stale failures with the protection off, and the takeover of values
@@ -291,7 +522,10 @@ report. The groups:
   (after rc7): Roundcube's `/mail/config/` still answers 403, while a
   missing static page under `/<name>/mail/config/` answers 404 and a
   Nextcloud file below a folder `mail/config` is read through
-  `/cloud/remote.php` and `/webdav` (B134).
+  `/cloud/remote.php` and `/webdav` (B134); `web-hsts-admin`: the control
+  panel (`/admin/`) and its assets send the same HSTS header as `/` of the
+  box's name, or none when HSTS is off for it (B180), and
+  `web-nginx-hsts-unit` runs `tests/fork/nginx-hsts.py` (described under **admin**).
 * **activesync** (after rc7): `nextcloud-bruteforce-loopback`: 127.0.0.1
   is on Nextcloud's brute-force bypass list, and no entry is there twice
   (B121; a check of the list: Nextcloud counts no attempts for a listed
@@ -299,7 +533,11 @@ report. The groups:
   exist) from the box's public address through the `/webdav` proxy, which
   connects to Nextcloud from 127.0.0.1, is logged and counted by Nextcloud
   for that address, not for 127.0.0.1 (B121; its attempts are reset
-  afterwards); `zpush-sync`: an ActiveSync account as a phone sets it
+  afterwards); `nextcloud-forwarded-for-local` (B213, with `--ssh`): a
+  failed login from the box itself straight to
+  `/cloud/remote.php/webdav/` with a forged `X-Forwarded-For` and a forged
+  proof header is logged by Nextcloud as 127.0.0.1, and nothing is counted
+  for the forged address; `zpush-sync`: an ActiveSync account as a phone sets it
   up (`tests/fork/eas.py`: Provision, FolderSync, Sync of all calendar and
   contact folders), and a marked event and two marked contacts put into
   alice's Nextcloud over DAV just before arrive, one of the cards with a
@@ -376,6 +614,7 @@ the in-place tool reports it.
 | v78-r2604.2 | 2026-11-15 | 70/70 twice ⁶ | 81/81 (from v78) ⁶ | not run | 81/81 (from v78) ⁶ | 80/81 (T5b from v78-r2604.1) ⁶ |
 | v78-r2604.3 | 2026-11-16 | 71/71, 72/72 ⁷ | not run | not run | not run | 81/82, 82/83 (T5b from v78-r2604.2) ⁷ |
 | v78-r2604.4 | 2026-11-19 | 84/84 twice ⁸ | not run | not run | not run | 94/94, 95/95 (T5b from v78-r2604.3) ⁸ |
+| v78-r2604.5 | 2026-11-23 | 105/105 twice ⁹ | 21/21, 110/110 ⁹ | 127/127 ⁹ | 21/21, 110/110 ⁹ | 127/127 four times (T5b from v78-r2604.4) ⁹ |
 
 ¹ Certification run at `33f056b`, before the last fixes of rc6 (B80-B85);
 not repeated on the code of the release (see "rc6 certification" below).
@@ -437,6 +676,22 @@ T5b at `e3df071` and again, from the same snapshot, at `f6e7f8b`. After
 `f6e7f8b` only the log audit's list (`d80a036`), the version strings,
 `tools/expected-changes/` and the documentation changed; T5b's log audit
 was repeated with the list of `d80a036`.
+
+⁹ Runs of the branches before the release commit, from the lab's mirror
+(see "v78-r2604.5" below). T1: fresh installs at `fe02b21` and `bd17f24`
+(all default groups; at `6bc2109`, before the account lock and the sending
+limit, 110/110 with the api group and `--fail2ban`). T2 and T4 ran only at
+`6bc2109` (a restricted and the full smoke test), before the account
+lock, the sending limit and B222 to B225; T2's full run after a reboot
+was 109/110 first (Nextcloud's SQLite lock, the known issue) and 110/110
+when repeated. T3 at `65a3916` (21/21 at `6bc2109`); the in-place tool
+changed after it by one line (`0415a5e`, B222). T5b at `65a3916`,
+`a9eaff0`, `fe02b21` and `bd17f24`, each from the same snapshot of the
+copy of a production box at the published v78-r2604.4, under client load
+(the load's strict verdict was FAIL in each run, see there). After
+`bd17f24` only the log audit's list (`84353e4`), an offline test helper of
+`update-check.sh` (`04785d0`), the status warning of B226 (offline test only), the version strings,
+`tools/expected-changes/` and the documentation changed.
 
 Every FAIL in this table is one of the known differences below, except one
 Nextcloud lock in rc4 T5 (see there), the first runs of rc6 T3 and T5b,
@@ -1183,6 +1438,299 @@ the API in the runs; and the release commit itself, which after `d80a036`
 changes only the version strings, `tools/expected-changes/` and the
 documentation.
 
+### After v78-r2604.4: B210 to B213 (2026-11-21)
+
+The hardening of the user database (B210), of the migration number
+(B211), of the backup and DNS settings (B212) and of Nextcloud's forwarded
+address (B213), on the branch `fix/r5-harden`. Only T5b ran: the copy of a
+production box at v78-r2604.3, updated non-interactively with
+`bootstrap.sh` and `TAG=<commit>` from the lab's mirror, with the second
+test box as the peer for port 25 and the backup target. During every setup
+run the peer sent a marked test mail (`X-Miab-Test: 1`) every 3 s over
+port 25 to a mailbox of the box.
+
+| Run | Result |
+|---|---|
+| T5b, `a985eb9` | setup stopped in web.sh: `nginx -t` refused the map with the proxy's secret ("could not build map_hash"); fixed in `0c41779`. Up to that point the user database was already root:root 0600, and all 48 test mails of the run were accepted. |
+| T5b repeated, `0c41779` | exit 0 in 198 s, a second run exit 0; smoke 95 of 104: every request of the `/caldav`, `/carddav` and `/webdav` proxy got HTTP 500 ("fastcgi request length mismatch": the map's regular expression replaced the captures of the PHP location), so Z-Push's ActiveSync answered 503; fixed in `2c1c054` (an update of the same box to it: the groups web and activesync 16/16). |
+| T5b final, `7b2b03d` (from the snapshot again) | the nightly backup on v78-r2604.3 first (exit 0). The update exit 0 in 207 s: `$STORAGE_ROOT/mail` root:root 755, `users.sqlite` root:root 0600 and still in the rollback journal mode, Roundcube's driver `mailinabox`, the migration record "15", `/etc/nginx/miab-nextcloud-proxy.conf` root:root 0600, `nginx -t` fine. 68 test mails, all accepted at once; 2 of them deferred for a few seconds inside the box (4.4.x, spampd restarting, as on every setup run before) and delivered on the next try. A second setup run exit 0 in 77 s changed no file's content (only the times of the files setup writes on every run), and the secret stayed. Smoke 104/104, among them `api-self-password` (the endpoint and Roundcube's Settings > Password), `nextcloud-forwarded-for` and `-local`, `zpush-sync`, `zpush-ping`, CalDAV, CardDAV and the backup checks. A failed CalDAV and CardDAV login from the peer was logged by Nextcloud under the peer's address. |
+| B211 and B212 on that box | the storage user wrote "11" into `mailinabox.version`: setup stopped before any migration with the message, the DKIM key untouched; with the file removed by the storage user, setup took 15 from the record and wrote it back. The storage user replaced `backup/` with a directory of its own (another target and passphrase): the nightly backup stopped with the reason and wrote nothing to the other target, saving the settings in the control panel was refused, the status checks showed it; after the directory was put back, a backup exit 0. The same with `dns/`: the DNS update failed with the reason and the zones stayed unchanged. |
+| Backup and restore | duplicity restored `mail/users.sqlite` from the backup after the update (root:root 0600, `integrity_check` ok) and `mail/` from the backup before it (root:www-data 775 and 0664, as v78-r2604.3 had them). The box with those older modes set back by hand and `mailinabox.version` removed by the storage user, updated to `cc934a9`: exit 0, the modes root's again, the version file written back as the storage user's; smoke 104/104. |
+| Downgrade and back | bootstrap with `TAG=v78-r2604.4`: exit 0; the directory and the database root:www-data again, Roundcube's sql driver, the nginx file unused; a password change in Roundcube worked. Then back to `cc934a9`: exit 0, root's again, a password change in Roundcube through the new driver worked. Test mails of both runs all delivered. |
+
+Log audit of the final run (since its first update): one unknown class,
+the bounce of an automatic reply to the test mails' sender, which does not
+exist on the peer (a lab artifact). Not tested: T1, T2, T3, T4, T6 (a
+fresh install creates the database with mode 0600 and the record through
+setup/start.sh; not run), the opt-in smoke group fail2ban, a user with
+two-factor authentication in Roundcube (offline only).
+
+### v78-r2604.5 (2026-11-23)
+
+The release of the branch `fix/b178`: B178 to B182 (System Status, the
+status mail, HSTS of the panel, the DNS checks), B200 to B204 (the tools),
+B210 to B213 (the hardening), System > Notifications, the restart of
+services only on a change, the Microsoft relay hint and the pruning of
+Nextcloud's backup copies; and of the work merged after it on `fix/r5-ipp`
+(head `04785d0`): the account lock (B126, a limit of different wrong
+passwords per account for logins through the box's own services, from
+`fix/r5-guard`), the sending limit with its emergency brake (B221), the
+banned addresses page by page (B220), the switch that turns fail2ban off
+for tests, and B222 to B225 (restarts during an update and at boot). The
+rounds up to "After the review" ran on `fix/b178`; the runs of the added
+work follow it. All runs installed or updated the branch from
+the lab's mirror of the repository, on one hypervisor, with the second test
+box as the peer for port 25, the probe address of `mailcheck`, the rsync
+target of `backup` and the source of the attacks. During setup runs of T5b
+the peer sent a marked test mail (`X-Miab-Test: 1`) every 3 s over port 25.
+
+The first round ran every scenario on `e9f5641`. Its findings were fixed
+in `223d83e` to `6bc2109` (B183 to B190, follow-ups of B154, B200 and
+B204, the log audit's lists and normaliser); T1 to T5b ran again on
+`6bc2109`, of the feature checks of T5b only the two that had failed. After them only the log audit's lists (`0abae8e`) and
+this documentation changed. T6 did not run.
+
+T7 is new: a test VM whose mail and DNS were kept inside the lab, with the
+published v78-r2604.4, given a copy of the configuration of a
+production box: its users, aliases, settings and custom DNS/web settings,
+without mail, cloud data, keys or backups, all passwords replaced; then
+updated to the commit under test as on the box. It runs no smoke test
+(that would add users to the copy) and was rolled back to its clean
+snapshot afterwards.
+
+First round, `e9f5641`:
+
+| Run | Result |
+|---|---|
+| T1 (fresh 26.04, network checks on) | install exit 0 in 2284 s with "Your Mail-in-a-Box is running." (a first attempt stopped with exit 100 in `apt-get update`: a PHP mirror in the middle of a sync, not the fork). `users.sqlite` root:root 0600, migration record 15, Roundcube's driver `mailinabox`, Dovecot's nodelay passdb, HSTS on `/admin/`, all panel assets, the Microsoft relay list accepted; smoke 110/110 (with `--provision`, the api group and `--fail2ban`), after a reboot 79/79. Two more setup runs exit 0 (98 s, 79 s); the second restarted only units whose files the lab had changed after the install (lab DNS, the test environment, the smoke test's DKIM tables), the third none. Log audit 0 unknown after classification; two rule gaps of the allowlist (a report recipient at another provider, fail2ban's note on `miab-munin`'s first match), fixed in the lists. |
+| T2 (22.04 v78 with local Roundcube changes → fresh 26.04) | the documented `--check` and the documented migration stopped in the preflight check with "STORAGE_ROOT: unbound variable" (B185), with nothing changed; with the changes moved aside `--check` found no blockers. With the variable given from outside the migration passed: "All checks passed", mail offline 21 min 45 s, the counts and keys the same, the old Roundcube's changes kept and named, smoke 21/21 and 110/110 after a reboot. ssh's messages from the old box ended in "?" (follow-up of B154), the exit code file of the tmux window was 0644 until the next call (follow-up of B204). |
+| T3 (the 24.04 copy of a production box, in place, `--keep-local`) | `TAG=<commit id>` could not be cloned (B188); with `TAG=` the branch at the same commit: "All checks passed", mail offline 1 h 31 min, the push hook, full-text search with the old indexes, the Docker stand-in and the hooks; `mailcheck` OK; smoke 21/21 (19/21 before an unmarked lab mail of the snapshot was removed). The plugin that the documented hook copied back from `old-roundcube/` could not be read by the web server, and Roundcube logged an error on every request (B186); `update-check.sh after` named the old release's spamd line as new (B187). |
+| T4 (22.04 v78 → 24.04 → 26.04, in place) | "All checks passed", mail offline 2 h 09 min, 3 reboots, the fallback SSH served every probe while port 22 was down (29/29, 66/66 in total); B200's report and `--ack-local`, B161's messages after a failed `--redo-from`, Dovecot's nodelay; smoke 21/21 and 110/110. When mail went offline, the mask of one apt timer started the other one's missed run: unattended-upgrade installed a kernel after the system archive had been made (B190). |
+| T5b (the copy of a production box at the published v78-r2604.4, the operator's update) | `update-check.sh before` and `backup` exit 0; the update interactive in a pty under client load (both instances RESULT OK, no failed login of the load, `load-no-failed-login` PASS), exit 0 in 119 s with the end line; 289 of 289 test mails accepted, 4 deferred inside the box during the documented restarts and delivered, none lost; Dovecot's and PHP-FPM's reloads cut a few IDLE and ActiveSync connections, as documented. `after`: "CHANGED", the lab's origin and the new drop-in of spampd's restart record, which the list of expected changes lacked (fixed in `223d83e`); `mailcheck` OK; smoke 122/122. The modes of B210, the record of B211, Roundcube's driver, `/me/password` 404 from outside, HSTS, the relay list, B126's nodelay (a wrong ActiveSync password answered in 0.035 s instead of 13.5 to 26 s), the pruning of Nextcloud's backup copies (the 3 newest and those of 14 days kept, other names left), the restarts on the first run, none on the second (75 s) and third run, sa-update's restart of spampd recorded through the drop-in; B202 (a local tag of the release name: the old bootstrap was fooled, the new one fetched); two downgrades to v78-r2604.4 and back, a reboot on each side, Roundcube's password change with both drivers; smoke at the end 110/110. Setup printed "database is locked" in Nextcloud's step under the load (B189). |
+| T5b features (the same box after the update) | in a headless browser: System Status with "show more" (B178), the TLS and External DNS pages, System > Notifications (a recipient at another provider, the test mail, the Munin select), Munin in a new tab, Intrusion Detection and Prevention with the Microsoft hint, its dialog and the allowlist entry removed again; no console error on these pages. The report recipient got the test mail and a change mail with whole checks (B179); a broken `admin_mail` written by hand was replaced by the standard address with a warning. Roundcube's password change (right and wrong current password, the two-factor hint; the limiter's 403 and 429 answered the harness's own requests to the management daemon, after which Roundcube showed the limiter's message), `users.sqlite` unreadable for www-data, the storage user's swaps of `mail/` and a higher `mailinabox.version` stopped by setup before any change, B213, B182 against a refusing and a silent server; smoke 121/121. Found: with a `dns/` of the storage user's own the status checks ended with a traceback and the panel's status answered HTTP 500 (B183); a status change mail went out every night with nc's "succeeded!" line (B184, also in v78-r2604.4). |
+| T7 (the configuration copy, isolated) | the published v78-r2604.4 installed (exit 0, 1492 s), the data imported, setup with it exit 0, `before` exit 0, the update exit 0 in 82 s with the end line, two more setup runs exit 0 with no restart and no changed file but the nightly job's minute (406 files compared); status checks over all domains without a traceback; System > Notifications as the aliases say; all mailboxes, aliases and domains in Postfix's and Dovecot's maps; 14 logins over IMAP, SMTP, webmail and ActiveSync; Roundcube's password change through the new driver; `users.sqlite` root:root 0600; nginx and the custom proxy; the panel in a browser without errors. `after`: the same missing drop-in as in T5b (and the lab's origin). The lab's DNS answered for the box's zones, but the DS lookups of the zone names went to the public parent zones until the lab rejected outgoing DNS (a gap of the harness, closed during the run; only the public zone names left the lab). |
+
+Second round, `6bc2109`:
+
+| Run | Result |
+|---|---|
+| T5b (the operator's update again, from the start snapshot at the published v78-r2604.4) | `before` and `backup` exit 0 (the copy verified on the rsync target); the update interactive under client load, exit 0 in 123 s with the end line; both load instances RESULT OK with no failed login (0 auth, 0 throttled results); 289 of 289 test mails accepted; the 2 s probe never found ports 25, 587, 993 or LMTP down, spampd 6 s at its restart; setup's output without "database is locked" (B189). `after`, with the published origin as a production box has it: "RESULT: OK - 0 unexpected, 13 expected changes, 2 newly recorded (not judged)", the drop-in accepted; its log audit named new classes of the client load (see below), so it exited 1; `mailcheck` OK. Smoke 122/122 with `--fail2ban`, the api group and `load-no-failed-login`. A second run exit 0 in 87 s: every unit kept its main process and invocation, 36 of 36 mails. B183: with a `dns/` of the storage user's own the status checks exit 0 without a traceback, the panel's status HTTP 200, the DS records shown with "Public Key: not shown" and the reason; the DNS update refused (exit 22), the zones unchanged; restored, the keys shown again. B184: `--show-changes` without a change printed 0 bytes, also through `2>&1`. Reboot: running, no failed unit; the run after it exit 0 in 104 s restarted each restart-on-change unit once (as documented), 41 of 41 mails. Smoke 110/110 at the end. |
+| T2 (as in the first round, both machines from their snapshots) | the documented `--check` with `TAG=<full commit id>` named the 3 local Roundcube changes and found no blockers, exit 0 (B185). The documented migration exit 0, "All checks passed"; mail offline 43 min (setup 43 min, with three other runs on the same disks), the new box answered on port 25 after 8.5 min. No "?" at the end of ssh's messages and no escape byte in `migrate.log` (29 banner lines of the old box filtered, B154); no entry of `/root/migration` with group or other bits, the exit code file 0600 (B204); the kept plugin 0755/0644, copied back with `cp -a` and readable by www-data, no load error in Roundcube, `--redo-from verify` exit 0 with only the settings open (B186). Smoke 21/21; after a reboot 109/110: `zpush-sync` got HTTP 500 for a calendar PUT while the first Nextcloud cron jobs after the 7 upgrade steps held the SQLite lock (the known issue), and 110/110 when run again. Log audit of the new box 0 unknown (112 allowed); of the old box one class, `postqueue`'s note at `--check-old` (rule added in `0abae8e`). The migration itself ran with `TAG=` the branch at the same commit; the tool's clone of the full commit id was checked on the new box. |
+| T1 (fresh 26.04, network checks on) | bootstrap with `TAG=<full commit id>` (B188): exit 0 in 2345 s with the end line, the checkout at `6bc2109`; 44 of 44 checks; smoke 110/110 (`--provision`, the api group, `--fail2ban`); a second run in a pty exit 0 in 96 s (it restarted the same four units as the first round's second run, after the same lab steps; not traced again); after a reboot 44 of 44 checks and smoke 79/79; log audit 0 unknown, 115 allowed. |
+| T3 (the 24.04 copy of a production box, as in the first round, from its snapshot) | `before` and `backup` with the Docker stand-in exit 0 (verified on the rsync target), `--ssh-fallback-test` clean, `--check --keep-local` with `TAG=<full commit id>`: no blockers, the proposed start command with that `TAG`. Started with `TAG=<full commit id>` (B188): cloned, "All checks passed", mail offline 1 h 33 min; the plugin brought back by the documented hook root:root 0755/0644 and loaded, no error in Roundcube's log, `old-roundcube/` 0700 with its `config.inc.php` 0600 (B186). The lab's setting had been put after the closing `?>` of the old configuration, which the report named as "text outside of PHP" (a lab artefact of the first round too). `after`: "RESULT: NOT JUDGED" (exit 3, the documented end of a release change), its log audit with the old-box list (B187) 0 unknown; `mailcheck` OK; `--cleanup-only` (also with `--old-checkout`) exit 0; reboot; smoke 21/21; log audit since the start 0 unknown (516 allowed, 16 known from the baseline). |
+| T4 (22.04 v78 seeded → 24.04 → 26.04, in place, from its snapshot) | `--check --no-backup-check` with `TAG=<full commit id>`: no blockers, the start command with that `TAG`; started with it (B188): cloned, "All checks passed", mail offline 2 h 02 min, 3 reboots, setup's end line. When mail went offline both apt timers only logged "Unit to trigger vanished", and `history.log` has no run of unattended-upgrade after the downtime began, only the tool's own package steps (B190). The plugin brought back by the documented hook root:root 0755/0644, readable by www-data, no load error; verify named only the two settings (B186). Reboot: SSH back after 22 s, no failed unit; smoke 21/21 (`--only migrated,api`) and 110/110; log audit since the start with the old-box list 0 unknown, 650 allowed. |
+
+Log audit: each class of every run was classified from its log lines.
+The harmless ones got rules in `tests/fork/log-audit-allow*.txt` (in
+`ff42e07` and `0abae8e`; `log-audit.sh` also masks the local part of a
+mailbox path under the box's own name). Left visible on purpose, all
+before or outside the setup runs and with the lab's client load: Nextcloud's
+"database is locked" with its ActiveSync and nginx follow-ups (the known
+issue of Nextcloud on SQLite), the continuation lines and two variants
+("no column named flags", "no such column: active") of the CardDAV
+plugin's migration race at two first webmail logins of new users in the
+same second (its main lines have rules; README-fork.md names the race for
+the update from rc7), Z-Push's loop detection after a Sync that setup's
+PHP-FPM reload cut, and three classes of spampd ("Use of uninitialized
+value" twice, `process_request` with "Broken pipe") from the second round's
+T5b: `update-check.sh backup` stops Postfix for its copy, and mails that
+arrive meanwhile end like this, which happens on any box that receives mail
+during that backup, not only in the lab.
+
+Not tested in this release: T6 (no box on the Internet); Let's Encrypt
+(the TLS page only shown); real Microsoft servers (the relay hint with a
+ban set by hand); B181 with a real overlong domain (only
+`tests/fork/status-dns.py` through the smoke test); outbound port 25 to
+the Internet and the blacklist checks (the lab's resolvers and forward
+zones answer, the Spamhaus checks say "could not check"); the in-place
+runs with `--no-backup-check` (T4) and the migration with
+`--skip-network-checks`; T7 with `SKIP_NETWORK_CHECKS`, without smoke test,
+backup, `mailcheck`, client load or reboot; client load only in T5b;
+`update-check.sh backup` with Docker volumes only in T3; a downgrade with
+the old bootstrap from the mirror's tag (from GitHub's, same commit); a
+bootstrap with a tag that the source does not have; the second round did
+not repeat the browser checks, the storage user's swaps of `mail/` and of
+`mailinabox.version`, B202, the downgrades, T4's `--ssh-fallback-test`
+and B161's hook, nor T1's third setup run (the code there did not change);
+T7 was not repeated: of its findings only the missing line of the list of
+expected changes was fixed, and `after` in the second T5b checked that
+line on the same path, without the data of the production box. Also not
+run: the log audit of the first round's T5b had no journal for about 25
+minutes of the run (the setup marks of that time were gone, see "Planned"
+in CHANGELOG-fork.md), so 18 classes were judged only from their lines;
+T4's check of a failed login on the fallback port from an account that is
+not an administrator; a migration of a box without local Roundcube changes
+(both T2 runs had them), and T2's detach, kill and reattach of the tmux
+client was not repeated; no run on a box brought back a plugin that the
+web server cannot read, so phase verify's warning about it (B186) was
+checked only offline, where the tools' call of it was not covered (see
+"After the review" below).
+
+After the review, `b0242e9` (B186's verify read its list of plugin
+directories twice, B191, bootstrap.sh's message for a failed first clone,
+B188): the offline tests pass (22), and the cases added for B186, B191
+and B188 fail on the commits before. On the copy of a production box from
+its start snapshot at the published v78-r2604.4: `update-check.sh before`
+exit 0; the update to `b0242e9` non-interactive (`TAG=<full commit id>`)
+exit 0 in 86 s with the end line, 37 of 37 marked mails accepted during
+it; the keys' hash in the zone files unchanged by the update; a forced DNS
+update exit 0, all 3 zones signed again, `ldns-verify-zone` "Zone is
+verified and complete" for each, nsd answers with DNSKEY and RRSIG. B191:
+with `custom.yaml` read through the checked `dns/` and then `dns/` swapped
+by the storage user for one of its own whose `.conf` names
+`../../etc/logrotate.d/...`, the DNS update was refused with "... is not a
+directory of root's own", nothing was written to `/etc/logrotate.d`, the
+zones stayed unchanged; with that name in root's own `.conf` the update
+was refused (exit 22, "names no KSK key file"), the zones unchanged;
+restored, the update exit 0 with the same hash. B186: phase verify of both
+installed tools, called as the tools call it, named a local plugin of mode
+0700/0600 (exit 0, `local-changes.json` written) and nothing once it was
+readable. B188: bootstrap.sh's first clone with a short commit id and an
+unknown tag exit 1 with the message (and the hint for the short id), no
+directory left. Smoke 121/121 with `--fail2ban`; log audit since `before`
+0 unknown (76 allowed). Not run after the review: T1 to T4, `after` and
+`mailcheck`, client load, a reboot; the in-place and migration tools'
+phase verify ran on its own, not in a whole run of a tool.
+
+#### The account lock (B126)
+
+The account lock counts the different wrong passwords of each account in
+the logins that the box's own services make to Dovecot (webmail,
+ActiveSync and Autodiscover, CalDAV and CardDAV through Nextcloud) and
+refuses these logins of the account at the limit (30 in 30 minutes by
+default); it replaces the passdb without delay that the rounds above
+tested. Its runs on `fix/r5-guard` updated the copy of a production box
+from the published v78-r2604.4 non-interactively (`TAG=<full commit id>`)
+or installed a fresh box (T1).
+
+| Run | Result |
+|---|---|
+| T5b, `45e46f6` (the branch merged with `fix/b178`) | the update exit 0 in 103 s with the end line, 42 of 42 marked mails accepted. 100 logins by IMAP from the box itself with the same wrong password, and 50 by ActiveSync and 50 by Autodiscover from the peer: the account's count stayed 1, and the right password went through at once (IMAP 0.03 s). 30 different wrong passwords locked the account: from the box itself its right password got "Too many failed logins", ActiveSync and Autodiscover 503 and webmail 401, while IMAP from the peer and the logins of another account went through. The report mail, the list under System > Intrusion Protection, a limit of 40 (applied without a restart of Dovecot) and the unlock worked, through the API and in a headless browser (7/7). Smoke 122/123: `api-read-only` had no shape check for the new `GET /system/auth-guard` (added in `cbedcce`). A first smoke run used the smoke test of a later commit by a mistake of the harness and does not count. |
+| T1 (fresh 26.04, `45e46f6`) | install exit 0 in 1132 s with the end line; 55 of 55 checks after the install, after a third setup run and after a reboot, which recreated the state directory `/run/miab-auth-guard` (0700, dovecot); the second and third setup runs exit 0. Smoke 111/112 (`--fail2ban`) and, after the reboot, 16/17 (`--only login,api`), both with the same `api-read-only` FAIL; log audit 7 unknown classes, 0 with 4 proposed rules (added to the list in `cbedcce`). |
+| T5b, `cbedcce` (after the fixes of the security review, `bb37faf` to `cbedcce`) | bootstrap.sh first refused the update in 1 s, as the box's checkout had GitHub as its origin, not the given source (its documented guard; nothing changed); with the origin set as its message says: exit 0 in 126 s with the end line; 62 marked mails, none lost, 4 of them deferred inside the box during spampd's restart and delivered after a `postqueue -f`. The same wrong password 100 times each by IMAP and ActiveSync and 20 times by Autodiscover from the box itself, and 100 + 15 times by ActiveSync and Autodiscover from the peer (7 s apart, as `miab-zpush` bans at 20 in 120 s): the count stayed 1, the right password went through at once. Client load on a test account for 10 minutes, once with 25 different wrong passwords counted before: 0 refused or failed of 11920 and of 12156 IMAP logins, both load verdicts OK. 600 made-up account names: 501 failed, then 99 refused once the pool of 500 was full; the counts of the real accounts unchanged. The cron job mailed the lock. A second setup run exit 0 in 66 s: Dovecot's main process unchanged, no reload. Reboot: the state directory recreated empty (a reboot ends a lock, as documented); lock, refusal and unlock work. Browser 7/7. Smoke 123/123; log audit 14 new classes: 13 from the deliberate wrong passwords and locks (lab), one of the product, the audit line of an unlock (added in `475c99d`). Then updated to `5987f18` (bursts count against 4 windows): exit 0 in 80 s, 37 of 37 mails, smoke 112/112, log audit one class, the full pool of the test (lab). |
+
+The lock test series ran on `475c99d` (with the setting of the number of
+windows a burst counts against, `dd4adef`): everyday use, attacks and
+operation on the copy of a production box, updated from v78-r2604.4 (exit
+0 in 131 s, 48 of 48 mails),
+with the peer as the outside world (phones, calendars, mail programs, an
+attacker) and a third test box as a second attacker. A refusal in
+everyday use would have stopped the release.
+
+| Part | Result |
+|---|---|
+| Everyday use | 60 minutes on one account (2 ActiveSync devices, webmail in 3 tabs with mail sent through it, CalDAV and CardDAV with parallel requests, Nextcloud, IMAP and SMTP from the peer): 14572 ok results, 35 ActiveSync disconnects, the account's count 0. 25 minutes on 5 accounts: 17579 ok results, 77 ActiveSync disconnects, and in the first minute 7 Nextcloud web logins and one webmail login of the new accounts answered with HTTP 500 and 401; all counts 0. A phone with an old password, tried 153 times in 2 hours while the account's other devices used the right one (10141 ok results): count 1, never refused. A password change in webmail: every device with the old password failed, with the new one it got in at once; count 1. 10 different wrong passwords in an hour: not locked, the right one went through each time. Wrong passwords by IMAP and SMTP from the peer: fail2ban banned the peer as before (`miab-slow-dovecot`, `postfix-sasl`, the same on v78-r2604.4), the lock counted nothing. The box's own jobs, run by hand, left no count. No login of everyday use was refused. |
+| Attacks | A slow attack through ActiveSync and webmail from the third test box at the default window: locked at the 30th different wrong password (counted over 6 minutes), the report mail 4 minutes later; the lock ended by itself 1 to 2 s after its expected end (probed every 15 s); a second attack ended with Unlock in the browser (10/10). A distributed attack from 7 addresses: locked at 30 as well. The following locks and the full pool came in one report mail, an hour after the first. Bursts of 100 parallel wrong passwords from the box itself with a window of 1 minute: refused for 60, 121, 181 and 181 s with 1, 2, 3 and 4 windows (the rule: the smaller of the setting and 100/30 windows), another account 10 of 10 logins during each burst (at most 0.62 s). Repeated bursts got more through than the limit: 100 every 30 s for 6 minutes 33.3 checked guesses a minute, 59 every 30 s for 10 minutes 32.4, against 30 a window; the texts had promised 30 and now say what bursts get through (`147b4cb`). 600 made-up names: 501 failed, 99 refused when the pool was full, a real account 40 of 40 logins during it. |
+| Operation | Settings changed live (limit 40, window 2 minutes, 3 windows) without a restart of Dovecot: the 40th wrong password locked; invalid values and a name not on the list refused with 400 and a message. A lock outlasted a restart of Dovecot and a setup run (exit 0 in 97 s) and ended at a reboot (as documented); an added account was on the list at once, a removed one gone. Downgrade to v78-r2604.4: exit 0 in 85 s, 32 of 32 mails, right and wrong logins from the box and the peer as on v78-r2604.4; its log audit named 4 classes, the deliberate wrong SMTP passwords from the peer repeated there (lab). The update back: exit 0 in 92 s, 36 of 36 mails, lock and unlock work. A fresh install on the third test box: exit 0 in 1218 s, smoke 112/112 (`--fail2ban`), a second setup run exit 0, after a reboot smoke 81/81 (`--only login,admin,api,web,mail`), log audit 0 unknown; the lab's T1 check "doveconf has nodelay" failed, as it tests the passdb of `fix/b178` that the lock replaced (an outdated check of the harness). |
+| End | smoke 123/123 (all default groups and `--fail2ban`); log audit 26 new classes, all in the series' lab list, 0 unknown with it. |
+
+#### The hardening (B210 to B213)
+
+The hardening ran on `fix/r5-harden` before the first round of this
+release, see "After v78-r2604.4: B210 to B213" above (the final run at
+`7b2b03d` and the update to `cc934a9`, smoke 104/104 each), and in every
+run of the release since.
+
+#### The sending limit (B221), the ban list (B220) and the fail2ban switch
+
+These runs on `fix/r5-ipp` include the account lock (`475c99d`). No mail
+was to leave the lab: on the test boxes Postfix sent all mail for other
+domains to the peer, and a firewall rule dropped TCP 25, 465 and 587 to
+every other address (IPv4 and IPv6); the lab checked both before the
+first mail and after every setup run, reboot and downgrade, and compared
+the mails of each flood at the peer with the box's log. All floods and
+brakes ran on the copy of a production box, updated from its snapshot at
+the published v78-r2604.4.
+
+First run, `f1c367e`:
+
+| Run | Result |
+|---|---|
+| Update | a first attempt stopped with exit 100 in `apt-get` (a mirror of the PHP packages in the middle of a sync, not the fork), and the lab's first transport rule had also sent the box's local mail to the peer (inside the lab); from the snapshot again: `update-check.sh before` and `backup` exit 0, the update exit 0 in 154 s with the end line, 55 of 55 mails, `after` "RESULT: OK - 0 unexpected, 20 expected changes", `mailcheck` OK, the services, ports, milters and cron job of the limit in place (18 of 18 checks). A second setup run exit 0 in 101 s: no restart of the two services, no content changed. |
+| Everyday use | 60 minutes on 3 accounts with mail programs on 587 and 465, webmail, ActiveSync, CalDAV, CardDAV and Nextcloud: 116 mails to 976 recipients (up to 20 a mail, attachments up to 3 MB) and 32 to themselves, 0 held, the brake never on, the peer got every mail, at most 0.7 s after it was sent. The box's own mail (status checks, reports, the cron jobs, mail to root, Nextcloud's welcome mail, a Sieve redirect): none held. 500 incoming mails from the peer in 15.4 s (100 to an alias that forwards to the peer): not counted, no brake; spampd could not keep up on the 2-vCPU test box, and 12 of them were deferred and delivered later. A mail to 30 recipients went out at once, and so did one to 31 (the changelog then said that it sets off the brake; the text was wrong); two accounts with 20 recipients each in the same second set off the brake (as documented); the administrator's mail of that brake came only with the cron job, 3.5 minutes later. |
+| Floods | FAIL: a flood at or below 30 mails a second never set off the brake: 1000 mails by SMTP on 587 at 23 a second (at most 32 in one second), 500 on 465 at 29.5, 300 by webmail at about 2 and 80 with 10 recipients each, 300 by ActiveSync at about 3, 300 by sendmail (pickup took 6.8 a second) and 300 by SMTP to 127.0.0.1:25 at 29 a second: all went out, 0 held. At that rate 10,000 mails leave in about 7 minutes. Fixed by a second, long limit (`759b0e2`; 1000 mails an hour by default since `4ec91ef`). With 5 recipients a mail the brake came on at once: of 300 mails by SMTP 6 (30 recipients) went out, the brake came on in the same second, the administrator's mail 1 s later, 294 held, nothing lost. |
+| The brake | The slow release let out 10.0 recipients a minute on average, the senders in turn, but up to 12 in a calendar minute and 15 in a sliding one (a token bucket; the changelog now says so); 276 held mails deleted in the panel never reached the peer; with the quiet time set to 2 minutes the brake ended by itself, as nothing was held. "Release all" and "Release now" let the held mail out at once, past the limit, as the panel says. A flood of ActiveSync mail with 40 recipients each got 3 mails (120 recipients) out within 1 s: a mail over the limit went out before the brake's new bucket was charged (fixed in `759b0e2` and `689e333`: nothing goes out in the brake's first period). In stop mode nothing was released for 2 minutes until "End the brake"; meanwhile the box's own mail through sendmail (mail to root, Nextcloud's mail, a Sieve redirect) was held with the rest, only the reports by SMTP to the administrator passed (the reports have a listener of their own since `aab263b`). A brake with 188 held mails outlasted restarts of the two services and of Postfix, a setup run (exit 0 in 132 s) and a reboot: the hold queue, the list and the brake stayed in step, the slow release went on, nothing was lost (200 = 12 out before the brake + 16 released + 172 deleted). |
+| Failure cases | With the release service stopped, mail over the limit waited up to 20 s or got `451 4.7.1` at once, as designed. FAIL: a sendmail mail that the milter had deferred meanwhile was held when the service came back and stayed in the hold queue, on no list and not in the panel, because it had waited more than 30 s in pickup; a sendmail flood of 400 mails with 5 recipients each left 159 such mails (fixed in `a72a0b6`: a record names any mail that had arrived when it was written, up to 5 days before, and mail held by others is counted and shown). FAIL: with the milter stopped, mail went out without a limit (`milter_default_action=accept`, as designed then); since `1c74675` the milter fails closed. With only the release service stopped, `send_limit.py --status` and `GET /system/send-limit` showed no warning: `status()` in `management/send_limit.py` took the milter's state for the release service's while the milter ran (B226, fixed after `04785d0`, offline test only). |
+| Settings and pages | 18 invalid values through the API and 10 in the panel refused with 400 and a message; settings saved and restored, with audit lines; the page's new name "Intrusion Detection and Prevention" in the menu and the heading, the old link `#fail2ban` opens it (12/12). The ban list (B220) with 3000 documentation addresses banned in 6 jails (3600 bans): `GET /system/fail2ban` 0.98 s without the list, a page of 50 bans 0.45 to 0.59 s; paging, the filters (network, IPv6 prefix, jail, part of an address), the limits (400 for bad values), "Why?", a click on a network and Unban of one address worked in the browser (the script's own checks 7/9: a row threshold too strict and a missing wait, both of the script); the page loaded in 2.9 to 4.1 s with 3007 elements, as wide as the window; after unbanning all, fail2ban and the page were empty. |
+| Downgrade and back | with nothing held: the downgrade to v78-r2604.4 exit 0 in 105 s, the milter no longer in Postfix's settings (its services left running, unused), mail both ways, no error mail of the cron jobs in 15 minutes (they test for their programs), log audit 0 unknown; back to `f1c367e` exit 0 in 75 s, 18 of 18 checks. |
+| Fresh install and smoke | a fresh install exit 0 in 1731 s (slow downloads), 18 of 18 checks; a brake with 1 mail a minute: the second mail held, the brake on and the administrator's mail within 3 s, all delivered after End. Smoke 115/116 there and 126/127 on the copy: `admin-send-limit` compared all settings with the three it set (a fault of the test, fixed in `6c6fbc4`). Log audit of the copy: one unknown class, the mails left alone above; two harmless classes got lines in `689e333`. |
+
+A short second round at `a72a0b6` (the long limit, failing closed, the
+reports' own listener, the fix of the mails left alone): the update exit
+0 in 97 s, `after` 0 unexpected and 21 expected changes, 26 of 26 checks
+of the new Postfix settings; `mailcheck` failed once because logrotate
+rotated `mail.log` while it waited (`update-check.sh` reads only
+`mail.log`) and passed when repeated; a second setup run changed nothing.
+Floods of 1500 recipients from full buckets: the brake came on after 1011
+(SMTP 587), 1030 (webmail), 1020 (ActiveSync), 1043 (sendmail) and 1009
+(127.0.0.1:25) recipients, "more than 1000 mails in 1 hour"; all held
+mails of the sendmail flood were listed; with the long limit off, 600
+mails at about 20 a second went out unbraked, as before. On the fresh test
+box an update to `a72a0b6` ran while the harness ran its checks and
+clean-up beside it and ended with exit 1 in Nextcloud's step; repeated
+alone: exit 0 in 479 s. The round was stopped for the second run.
+
+Second run, `689e333`:
+
+| Run | Result |
+|---|---|
+| Update | from the snapshot: exit 0 in 118 s, 41 of 41 mails, `after` 0 unexpected and 21 expected changes (its 3 new log classes from the lab's route probes and a bounce of the peer), `mailcheck` OK, 26 of 26 checks. A second setup run exit 0 in 75 s: no restart, no content changed. |
+| Fresh install | a first install was discarded (the first run's agent updated the same test box at the same time) and repeated from the snapshot: exit 0 in 1394 s; 25 of 26 checks (`postfix check` printed something once right after the install and nothing later; not reproduced); smoke 115/116 (`--fail2ban`), log audit 0 unknown. The FAIL: `api-read-only` found the brake on, see "A changed setting". |
+| Everyday use | 30 minutes on 3 accounts with all clients: 75 mails to 507 recipients and 16 to themselves, 0 held, 0 deferred, the brake never on, every mail at the peer (at most 3.6 s, median 0.2 to 0.4 s). The box's reports and the test mail of System > Notifications came through the new listener `127.0.0.1:10587`; mail to root, Nextcloud's mail and the Sieve redirect passed the milter at once. |
+| Floods (long limit) | from full buckets, the recipients out before the brake: SMTP 587 (1500 at about 20 a second) 1013, SMTP 465 1010, webmail (300 × 5) 1020, ActiveSync (300 × 5) 1010, sendmail (1500) 1040, SMTP to 127.0.0.1:25 1008; the brake's log line and the administrator's mail, 2 to 3 s later, said "more than 1000 mails in 1 hour"; the 10 to 40 over 1000 are the refill of the bucket during the flood. The rest held and deleted; the peer's count equal to the box's log every time; a second account's mails during the brake held and released (at most 52 to 83 s). With the long limit off 600 mails went out unbraked, as before. The administrator's mail of the sendmail flood counted one mail "not on the list" although none was held by hand (a race, fixed in `65a3916`). |
+| The brake | nothing released in the brake's first 60 s, also not a mail with 40 recipients, then 9.7 recipients a minute on average, the senders in turn. A sendmail flood of 400 × 5: the hold queue and the list both 294, no mail left alone; deleted (292) and the brake ended in the panel. A mail held by hand showed as 1 "not on the list" in the panel and in the administrator's mail. A mail deferred while the release service was stopped was held, listed and released when it came back. Two accounts with 20 recipients each in the same second set off the brake, as documented. |
+| A changed setting | FAIL: after a limit of 1 mail an hour had been set and 30 a second restored, the next mail of any account was held and set off the brake, also 90 s later: the changed setting left the bucket without room; the smoke test had counted the held mail as sent. Found on both test boxes; fixed in `176a09a`, and the smoke test now checks that this mail is not held. |
+| Failure cases | the milter stopped, hung, and killed 6 times: mail programs on 587 and 465 got "454 4.3.0 Try again later", webmail an error, SMTP to 127.0.0.1:25 and [::1]:25 "451 4.7.1" (when hung, after 30.0 to 30.6 s); ActiveSync and sendmail mail waited in the maildrop and went out within 37 s after the start; systemd restarted the killed milter each time within 2.2 to 2.4 s; a sender on 587 meanwhile got 40 mails out and 13 temporary errors; 237 of 237 mails from the peer were delivered. The reports came through 10587 meanwhile; it took 20 mails a minute (then 450) and refused other recipients (554). Stopped for 15 minutes, the cron job mailed "does not answer" once and "answers again" once; the text named 451 4.7.1 for all clients (fixed in `65a3916`). |
+| Switches | the sending limit turned off in the panel: the milter out of Postfix's settings, the 53 held mails out, every path delivered with the milter stopped, no cron mail, a setup run kept it off; on again: the settings back, a flood braked. fail2ban turned off in the browser (one attempt repeated after a fix of the harness's click): stopped and disabled, the bans lifted, warnings on the page and in the status checks, kept off by a setup run and a reboot, wrong passwords from the peer banned nothing; on again: its 13 jails and the bans that had not run out back; the same through the API. |
+| Downgrade and back | the downgrade to v78-r2604.4 exit 0 in 69 s: `smtpd_milter_maps`, the listener 10587 and the two services stay (mail from the box itself on port 25 still passes the limit there), `sendlimit_submission_milters` stays unused (Postfix warns about it); mail from webmail, mail programs and the box went out, no cron error mail in 15 minutes; back: 26 of 26 checks. |
+| Smoke and log audit | smoke 126/127 on the copy, with the same `api-read-only` FAIL as the fresh install; log audit of the copy 37 new classes: 34 from the lab (the deliberate stops of the milter, floods and wrong passwords), 3 harmless with proposed lines, 0 defects. |
+
+#### Final T3 and T5b (`65a3916`)
+
+| Run | Result |
+|---|---|
+| T3 (the 24.04 copy of a production box, in place, `--keep-local`, the tool of `65a3916` by `curl \| sudo bash` in a recorded terminal) | "All checks passed. The upgrade is finished.", all 11 phases done; the tool ran 52 minutes with one reboot, mail was offline 36 minutes. `after` did not judge the changes (the Ubuntu release changed) and named 8 new log classes, judged in the audit below; `mailcheck` OK; smoke 32/32 (`migrated,web,activesync`). The new parts on the upgraded box: 40 of 40 checks (the limit's defaults, Postfix's settings, the listener 10587, fail2ban, the account lock); the users' mail (587, 465, webmail, ActiveSync, 20 recipients with 2 MB) and the box's reports through 10587, 0 held. A setup run after a reboot (the harness's first try had no hostname and ran no setup) exit 0 in 94 s and restarted the two services once, as documented for the first run after a reboot; a run without a reboot before it restarted nothing and changed only the nightly job's minute and a rebuilt greylisting map. Found: after a reboot with mail in the queue, Postfix started 3 s before spampd listened, and 16 local mails, also mails that came in after spampd listened, waited 325 to 602 s (B222, in setup since upstream; fixed in `0415a5e`). A reboot with an empty queue: spampd listened 3 s after boot, no mail deferred. Smoke 127/127; log audit 12 new classes, 3 left with the lab's list: those of B222. |
+| T5b (the copy at the published v78-r2604.4, updated non-interactively under client load) | exit 0 in 185 s with the end line; 335 of 335 marked mails; probes: port 993 and LMTP down for one round, spampd 6 s, ports 25 and 587 never; senders 587 10 of 10, 465 9 of 9, webmail 8 of 9, ActiveSync 8 of 9 (one cut read, one 502 at PHP-FPM's reload; both told the client), all accepted mail at the peer; 0 held, the brake never on; 5 local deliveries deferred at the restarts of Dovecot and spampd and delivered after 63 to 384 s (B225 below). The client load's verdict FAIL on both sides: a DAV login got 401 2 s after setup stopped Dovecot, Z-Push answered 500 at the same moment, and one ActiveSync device got no answer for 68 s between Dovecot's stop and PHP-FPM's reload. `after`: 1 unexpected (the lab's origin), 22 expected; `mailcheck` OK; Postfix's settings and the defaults as expected. A second setup run exit 0 in 107 s: no restart of the two services, only the nightly job's minute and the greylisting map changed; reboot: running, no failed unit, mail both ways. The fixes since `689e333`: after a changed setting (1 an hour, and a long limit of 5) mails 5 and 90 s later were not held and set off no brake (`176a09a`); a sendmail flood of 1500 set off the brake after 1050 mails, the hold queue and the list both 453, "not on the list" 0 in 693 samples (`65a3916`), a mail held by hand counted; fail2ban's dialogs say that it was stopped and started; with the milter stopped for 9 minutes the mail named 454 4.3.0, 451 4.7.1 and the waiting ActiveSync mail, then "answers again". Smoke 127/127. Found by the log audit (8 classes): dpkg's trigger restarted Dovecot when setup installed `dovecot-auth-lua`, and 13 s later setup reloaded it with the new passdbs of the account lock; under the load its auth process died ("Panic: ... sasl-server.c", 29 times "Auth worker sees different passdbs/userdbs than auth server"), and a login on the submission port failed (B223, in setup since v78-r2604.0; fixed in `a9eaff0`: a changed passdb or userdb restarts Dovecot). The other 41 new classes: 26 from the lab, 15 harmless in the setup window (7 proposed lines). |
+
+#### B222 to B225: the delta runs
+
+Each delta run updated the copy at the published v78-r2604.4 from its
+snapshot under the client load of the final T5b, ran a second setup run,
+the smoke test with `--fail2ban` and the log audit, and checked the fix
+before it in detail.
+
+| Run | Result |
+|---|---|
+| Delta 1, `a9eaff0` (B223; B222 on the update path) | the update exit 0 in 219 s; Dovecot restarted twice (dpkg's trigger, then setup), never reloaded; no Panic and no "Auth worker sees different passdbs/userdbs": 6 of the 8 classes of B223 gone. Found: dpkg's restart stopped Dovecot for 6.6 s, 5 new submission processes of Postfix exited ("no SASL authentication mechanisms"), and Postfix then started none for 60 s: port 587 did not answer for 56 s, 3 SMTP logins of the load got no banner for 30 s, and the 2 classes of B223 left ("Connection lost to authentication server", Z-Push's temporary failure) came from that restart (B224, in Postfix's setup since upstream; fixed in `fe02b21`: `service_throttle_time` 10 s, and Dovecot's packages installed without their restart). Also: 2 of 343 marked mails got "451 4.3.5" (Dovecot's quota service during the restart; the sender tries again), 5 local deliveries waited 351 to 396 s. Senders 587 10, 465 9, webmail 10, ActiveSync 7 of 9; 0 held. `after` 1 unexpected (the lab's origin), 25 expected with both drop-ins of B222; `mailcheck` OK. The second setup run exit 0 in 120 s left Dovecot alone. B222: 5 mails put into the maildrop with Postfix stopped, then a reboot: Postfix started 6 ms after spampd's start had ended, the mails were delivered 2.5 to 4.8 s after Postfix's start, no "Connection refused". Smoke 127/127; log audit 40 new classes: 4 from the lab, 30 harmless (11 proposed lines), 6 of B224. |
+| Delta 2, `fe02b21` (B224) | the update exit 0 in 238 s; Dovecot restarted once, by setup (stop 1.6 s), dpkg's trigger held, no `policy-rc.d` left; no class of B223. Postfix logged the throttle twice, port 465 answered again 9.1 s after it, port 587 was not interrupted; 352 of 352 marked mails; 0 held. The client load's verdict FAIL on both sides: of 182 failed rounds 86 were inside Dovecot's restart and PHP-FPM's reload, 96 outside, all ActiveSync Provision and FolderSync timeouts (the baseline on v78-r2604.4 had 24 in 5 minutes); no IMAP, SMTP, DAV or webmail failure outside them (the harness's webmail sender had failed its first login before the update in Roundcube's race of parallel first logins, a lab artefact). Found: 3 mails to a user that arrived during the restarts of Dovecot and spampd were deferred and delivered 353 to 374 s later, after Postfix's backoff of 300 s (B225, in setup since upstream; fixed in `bd17f24`: setup retries those mails at its end). The second setup run exit 0 in 143 s restarted nothing. B222 again: the 5 mails delivered 3.0 to 5.6 s after Postfix's start. Smoke 127/127; log audit 1 new class (Nextcloud's "Login failed" during Dovecot's stop, 15 lines). A fresh install: exit 0 in 1318 s, `service_throttle_time` 10 s, no `policy-rc.d`, smoke 105/105, log audit 0 unknown (the lab's outdated check of the passdb of `fix/b178` failed as before). |
+| Delta 3, `bd17f24` (B225) | the update exit 0 in 294 s under the client load and a loop that sent a mail to a user of the box every 2 s from setup's start to 60 s after its end; Dovecot restarted once (stop 6.75 s under the load), the throttle once and port 587 back 9.7 s after it; 368 of 369 marked mails (one "451 4.3.5" during Dovecot's stop); every sender's mails accepted; 0 held. Client load FAIL on both sides with the picture of delta 2 (191 failed rounds inside the restart windows, 88 outside, all ActiveSync timeouts). The loop: 176 mails sent, 176 delivered, none twice. 28 mails were deferred in setup's window with a reason at 127.0.0.1; Postfix's own retries delivered 8, setup's end put the other 20 back into delivery within 0.2 s; 16 of them were delivered 9.3 to 20.8 s after the end line, 4 after 99 to 107 s: spampd, with Ubuntu's default of 3 processes, was saturated by the test's own mail loop, and local delivery took 10 to 22 s already before any restart. Accepted as a limit of capacity under the test's load, not a defect of the release (CHANGELOG-fork.md, "Planned"). The second setup run exit 0 in 129 s restarted nothing, 51 of 51 mails. Smoke 127/127; log audit 13 new classes: the known "Login failed" (90 lines, all during Dovecot's stop) and harmless consequences of the longer stop and the extra mail, 0 defects; their lines are in `84353e4`. A fresh install: exit 0 in 1154 s, smoke 105/105, log audit 0 unknown; setup's end ran the retry without an error (the queue was empty). |
+
+After the delta runs only the log audit's list (`84353e4`), an offline
+test helper of `update-check.sh` (`tests/fork/update-check-compare.py`,
+`04785d0`) and, in the release commit, the warning of the sending limit's
+status for a stopped release service (B226, two lines of
+`management/send_limit.py`, checked by `tests/fork/send-limit.py` only)
+changed, besides the version strings, `tools/expected-changes/` and the
+documentation.
+
+Not tested in the added work: T2, T4, T6 and T7 (T2 and T4 ran at
+`6bc2109`, before the account lock, the sending limit and B222 to B225);
+the in-place tool's line for the drop-in of B222 (`0415a5e`), as T3 ran at
+`65a3916`; a reboot with mail in the queue at `bd17f24` (passed at
+`a9eaff0` and `fe02b21`, unchanged since); the smoke group `--fail2ban` in
+the fresh installs after `689e333`; mail to the Internet: every flood went
+to the peer, so neither the limit nor the brake met a real provider, and
+the clients were the lab's scripts, not real mail programs and phones;
+floods of more than 1500 recipients or longer than an hour, and a flood
+across a restart of the two services (their counts live in memory and
+start anew; the floods restarted them on purpose); a downgrade with held
+mail (the two downgrades of these runs had an empty hold queue); the account lock with
+real phones and mail programs, and bursts at the default window of 30
+minutes (only at 1 minute); the ban list only with documentation addresses
+in a headless browser 1280 pixels wide; the fail2ban switch only on the
+test boxes; the warning for a stopped release service (B226) only in
+`tests/fork/send-limit.py`, not on a box.
+
 ### Production use
 
 rc3 was used to upgrade a production box in place: Ubuntu 24.04 (release-
@@ -1204,6 +1752,10 @@ The same box was later updated from rc3 to rc6 with the commands of
 "Updating the fork" in README-fork.md. rc7 builds on that update: the Munin
 alert setting, the API test and the update tools (see CHANGELOG-fork.md,
 rc7).
+
+The account lock, the sending limit and the fail2ban switch of
+v78-r2604.5 ran only in the lab, on test boxes and on copies of a
+production box (see "v78-r2604.5").
 
 ## Known differences
 
@@ -1406,6 +1958,10 @@ does not make a new one.
   hours of a public box's traffic.
 * **The update of the production box itself.** The operator's steps from
   rc7 ran on a copy of a production box (T5b Part A), not on the box.
+* **The account lock and the sending limit outside the lab
+  (v78-r2604.5).** Both ran with the lab's scripted clients, and no mail
+  of the floods left the lab: no real phone or mail program met a lock,
+  and no real mail provider saw a flood or a brake (see "v78-r2604.5").
 * **Other virtualization and hosting providers.** The tests ran on one
   hypervisor with its cloud-init. The cloud-init configuration of hosting
   providers' images (`manage_etc_hosts`, B68) was not tested.

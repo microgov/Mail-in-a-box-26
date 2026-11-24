@@ -2,7 +2,7 @@
 # domains for which a mail account has been set up.
 ########################################################################
 
-import os.path, re, rtyaml
+import os.path, re, sys, rtyaml
 
 from mailconfig import get_mail_domains
 from dns_update import get_custom_dns_config, get_dns_zones
@@ -50,7 +50,15 @@ def get_web_domains(env, include_www_redirects=True, include_auto=True, exclude_
 
 def get_domains_with_a_records(env):
 	domains = set()
-	dns = get_custom_dns_config(env)
+	try:
+		dns = list(get_custom_dns_config(env))
+	except ValueError as e:
+		# dns/ or its custom.yaml cannot be trusted (B212). Only the zones are
+		# not built without the custom records; the web configuration, the TLS
+		# certificates and the status checks go on as without them (the
+		# status checks and the DNS update report the reason).
+		print(f"The custom DNS records are not used: {e}", file=sys.stderr)
+		dns = []
 	for domain, rtype, value in dns:
 		if rtype == "CNAME" or (rtype in {"A", "AAAA"} and value not in {"local", env['PUBLIC_IP'], env['PUBLIC_IPV6']}):
 			domains.add(domain)
@@ -207,11 +215,16 @@ def make_domain_config(domain, templates, ssl_certificates, env):
 			# override the HSTS directive type
 			hsts = yaml.get("hsts", hsts)
 
-	# Add the HSTS header.
+	# Add the HSTS header. A location with add_header directives of its own
+	# (/admin/ in nginx-primaryonly.conf) inherits none of the server's, so
+	# the same line goes in its placeholder "# HSTS HEADER HERE" (B180).
+	hsts_header = None
 	if hsts == "yes":
-		nginx_conf_extra += '\tadd_header Strict-Transport-Security "max-age=15768000" always;\n'
+		hsts_header = 'add_header Strict-Transport-Security "max-age=15768000" always;'
 	elif hsts == "preload":
-		nginx_conf_extra += '\tadd_header Strict-Transport-Security "max-age=15768000; includeSubDomains; preload" always;\n'
+		hsts_header = 'add_header Strict-Transport-Security "max-age=15768000; includeSubDomains; preload" always;'
+	if hsts_header:
+		nginx_conf_extra += "\t" + hsts_header + "\n"
 
 	# Add in any user customizations in the includes/ folder.
 	nginx_conf_custom_include = os.path.join(env["STORAGE_ROOT"], "www", safe_domain_name(domain) + ".conf")
@@ -224,6 +237,10 @@ def make_domain_config(domain, templates, ssl_certificates, env):
 	nginx_conf = "# ADDITIONAL DIRECTIVES HERE\n"
 	for t in [*templates, nginx_conf_extra]:
 		nginx_conf = re.sub("[ \t]*# ADDITIONAL DIRECTIVES HERE *\n", t, nginx_conf)
+	# The HSTS header in the locations that set headers of their own, with the
+	# indentation of the placeholder; nothing when HSTS is off (B180).
+	nginx_conf = re.sub(r"^([ \t]*)# HSTS HEADER HERE *\n",
+		lambda m: m.group(1) + hsts_header + "\n" if hsts_header else "", nginx_conf, flags=re.M)
 
 	# Replace substitution strings in the template & return.
 	nginx_conf = nginx_conf.replace("$STORAGE_ROOT", env['STORAGE_ROOT'])

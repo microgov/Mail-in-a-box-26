@@ -161,5 +161,49 @@ cat > /etc/cron.d/mailinabox-nightly << EOF;
 $minute 1 * * *	root	(cd $PWD && management/daily_tasks.sh)
 EOF
 
-# Start the management server.
-restart_service mailinabox
+# Mail the accounts that Dovecot refuses for logins from the box itself after
+# too many failed logins, and remove the counts of names without failures
+# (management/auth_guard.py, setup/mail-users.sh).
+tools/write_conf.py /etc/cron.d/mailinabox-auth-guard << EOF;
+# Mail-in-a-Box --- Do not edit / will be overwritten on update.
+# Dovecot's limit of failed logins from the box itself: mail new locks.
+*/10 * * * *	root	(cd $PWD && test -x management/auth_guard.py && management/auth_guard.py --notify)
+EOF
+# Its limit and window, as System > Intrusion Detection and Prevention set them in
+# settings.yaml (also after a migration), for the Lua code of Dovecot.
+management/auth_guard.py --apply
+
+# The sending limit (management/send_limit.py, setup/mail-postfix.sh): mail
+# the minutes in which outgoing mail had to wait, and write the settings file
+# of its milter from settings.yaml. The jobs check that the program is there:
+# after a downgrade to a release without it, they stay quiet instead of
+# mailing an error to root every few minutes.
+tools/write_conf.py /etc/cron.d/mailinabox-send-limit << EOF;
+# Mail-in-a-Box --- Do not edit / will be overwritten on update.
+# The sending limit of the box: mail the minutes in which mail had to wait.
+*/5 * * * *	root	(cd $PWD && test -x management/send_limit.py && management/send_limit.py --notify)
+EOF
+# When the brake of the sending limit goes on, its release service starts
+# this unit, so the administrator is mailed at once, not at the next cron run.
+tools/write_conf.py /etc/systemd/system/miab-sendlimit-notify.service << EOF;
+# Mail-in-a-Box --- Do not edit / will be overwritten on update.
+[Unit]
+Description=Mail-in-a-Box sending limit: mail the administrator (management/send_limit.py --notify)
+
+[Service]
+Type=oneshot
+WorkingDirectory=$PWD
+ExecStart=$PWD/management/send_limit.py --notify
+EOF
+hide_output systemctl daemon-reload
+management/send_limit.py --apply
+
+# Start the management server, or restart it when its code, its start script
+# and unit, /etc/mailinabox.conf (read when it starts) or the packages of its
+# virtualenv changed (restart_on_change; its own replaced library files are
+# checked too). A restart makes the control panel answer 502 for a moment.
+venv_packages=()
+for d in "$venv"/lib/python3*/site-packages; do venv_packages+=("dir:$d"); done
+restart_on_change mailinabox "" "tree:$PWD/management" "$inst_dir/start" \
+	/lib/systemd/system/mailinabox.service tree:/etc/systemd/system/mailinabox.service.d \
+	/etc/mailinabox.conf "stat:$venv/bin/python3" "dir:$venv/bin" "${venv_packages[@]}"

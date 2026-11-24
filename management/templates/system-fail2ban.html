@@ -1,15 +1,33 @@
 <style>
-#f2b-bans td, #f2b-jails td, #f2b-report-accounts td, #f2b-report-persistent td { vertical-align: top; }
-#f2b-bans .f2b-ip, #f2b-report-persistent .f2b-ip { font-family: monospace; white-space: nowrap; }
-#f2b-bans .f2b-ban { margin-bottom: 3px; }
+#f2b-jails td, #f2b-report-accounts td, #f2b-report-persistent td { vertical-align: top; }
+#f2b-report-persistent .f2b-ip { font-family: monospace; white-space: nowrap; }
+/* The banned addresses (B220): a fixed layout of the page's width, in which
+   long addresses, hints and log lines wrap instead of widening the page. */
+#f2b-bans { table-layout: fixed; width: 100%; margin-bottom: 6px; }
+#f2b-bans td, #f2b-bans th { vertical-align: top; white-space: normal; overflow-wrap: break-word; word-wrap: break-word; }
+#f2b-bans .f2b-col-ip { width: 30%; }
+#f2b-bans .f2b-col-jails { width: 24%; }
+#f2b-bans .f2b-col-since { width: 18%; }
+#f2b-bans .f2b-col-ends { width: 13%; }
+#f2b-bans .f2b-col-actions { width: 15%; }
+#f2b-bans .f2b-addr { font-family: monospace; word-break: break-all; }
+#f2b-bans .f2b-actions .btn { margin: 0 2px 2px 0; }
+#f2b-bans tr.f2b-detail > td { border-top: none; padding-top: 0; padding-left: 1.5em; }
+#f2b-bans .f2b-ban { margin-top: 4px; }
 #f2b-bans .f2b-ban a { font-size: 85%; margin-left: .5em; }
+#f2b-bans-tools { margin-bottom: 6px; }
+#f2b-bans-pager { margin-bottom: 1em; }
+#f2b-bans-pager .btn { margin: 0 .5em; }
+#f2b-networks { margin-bottom: 1em; overflow-wrap: anywhere; }
+#f2b-networks .f2b-net { display: inline-block; margin-right: 1em; }
+#f2b-networks .f2b-net a { font-family: monospace; }
 #f2b-jails td.num, #f2b-jails th.num, #f2b-report-accounts td.num, #f2b-report-persistent td.num { text-align: right; }
 #f2b-bans-filter { width: 16em; display: inline-block; }
 #fail2ban-settings .help-block { margin-bottom: 0; }
 #fail2ban-settings .f2b-section { font-weight: bold; }
 #f2b-allowlist { font-family: monospace; }
 #f2b-bans .f2b-reason { margin: 1px 0 4px 1em; }
-#f2b-bans .f2b-reason pre { font-size: 85%; white-space: pre-wrap; word-break: break-all; margin: 3px 0; max-width: 60em; }
+#f2b-bans .f2b-reason pre { font-size: 85%; white-space: pre-wrap; word-break: break-all; margin: 3px 0; max-height: 24em; overflow-y: auto; }
 #f2b-nc td { vertical-align: top; }
 #f2b-nc td.num, #f2b-nc th.num { text-align: right; }
 #f2b-nc .f2b-ip { font-family: monospace; white-space: nowrap; }
@@ -17,7 +35,7 @@
 #f2b-jail-values input { width: 7em; }
 </style>
 
-<h2>Intrusion Protection</h2>
+<h2>Intrusion Detection and Prevention</h2>
 
 <p>fail2ban watches the logs of this box (mail, webmail, Nextcloud, ActiveSync, this control panel) and bans IP addresses that fail to log in too often. On top of Mail-in-a-Box&rsquo;s own rules (20 failures within 30 seconds, banned for 10 minutes), repeat offenders get longer bans on the mail ports each time, slow jails catch attacks that try only a few passwords per hour, and addresses on the allowlist are never banned.</p>
 
@@ -26,6 +44,7 @@
 <h3>Banned addresses</h3>
 
 <p id="f2b-summary" class="text-muted">Loading...</p>
+<div id="f2b-networks" class="small" style="display: none"></div>
 
 <form class="form-inline" role="form" onsubmit="f2b_unban_form(); return false;" style="margin-bottom: 1em">
   <div class="form-group">
@@ -41,27 +60,40 @@
   <button type="submit" class="btn btn-default">Unban</button>
 </form>
 
-<div class="form-group">
-  <label for="f2b-bans-filter" class="sr-only">Filter</label>
-  <input type="text" class="form-control input-sm" id="f2b-bans-filter" placeholder="Filter by address or jail" oninput="f2b_render_bans()">
+<div id="f2b-bans-tools" class="form-inline">
+  <div class="form-group">
+    <label for="f2b-bans-filter" class="sr-only">Filter</label>
+    <input type="text" class="form-control input-sm" id="f2b-bans-filter" maxlength="64" placeholder="Filter: address, jail or network" title="Part of an address or of a jail's name, or a network in CIDR notation (e.g. 192.0.2.0/24)" oninput="f2b_filter_changed()">
+  </div>
 </div>
 
-<div class="table-responsive">
-<table id="f2b-bans" class="table" style="width: auto; min-width: 50%">
+<table id="f2b-bans" class="table table-condensed">
+  <colgroup>
+    <col class="f2b-col-ip">
+    <col class="f2b-col-jails">
+    <col class="f2b-col-since">
+    <col class="f2b-col-ends">
+    <col class="f2b-col-actions">
+  </colgroup>
   <thead>
     <tr>
       <th scope="col">Address</th>
-      <th scope="col">Banned in, and why</th>
-      <th scope="col"></th>
+      <th scope="col">Jails</th>
+      <th scope="col">Banned since</th>
+      <th scope="col">Ends</th>
+      <th scope="col"><span class="sr-only">Actions</span></th>
     </tr>
   </thead>
   <tbody>
   </tbody>
 </table>
+<div id="f2b-bans-pager" class="small" style="display: none">
+  <button type="button" class="btn btn-default btn-xs" id="f2b-bans-prev" onclick="f2b_bans_page(-1)">&laquo; Previous</button>
+  <span id="f2b-bans-range"></span>
+  <button type="button" class="btn btn-default btn-xs" id="f2b-bans-next" onclick="f2b_bans_page(1)">Next &raquo;</button>
 </div>
-<p id="f2b-bans-more" class="small text-muted" style="display: none"></p>
 
-<p class="small text-muted">&ldquo;Unban&rdquo; releases the address in all jails, recidive included, and deletes its ban history, so a new ban starts again at the initial ban time. &ldquo;in this jail only&rdquo; releases only that jail&rsquo;s ban. Failures that other jails counted but did not ban yet stay counted: if a device keeps getting banned, fix its password or put its network on the allowlist below.</p>
+<p class="small text-muted">&ldquo;Unban&rdquo; releases the address in all jails, recidive included, and deletes its ban history, so a new ban starts again at the initial ban time. &ldquo;Why?&rdquo; shows the failures and log lines that fail2ban kept for each ban and the jail&rsquo;s rule; &ldquo;in this jail only&rdquo; there releases only that jail&rsquo;s ban. Failures that other jails counted but did not ban yet stay counted: if a device keeps getting banned, fix its password or put its network on the allowlist below.</p>
 
 <h3>Nextcloud throttle</h3>
 
@@ -89,6 +121,148 @@
 <p id="f2b-nc-more" class="small text-muted" style="display: none"></p>
 
 <p class="small text-muted">Nextcloud counts an IPv6 address together with its network (<span class="f2b-nc-v6">/56</span> by default, <tt>security.ipv6_normalized_subnet_size</tt>). &ldquo;Reset&rdquo; deletes Nextcloud&rsquo;s failures of the address&rsquo;s network, so its next login is not delayed (also while the throttle is off or the address is on the bypass list, where Nextcloud&rsquo;s own reset does nothing). If a device keeps failing, fix its password: the failures come back.</p>
+
+<h3>Logins through the box&rsquo;s own services</h3>
+
+<p>ActiveSync and Autodiscover (Z-Push), webmail and Nextcloud check each password with a login to the mail server from the box itself (127.0.0.1). fail2ban bans their clients by their own addresses, but not a client that stays below its thresholds or tries one account from many addresses, nor a program on the box that tries passwords. So the mail server counts, per account, the <em>different</em> wrong passwords of these logins: an account with <span class="ag-limit">30</span> of them within <span class="ag-window">30</span> minutes is refused for logins through these services until it has fewer, even with its right password. A password that is sent again counts once, so a phone that keeps trying an old password does not lock its account. Other accounts are not slowed down, and the account&rsquo;s mail programs that log in from outside (IMAP, SMTP) are not refused. A new lock is mailed to the recipient of the box&rsquo;s reports (System &gt; Notifications).</p>
+
+<form class="form-inline" role="form" onsubmit="ag_save(); return false;" style="margin-bottom: 1em">
+  <div class="form-group">
+    <label for="ag-limit">Refuse an account after</label>
+    <input type="number" class="form-control" id="ag-limit" min="3" max="1000" style="width: 6em">
+  </div>
+  <div class="form-group">
+    <label for="ag-window">different wrong passwords within</label>
+    <input type="number" class="form-control" id="ag-window" min="1" max="1440" style="width: 6em">
+    <span>minutes;</span>
+  </div>
+  <div class="form-group">
+    <label for="ag-span">a burst counts against</label>
+    <input type="number" class="form-control" id="ag-span" min="1" max="4" style="width: 5em">
+    <span>windows</span>
+  </div>
+  <button type="submit" class="btn btn-primary">Save</button>
+  <button type="button" class="btn btn-default" onclick="ag_reset()">Restore defaults</button>
+</form>
+<p id="ag-help" class="help-block small"></p>
+<div id="ag-warnings"></div>
+
+<p id="ag-summary" class="text-muted">Loading...</p>
+<div class="table-responsive">
+<table id="ag-names" class="table" style="width: auto; min-width: 50%; display: none">
+  <thead>
+    <tr>
+      <th scope="col">Account</th>
+      <th scope="col" class="num">Different wrong passwords</th>
+      <th scope="col">Last one</th>
+      <th scope="col">Status</th>
+      <th scope="col"></th>
+    </tr>
+  </thead>
+  <tbody>
+  </tbody>
+</table>
+</div>
+<p id="ag-more" class="small text-muted" style="display: none"></p>
+
+<h3>Sending limit</h3>
+
+<p>The box lets at most <span class="sl-rate">30</span> mails within <span class="sl-per">1</span> second(s) go out<span class="sl-long-text">, and at most <span class="sl-long-rate">1000</span> within <span class="sl-long-per">3600</span> seconds (a steady flood below the first limit)</span> (each recipient counts as one mail), of all mail that its users and the box itself send: mail programs and webmail (SMTP with login on ports 465 and 587), ActiveSync, Nextcloud, Sieve redirects and programs on the box (sendmail), and SMTP from the box itself. More than that sets off the <strong>brake</strong>: from the first mail that does not fit, all outgoing mail is accepted and held (nobody gets an error, nothing is lost), the recipient of the box&rsquo;s reports (System &gt; Notifications) is mailed at once, and held mail goes out only very slowly, or not at all until you end the brake. So an account that was taken over, or a program that sends spam, gets a few dozen mails out instead of thousands, and you can delete the rest below before it goes out; a flood of spam would ruin the reputation of the box&rsquo;s address with other mail providers. The box&rsquo;s own mail to its report recipient is never held. Mail that comes in from other servers is not limited.</p>
+
+<form class="form-inline" role="form" onsubmit="sl_save(); return false;" style="margin-bottom: 1em">
+  <div class="checkbox" style="margin-right: 1em">
+    <label><input type="checkbox" id="sl-enabled"> Limit sending to</label>
+  </div>
+  <div class="form-group">
+    <label for="sl-rate" class="sr-only">mails</label>
+    <input type="number" class="form-control" id="sl-rate" min="1" max="100000" style="width: 7em">
+    <span>mails within</span>
+  </div>
+  <div class="form-group">
+    <label for="sl-per" class="sr-only">seconds</label>
+    <input type="number" class="form-control" id="sl-per" min="1" max="3600" style="width: 6em">
+    <span>seconds</span>
+  </div>
+  <div style="margin-top: .5em">
+    <div class="checkbox" style="margin-right: 1em">
+      <label><input type="checkbox" id="sl-long-enabled"> and to</label>
+    </div>
+    <div class="form-group">
+      <label for="sl-long-rate" class="sr-only">mails</label>
+      <input type="number" class="form-control" id="sl-long-rate" min="1" max="100000" style="width: 7em">
+      <span>mails within</span>
+      <label for="sl-long-per" class="sr-only">seconds</label>
+      <input type="number" class="form-control" id="sl-long-per" min="60" max="604800" style="width: 7em">
+      <span>seconds (the long limit, against a steady flood below the first one)</span>
+    </div>
+  </div>
+  <div style="margin-top: .5em">
+    <span>While the brake is on:</span>
+    <div class="radio" style="display: inline-block; margin: 0 1em">
+      <label><input type="radio" name="sl-stop" id="sl-stop-0" value="0"> send held mail very slowly,</label>
+    </div>
+    <div class="form-group">
+      <label for="sl-brake-rate" class="sr-only">mails</label>
+      <input type="number" class="form-control" id="sl-brake-rate" min="1" max="100000" style="width: 6em">
+      <span>mails within</span>
+      <label for="sl-brake-per" class="sr-only">seconds</label>
+      <input type="number" class="form-control" id="sl-brake-per" min="1" max="86400" style="width: 7em">
+      <span>seconds, and end the brake after</span>
+      <label for="sl-calm" class="sr-only">minutes</label>
+      <input type="number" class="form-control" id="sl-calm" min="1" max="1440" style="width: 6em">
+      <span>minutes without held mail and without more mail than the limit;</span>
+    </div>
+    <div class="radio" style="display: inline-block; margin: 0 1em">
+      <label><input type="radio" name="sl-stop" id="sl-stop-1" value="1"> send nothing until I end the brake</label>
+    </div>
+  </div>
+  <div style="margin-top: .5em">
+    <button type="submit" class="btn btn-primary">Save</button>
+    <button type="button" class="btn btn-default" onclick="sl_reset()">Restore defaults</button>
+  </div>
+</form>
+<div id="sl-brake"></div>
+<p id="sl-help" class="help-block small"></p>
+<div id="sl-warnings"></div>
+
+<div id="sl-held" style="display: none">
+<p id="sl-held-summary"></p>
+<table id="sl-held-table" class="table" style="width: auto; min-width: 50%">
+  <thead>
+    <tr>
+      <th scope="col">Sender</th>
+      <th scope="col" class="num">Mails</th>
+      <th scope="col" class="num">Recipients</th>
+      <th scope="col">Held since</th>
+      <th scope="col"></th>
+    </tr>
+  </thead>
+  <tbody>
+  </tbody>
+</table>
+<p>
+  <button type="button" class="btn btn-default btn-sm" onclick="sl_held_action('release', null)">Release all now</button>
+  <button type="button" class="btn btn-danger btn-sm" onclick="sl_held_action('delete', null)">Delete all held mail</button>
+</p>
+</div>
+
+<p id="sl-summary" class="text-muted">Loading...</p>
+<div class="table-responsive">
+<table id="sl-events" class="table" style="width: auto; min-width: 50%; display: none">
+  <thead>
+    <tr>
+      <th scope="col">Minute</th>
+      <th scope="col" class="num">Held</th>
+      <th scope="col" class="num">Waited</th>
+      <th scope="col" class="num">Deferred</th>
+      <th scope="col" class="num">Longest wait</th>
+      <th scope="col">Senders</th>
+    </tr>
+  </thead>
+  <tbody>
+  </tbody>
+</table>
+</div>
 
 <h3>Jails</h3>
 
@@ -120,6 +294,14 @@
 <h3>Settings</h3>
 
 <form id="fail2ban-settings" class="form-horizontal" role="form" onsubmit="f2b_save_settings(); return false;" oninput="f2b_settings_dirty = true;" onchange="f2b_settings_dirty = true;">
+  <div class="form-group">
+    <div class="col-sm-offset-2 col-sm-8">
+      <div class="checkbox">
+        <label class="f2b-section"><input type="checkbox" id="f2b-enabled"> fail2ban (on by default)</label>
+      </div>
+      <p class="help-block">Bans an address after failed logins, in the jails below. Turn it off only for tests: while it is off, no address is banned after failed logins and the current bans are lifted; turned on again, the bans that have not run out come back. The status checks warn while it is off. Nextcloud&rsquo;s throttle and the limit of failed logins through the box&rsquo;s own services do not depend on it.</p>
+    </div>
+  </div>
   <div class="form-group">
     <div class="col-sm-offset-2 col-sm-8">
       <div class="checkbox">
@@ -247,7 +429,14 @@
 <script>
 var f2b_state = null;
 var f2b_settings_dirty = false; // the settings form has unsaved edits
-var F2B_MAX_ROWS = 300;
+// The banned addresses, page by page (/system/fail2ban/bans, B220).
+var F2B_PAGE = 50;
+var f2b_bans = null;         // the page shown
+var f2b_bans_offset = 0;
+var f2b_bans_seq = 0;        // the answers of older requests are dropped
+var f2b_filter_timer = null;
+var f2b_open = { };          // ip -> true: its "Why?" is open
+var f2b_reasons = { };       // ip -> answer of /system/fail2ban/ban-reason
 var F2B_INPUTS = ["bantime_max", "memory", "slow_maxretry", "slow_findtime", "slow_bantime", "spray_min_ips", "nc_max_attempts"];
 var F2B_JAIL_OPTIONS = ["maxretry", "findtime", "bantime"];
 var f2b_nc_state = null;
@@ -285,6 +474,16 @@ function f2b_time(t) {
   return new Date(t * 1000).toLocaleString();
 }
 
+function f2b_num(n) {
+  // 3214 -> "3,214"
+  return String(n).replace(/\B(?=(\d{3})+(?!\d))/g, ",");
+}
+
+function f2b_short_jail(name) {
+  // "miab-slow-smtp" -> "slow-smtp"; the full names are in the title.
+  return name.replace(/^miab-/, "");
+}
+
 function f2b_api_error(title) {
   return function(text, xhr) {
     if (xhr && xhr.status == 403) return; // handled by api()
@@ -295,7 +494,13 @@ function f2b_api_error(title) {
 function show_fail2ban() {
   $('#f2b-summary').text("Loading...").addClass("text-muted");
   $('#f2b-alerts').html("");
+  $('#f2b-networks').hide().html("");
   $('#f2b-bans tbody').html("");
+  $('#f2b-bans-pager').hide();
+  f2b_bans = null;
+  f2b_bans_offset = 0;
+  f2b_open = { };
+  f2b_reasons = { };
   $('#f2b-jails tbody').html("");
   $('#f2b-report').html("<p class='text-muted'>Loading...</p>");
   $('#f2b-nc-summary').text("Loading...").addClass("text-muted");
@@ -303,8 +508,211 @@ function show_fail2ban() {
   f2b_settings_dirty = false;
   f2b_nc_state = null;
   f2b_load_status();
+  f2b_load_bans();
   f2b_load_nc();
   f2b_load_report();
+  $('#ag-summary').text("Loading...").addClass("text-muted");
+  $('#ag-names').hide().find('tbody').html("");
+  ag_load();
+  $('#sl-summary').text("Loading...").addClass("text-muted");
+  $('#sl-events').hide().find('tbody').html("");
+  sl_load();
+}
+
+// Dovecot's limit of failed logins from the box itself (/system/auth-guard,
+// management/auth_guard.py).
+var ag_state = null;
+
+function ag_load() {
+  api("/system/auth-guard", "GET", { },
+    function(r) { ag_state = r; ag_render(); },
+    function(text, xhr) {
+      if (xhr && xhr.status == 403) return;
+      $('#ag-summary').text("The limit could not be read: " + text).removeClass("text-muted");
+    });
+}
+
+function ag_render() {
+  var r = ag_state, s = r.settings;
+  $('.ag-limit').text(r.applied.limit);
+  $('.ag-window').text(r.applied.window);
+  $('#ag-limit').val(s.limit).attr('min', r.ranges.limit[0]).attr('max', r.ranges.limit[1]);
+  $('#ag-window').val(s.window).attr('min', r.ranges.window[0]).attr('max', r.ranges.window[1]);
+  $('#ag-span').val(s.span).attr('min', r.ranges.span[0]).attr('max', r.ranges.span[1]);
+  $('#ag-help').text("Defaults: " + r.defaults.limit + " different wrong passwords within " + r.defaults.window
+    + " minutes, " + r.defaults.span + " windows. Allowed: " + r.ranges.limit[0] + " to " + r.ranges.limit[1] + ", within " + r.ranges.window[0] + " to " + r.ranges.window[1]
+    + " minutes, " + r.ranges.span[0] + " to " + r.ranges.span[1] + " windows. A lower number stops guessing sooner; it also lets someone who tries an account's passwords through these services lock that account out sooner."
+    + " Windows: many guesses at the same moment are checked in parallel and can get more than the limit through in one window; they then count against the next windows as well, so that over time only a little more than the limit per window gets through."
+    + " After a normal attack a lock ends one window after it; after such a burst it can last up to that many windows (1 = never longer than one window, but bursts then get more through). The change applies at once.");
+  var w = $('#ag-warnings').html("");
+  r.warnings.forEach(function(t) { w.append($('<div class="alert alert-warning"/>').text(t)); });
+  var tbody = $('#ag-names tbody').html("");
+  var refused = r.names.filter(function(n) { return n.refused; }).length;
+  if (!r.names.length) {
+    $('#ag-summary').text("No account had a wrong password through these services in the last " + r.applied.window + " minutes.").addClass("text-muted");
+    $('#ag-names').hide();
+  } else {
+    $('#ag-summary').text(r.names.length + " account name" + (r.names.length == 1 ? "" : "s") + " with wrong passwords in the last " + r.applied.window + " minutes"
+      + (refused ? ", " + refused + " refused now." : ", none refused.")).toggleClass("text-muted", !refused);
+    r.names.forEach(function(n) {
+      var tr = $('<tr/>');
+      var td = $('<td/>').append($('<tt/>').text(n.name));
+      if (n.account === false) td.append($('<div class="small text-muted"/>').text("no such account"));
+      tr.append(td);
+      tr.append($('<td class="num"/>').text(n.failures));
+      tr.append($('<td/>').text(f2b_time(n.last)));
+      tr.append($('<td/>').append(n.refused ? $('<span class="text-danger"/>').text("refused") : $('<span class="text-muted"/>').text("counted")));
+      tr.append($('<td/>').append($('<button type="button" class="btn btn-default btn-xs"/>').text(n.refused ? "Unlock" : "Forget").click(function() { ag_unlock(n); })));
+      tbody.append(tr);
+    });
+    $('#ag-names').show();
+  }
+  $('#ag-more').toggle(r.more > 0).text("... and " + r.more + " more (made-up names, most likely).");
+}
+
+function ag_save() {
+  api("/system/auth-guard", "POST", { limit: $('#ag-limit').val(), window: $('#ag-window').val(), span: $('#ag-span').val() },
+    function(r) { ag_load(); },
+    f2b_api_error("Logins through the box's own services"));
+}
+
+function ag_reset() {
+  api("/system/auth-guard", "POST", { reset: "1" },
+    function(r) { ag_load(); },
+    f2b_api_error("Logins through the box's own services"));
+}
+
+function ag_unlock(n) {
+  api("/system/auth-guard/unlock", "POST", { key: n.key },
+    function(r) {
+      show_modal_error("Logins through the box's own services", $("<p/>").text("The wrong passwords of " + r.name + " are forgotten; it can log in through these services again."), function() { ag_load(); });
+    },
+    f2b_api_error("Logins through the box's own services"));
+}
+
+// The sending limit of the box (/system/send-limit, management/send_limit.py).
+var sl_state = null;
+
+function sl_load() {
+  api("/system/send-limit", "GET", { },
+    function(r) { sl_state = r; sl_render(); },
+    function(text, xhr) {
+      if (xhr && xhr.status == 403) return;
+      $('#sl-summary').text("The sending limit could not be read: " + text).removeClass("text-muted");
+    });
+}
+
+function sl_sender(s) {
+  if (s.indexOf("sendmail:") == 0) return s.substring(9) + " (sendmail)";
+  if (s.indexOf("smtp:") == 0) return s.substring(5) + " (SMTP without login)";
+  return s;
+}
+
+function sl_render() {
+  var r = sl_state, s = r.settings, a = r.applied;
+  $('.sl-rate').text(a.rate);
+  $('.sl-per').text(a.per);
+  $('#sl-enabled').prop('checked', s.enabled);
+  $('#sl-rate').val(s.rate).attr('min', r.ranges.rate[0]).attr('max', r.ranges.rate[1]);
+  $('#sl-per').val(s.per).attr('min', r.ranges.per[0]).attr('max', r.ranges.per[1]);
+  $('#sl-long-enabled').prop('checked', s.long_enabled);
+  $('#sl-long-rate').val(s.long_rate).attr('min', r.ranges.long_rate[0]).attr('max', r.ranges.long_rate[1]);
+  $('#sl-long-per').val(s.long_per).attr('min', r.ranges.long_per[0]).attr('max', r.ranges.long_per[1]);
+  $('.sl-long-rate').text(a.long_rate);
+  $('.sl-long-per').text(a.long_per);
+  $('.sl-long-text').toggle(!!a.long_enabled);
+  $('#sl-stop-' + (s.stop ? "1" : "0")).prop('checked', true);
+  $('#sl-brake-rate').val(s.brake_rate);
+  $('#sl-brake-per').val(s.brake_per);
+  $('#sl-calm').val(s.calm);
+  var b = $('#sl-brake').html("");
+  if (r.brake && r.brake.on) {
+    var div = $('<div class="alert alert-danger"/>');
+    div.append($('<p/>').append($('<strong/>').text("The brake is on")).append(document.createTextNode(" since " + f2b_time(r.brake.since) + ": the box sent more mail than its limit allows, so all outgoing mail is held"
+      + (r.brake.stop ? " and nothing is sent until you end the brake." : " and goes out only at " + s.brake_rate + " mails within " + s.brake_per + " seconds.")
+      + " Look at the held mail below: delete what you did not expect (and change the password of its account), then end the brake.")));
+    div.append($('<button type="button" class="btn btn-default btn-sm"/>').text("End the brake").click(function() { sl_held_action('end', null); }));
+    b.append(div);
+  }
+  $('#sl-help').text("Defaults: " + r.defaults.rate + " mails within " + r.defaults.per + " second(s) and " + r.defaults.long_rate + " within " + r.defaults.long_per + " seconds; while the brake is on " + r.defaults.brake_rate + " mails within "
+    + r.defaults.brake_per + " seconds, ending after " + r.defaults.calm + " calm minutes. Up to that many mails go out at once; the first one more sets off the brake."
+    + " A mail to more recipients than the limit goes out when nothing else waits and counts in full. A lower limit catches a flood sooner, and a higher one lets"
+    + " mail to many recipients go out without the brake. The change applies at once.");
+  var w = $('#sl-warnings').html("");
+  if (r.held && r.held.other_hold)
+    w.append($('<div class="alert alert-warning"/>').text("Postfix's hold queue also has " + r.held.other_hold + " mails that are not on the list below (held by hand, or not recognised by the sending limit). On the box: sudo postqueue -p lists them (marked !), sudo postsuper -H ID releases one, sudo postsuper -d ID deletes it."));
+  if (!a.enabled) w.append($('<div class="alert alert-warning"/>').text("The sending limit is turned off: the box sends as much mail as it is given, and Postfix does not ask its milter at all."));
+  r.warnings.forEach(function(t) { w.append($('<div class="alert alert-warning"/>').text(t)); });
+  var h = r.held, hb = $('#sl-held-table tbody').html("");
+  if (h.mails) {
+    $('#sl-held-summary').text("On hold now: " + h.mails + " mail" + (h.mails == 1 ? "" : "s") + " to " + h.recipients + " recipients. They go out at the limit, the senders in turn."
+      + " If a sender is not expected to send this much (an account that was taken over), change its password and delete its held mail.");
+    h.senders.forEach(function(x) {
+      var tr = $('<tr/>');
+      tr.append($('<td style="word-break: break-all; max-width: 30em"/>').text(sl_sender(x.sender)));
+      tr.append($('<td class="num"/>').text(x.mails));
+      tr.append($('<td class="num"/>').text(x.recipients));
+      tr.append($('<td style="white-space: nowrap"/>').text(f2b_time(x.oldest)));
+      tr.append($('<td style="white-space: nowrap"/>')
+        .append($('<button type="button" class="btn btn-default btn-xs"/>').text("Release now").click(function() { sl_held_action('release', x.sender); }))
+        .append(" ")
+        .append($('<button type="button" class="btn btn-danger btn-xs"/>').text("Delete").click(function() { sl_held_action('delete', x.sender); })));
+      hb.append(tr);
+    });
+    $('#sl-held').show();
+  } else {
+    $('#sl-held').hide();
+  }
+  var d = r.day, tbody = $('#sl-events tbody').html("");
+  if (!d.minutes) {
+    $('#sl-summary').text("No mail had to wait in the last 24 hours.").addClass("text-muted");
+    $('#sl-events').hide();
+    return;
+  }
+  $('#sl-summary').text("In the last 24 hours the limit acted in " + d.minutes + " minute" + (d.minutes == 1 ? "" : "s") + ": " + d.held + " mails were put on hold, " + d.delayed + " waited (up to "
+    + d.max_wait + " s), " + d.deferred + " were deferred. Most recipients: "
+    + d.senders.slice(0, 3).map(function(x) { return sl_sender(x.sender) + " (" + x.recipients + ")"; }).join(", ") + ".").removeClass("text-muted");
+  r.events.forEach(function(e) {
+    var tr = $('<tr/>');
+    tr.append($('<td style="white-space: nowrap"/>').text(f2b_time(e.time)));
+    tr.append($('<td class="num"/>').text(e.held || 0));
+    tr.append($('<td class="num"/>').text(e.delayed));
+    tr.append($('<td class="num"/>').text(e.deferred));
+    tr.append($('<td class="num"/>').text(e.max_wait + " s"));
+    tr.append($('<td class="small" style="word-break: break-all; max-width: 40em"/>').text(e.senders.map(function(x) { return sl_sender(x.sender) + " " + x.recipients; }).join(", ")
+      + (e.others ? " and " + e.others + " more" : "")));
+    tbody.append(tr);
+  });
+  $('#sl-events').show();
+}
+
+function sl_held_action(action, sender) {
+  var who = sender === null ? "all senders" : sl_sender(sender);
+  var q = action == "delete"
+    ? "Delete the held mail of " + who + "? It is removed from the queue and never sent; its senders are not told."
+    : action == "end" ? "End the brake? The held mail then goes out at the limit, the senders in turn; a new flood sets the brake off again."
+    : "Release the held mail of " + who + " now? It goes out at once, past the limit.";
+  show_modal_confirm("Sending limit", $("<p/>").text(q), action == "delete" ? "Delete" : action == "end" ? "End the brake" : "Release", function() {
+    api("/system/send-limit/held", "POST", { action: action, sender: sender === null ? "" : sender },
+      function(r) {
+        show_modal_error("Sending limit", $("<p/>").text(action == "end" ? "The brake ends within a second." : (action == "delete" ? "Deleted " : "Released ") + r.mails + " held mail" + (r.mails == 1 ? "" : "s") + "."), function() { setTimeout(sl_load, 1500); });
+      },
+      f2b_api_error("Sending limit"));
+  });
+}
+
+function sl_save() {
+  api("/system/send-limit", "POST", { enabled: $('#sl-enabled').prop('checked') ? "1" : "0", rate: $('#sl-rate').val(), per: $('#sl-per').val(),
+      stop: $('#sl-stop-1').prop('checked') ? "1" : "0", brake_rate: $('#sl-brake-rate').val(), brake_per: $('#sl-brake-per').val(), calm: $('#sl-calm').val(),
+      long_enabled: $('#sl-long-enabled').prop('checked') ? "1" : "0", long_rate: $('#sl-long-rate').val(), long_per: $('#sl-long-per').val() },
+    function(r) { sl_load(); },
+    f2b_api_error("Sending limit"));
+}
+
+function sl_reset() {
+  api("/system/send-limit", "POST", { reset: "1" },
+    function(r) { sl_load(); },
+    f2b_api_error("Sending limit"));
 }
 
 function f2b_load_status() {
@@ -315,7 +723,8 @@ function f2b_load_status() {
     function(r) {
       f2b_state = r;
       f2b_render_alerts();
-      f2b_render_bans();
+      f2b_render_networks();
+      f2b_render_bans(); // your address, and the PTR names of relay hints
       f2b_render_jails();
       // Keep unsaved edits of the form (e.g. after an unban).
       if (!f2b_settings_dirty) f2b_render_settings();
@@ -324,22 +733,6 @@ function f2b_load_status() {
       if (xhr && xhr.status == 403) return;
       $('#f2b-summary').text("The status could not be loaded: " + text).removeClass("text-muted");
     });
-}
-
-// map of ip -> list of bans (with the jail name), newest first
-function f2b_bans_by_ip() {
-  var by_ip = { };
-  var latest = { };
-  f2b_state.jails.forEach(function(j) {
-    j.banned.forEach(function(b) {
-      if (!by_ip[b.ip]) { by_ip[b.ip] = []; latest[b.ip] = 0; }
-      by_ip[b.ip].push($.extend({ jail: j.name }, b));
-      latest[b.ip] = Math.max(latest[b.ip], b.start);
-    });
-  });
-  var ips = Object.keys(by_ip);
-  ips.sort(function(a, b) { return latest[b] - latest[a] || (a < b ? -1 : 1); });
-  return { ips: ips, by_ip: by_ip };
 }
 
 function f2b_render_alerts() {
@@ -354,7 +747,9 @@ function f2b_render_alerts() {
     return div;
   }
 
-  if (!r.running)
+  if (!r.running && r.enabled === false)
+    alert("alert-warning", $("<p/>").text("fail2ban is turned off (Settings below): no address is banned after failed logins. Turn it on again after the tests."));
+  else if (!r.running)
     alert("alert-danger", $("<p/>").text("fail2ban is not running: " + (r.error || "unknown error") + " No address is banned at the moment."));
   if (!r.config_current)
     alert("alert-warning", $("<p/>").text("The fail2ban configuration files do not match the settings below. Save the settings to write them again."));
@@ -367,10 +762,7 @@ function f2b_render_alerts() {
   // The address this page is used from.
   var c = r.client;
   if (c && !c.own) {
-    var jails = [];
-    r.jails.forEach(function(j) {
-      j.banned.forEach(function(b) { if (b.ip == c.ip) jails.push(j.name); });
-    });
+    var jails = c.banned_in || [];
     if (jails.length > 0) {
       var div = alert("alert-warning", $("<p/>").text("Your address " + c.ip + " is banned in " + jails.join(", ") + "."));
       div.append($('<button type="button" class="btn btn-default btn-sm">Unban it</button>').click(function() { f2b_unban(c.ip, null); }));
@@ -387,11 +779,25 @@ function f2b_render_alerts() {
     }
   }
 
+  // Banned addresses of the servers through which Outlook for iOS and
+  // Android syncs Exchange accounts (Microsoft's published ranges, B126).
+  var relay_ips = Object.keys(r.relays || {});
+  if (relay_ips.length > 0) {
+    var nets = [];
+    relay_ips.forEach(function(ip) { if (nets.indexOf(r.relays[ip].network) < 0) nets.push(r.relays[ip].network); });
+    alert("alert-warning", $("<p/>").text((relay_ips.length == 1 ? "A banned address belongs" : relay_ips.length + " banned addresses belong")
+      + " to Microsoft's servers through which Outlook for iOS and Android syncs Exchange (ActiveSync) accounts (" + nets.join(", ")
+      + ", from Microsoft's published list). All users of that app reach this box through these servers, so such a ban hits all of them."
+      + " See the hint at the address below; whether to put the network on the allowlist is your decision."));
+  }
+  if (r.relays_error)
+    alert("alert-warning", $("<p/>").text(r.relays_error));
+
   if (!r.running) {
     $('#f2b-summary').text("fail2ban is not running.").removeClass("text-muted");
   } else {
-    $('#f2b-summary').text(r.banned_ips + " address" + (r.banned_ips == 1 ? " is" : "es are") + " banned at the moment"
-      + (r.banned_entries != r.banned_ips ? " (" + r.banned_entries + " bans in " + r.jails.length + " jails)" : "") + ".").removeClass("text-muted");
+    $('#f2b-summary').text(f2b_num(r.banned_ips) + " address" + (r.banned_ips == 1 ? " is" : "es are") + " banned at the moment"
+      + (r.banned_entries != r.banned_ips ? " (" + f2b_num(r.banned_entries) + " bans in " + r.jails.length + " jails)" : "") + ".").removeClass("text-muted");
   }
 
   // jail selection of the unban form
@@ -404,66 +810,229 @@ function f2b_render_alerts() {
   sel.val(cur && sel.find('option').filter(function() { return this.value == cur; }).length ? cur : "");
 }
 
-function f2b_render_bans() {
-  if (!f2b_state) return;
-  var tbody = $('#f2b-bans tbody');
-  tbody.html("");
-  $('#f2b-bans-more').hide();
-  var data = f2b_bans_by_ip();
-  var filter = $('#f2b-bans-filter').val().trim().toLowerCase();
-  var ips = data.ips.filter(function(ip) {
-    if (!filter) return true;
-    if (ip.toLowerCase().indexOf(filter) >= 0) return true;
-    return data.by_ip[ip].some(function(b) { return b.jail.toLowerCase().indexOf(filter) >= 0; });
+function f2b_render_networks() {
+  // The networks with the most banned addresses (IPv4 /24, IPv6 /64); a
+  // click shows only the addresses of that network.
+  var div = $('#f2b-networks').html("");
+  var nets = f2b_state.top_networks || [];
+  if (!nets.length) { div.hide(); return; }
+  div.append($('<span class="text-muted"/>').text("Networks with the most banned addresses: "));
+  nets.forEach(function(n) {
+    var span = $('<span class="f2b-net"/>');
+    span.append($('<a href="#"/>').text(n.network).attr('title', "Show only the banned addresses of " + n.network)
+      .click(function() { f2b_filter_set(n.network); return false; }));
+    span.append($('<span class="text-muted"/>').text(" " + f2b_num(n.addresses) + " (" + n.jails.map(f2b_short_jail).join(", ") + ")"));
+    div.append(span);
   });
-
-  if (ips.length == 0) {
-    tbody.append($('<tr/>').append($('<td colspan="3" class="text-muted"/>').text(
-      data.ips.length == 0 ? "No address is banned." : "No banned address matches the filter.")));
-    return;
-  }
-
-  var client_ip = f2b_state.client ? f2b_state.client.ip : null;
-  ips.slice(0, F2B_MAX_ROWS).forEach(function(ip) {
-    var tr = $('<tr/>');
-    var td_ip = $('<td class="f2b-ip"/>').text(ip);
-    if (ip == client_ip) td_ip.append($('<div class="small text-danger"/>').text("your address"));
-    var nc = f2b_nc_entry(ip);
-    if (nc && (nc.blocked || nc.delay_ms > 0)) {
-      td_ip.append($('<div class="small text-warning"/>').text(nc.blocked ? "also blocked by Nextcloud (HTTP 429)" : "also delayed by Nextcloud"));
-      td_ip.append($('<button type="button" class="btn btn-default btn-xs">Reset Nextcloud</button>').click(function() { f2b_nc_reset(ip); }));
-    }
-    tr.append(td_ip);
-
-    var td_bans = $('<td/>');
-    data.by_ip[ip].forEach(function(b) {
-      var div = $('<div class="f2b-ban"/>');
-      div.append($('<strong/>').text(b.jail));
-      var info;
-      if (b.end == null)
-        info = "permanent, since " + f2b_time(b.start);
-      else
-        info = f2b_nice_duration(b.remaining) + " left of " + f2b_nice_duration(b.bantime) + ", since " + f2b_time(b.start);
-      div.append($('<span class="text-muted"/>').text(" – " + info));
-      if (data.by_ip[ip].length > 1)
-        div.append($('<a href="#">in this jail only</a>').click(function() { f2b_unban(ip, b.jail); return false; }));
-      td_bans.append(div);
-      td_bans.append(f2b_reason(b));
-    });
-    tr.append(td_bans);
-
-    tr.append($('<td/>').append(
-      $('<button type="button" class="btn btn-default btn-xs">Unban</button>').click(function() { f2b_unban(ip, null); })));
-    tbody.append(tr);
-  });
-
-  if (ips.length > F2B_MAX_ROWS)
-    $('#f2b-bans-more').text("Showing " + F2B_MAX_ROWS + " of " + ips.length + " addresses (the most recently banned). Use the filter to find others.").show();
+  div.show();
 }
 
-function f2b_rule_text(name) {
+function f2b_load_bans(quiet) {
+  var seq = ++f2b_bans_seq;
+  var filter = $('#f2b-bans-filter').val().trim();
+  api(
+    "/system/fail2ban/bans",
+    "GET",
+    { filter: filter, offset: f2b_bans_offset, limit: F2B_PAGE },
+    function(r) {
+      if (seq != f2b_bans_seq) return;
+      // After an unban the page can be past the end: show the last one.
+      if (r.addresses.length == 0 && r.offset > 0 && r.matched > 0) {
+        f2b_bans_offset = Math.floor((r.matched - 1) / F2B_PAGE) * F2B_PAGE;
+        f2b_load_bans(quiet);
+        return;
+      }
+      f2b_bans = r;
+      f2b_reasons = { };
+      f2b_render_bans();
+    },
+    function(text, xhr) {
+      if (seq != f2b_bans_seq) return;
+      if (xhr && xhr.status == 403) return;
+      f2b_bans = null;
+      $('#f2b-bans-pager').hide();
+      $('#f2b-bans tbody').html("").append($('<tr/>').append($('<td colspan="5" class="text-danger"/>').text(
+        (xhr && xhr.status == 400 ? "" : "The banned addresses could not be loaded: ") + text)));
+    },
+    null,
+    { quiet: !!quiet });
+}
+
+function f2b_filter_changed() {
+  // The server filters: wait until the typing pauses.
+  clearTimeout(f2b_filter_timer);
+  f2b_filter_timer = setTimeout(function() { f2b_bans_offset = 0; f2b_load_bans(true); }, 300);
+}
+
+function f2b_filter_set(value) {
+  clearTimeout(f2b_filter_timer);
+  $('#f2b-bans-filter').val(value);
+  f2b_bans_offset = 0;
+  f2b_load_bans();
+}
+
+function f2b_bans_page(step) {
+  if (!f2b_bans) return;
+  f2b_bans_offset = Math.max(0, f2b_bans.offset + step * F2B_PAGE);
+  f2b_load_bans();
+}
+
+function f2b_ends(a) {
+  // When the address's last ban ends.
+  if (a.end == null) return $('<span/>').text("permanent");
+  return $('<span/>').text(a.remaining > 0 ? "in " + f2b_nice_duration(a.remaining) : "now").attr('title', f2b_time(a.end));
+}
+
+function f2b_render_bans() {
+  var tbody = $('#f2b-bans tbody');
+  var pager = $('#f2b-bans-pager');
+  var r = f2b_bans;
+  if (!r) return;
+  tbody.html("");
+  function message(text) {
+    tbody.append($('<tr/>').append($('<td colspan="5" class="text-muted"/>').text(text)));
+  }
+  if (!r.running) {
+    message("fail2ban is not running.");
+    pager.hide();
+    return;
+  }
+  if (r.addresses.length == 0)
+    message(r.total == 0 ? "No address is banned." : "No banned address matches the filter.");
+  if (r.jail_errors)
+    Object.keys(r.jail_errors).forEach(function(j) { tbody.append($('<tr/>').append($('<td colspan="5" class="small text-danger"/>').text(j + ": " + r.jail_errors[j]))); });
+
+  var client_ip = f2b_state && f2b_state.client ? f2b_state.client.ip : null;
+  r.addresses.forEach(function(a) {
+    var tr = $('<tr/>');
+    var td_ip = $('<td/>').append($('<span class="f2b-addr"/>').text(a.ip));
+    if (a.ip == client_ip) td_ip.append($('<div class="small text-danger"/>').text("your address"));
+    var nc = f2b_nc_entry(a.ip);
+    if (nc && (nc.blocked || nc.delay_ms > 0)) {
+      td_ip.append($('<div class="small text-warning"/>').text(nc.blocked ? "also blocked by Nextcloud (HTTP 429)" : "also delayed by Nextcloud"));
+      td_ip.append($('<button type="button" class="btn btn-default btn-xs">Reset Nextcloud</button>').click(function() { f2b_nc_reset(a.ip); }));
+    }
+    // The status has the PTR name of a relay; the page has the hint only.
+    var relay = (f2b_state && f2b_state.relays && f2b_state.relays[a.ip]) || a.relay;
+    if (relay) td_ip.append(f2b_relay_hint(relay));
+    tr.append(td_ip);
+    var jails = a.bans.map(function(b) { return b.jail; });
+    tr.append($('<td/>').attr('title', jails.join(", ")).text(jails.map(f2b_short_jail).join(", ")));
+    tr.append($('<td class="small"/>').text(f2b_time(a.start)));
+    tr.append($('<td class="small"/>').append(f2b_ends(a)));
+
+    var detail = $('<tr class="f2b-detail"/>').append($('<td colspan="5"/>'));
+    var why = $('<button type="button" class="btn btn-default btn-xs"/>').text("Why?").attr('aria-expanded', f2b_open[a.ip] ? "true" : "false");
+    why.click(function() {
+      if (f2b_open[a.ip]) {
+        delete f2b_open[a.ip];
+        detail.hide();
+      } else {
+        f2b_open[a.ip] = true;
+        detail.show();
+        f2b_show_reason(a, detail);
+      }
+      why.attr('aria-expanded', f2b_open[a.ip] ? "true" : "false");
+    });
+    var unban = $('<button type="button" class="btn btn-default btn-xs">Unban</button>').click(function() { f2b_unban(a.ip, null); });
+    tr.append($('<td class="f2b-actions"/>').append(why).append(unban));
+    tbody.append(tr);
+    tbody.append(detail);
+    if (f2b_open[a.ip]) f2b_show_reason(a, detail);
+    else detail.hide();
+  });
+
+  if (r.matched == 0) {
+    pager.hide();
+    return;
+  }
+  var to = r.offset + r.addresses.length;
+  $('#f2b-bans-range').text(f2b_num(r.offset + 1) + "–" + f2b_num(to) + " of " + f2b_num(r.matched)
+    + (r.filter ? " matching (" + f2b_num(r.total) + " banned)" : ""));
+  $('#f2b-bans-prev').prop('disabled', r.offset == 0).toggle(r.matched > F2B_PAGE || r.offset > 0);
+  $('#f2b-bans-next').prop('disabled', to >= r.matched).toggle(r.matched > F2B_PAGE || r.offset > 0);
+  pager.show();
+}
+
+function f2b_show_reason(a, detail) {
+  // The reasons of the address's bans, read when "Why?" is opened.
+  var td = detail.find('td').first().html("");
+  if (f2b_reasons[a.ip]) {
+    td.append(f2b_render_reason(a, f2b_reasons[a.ip]));
+    return;
+  }
+  td.append($('<span class="small text-muted"/>').text("Loading..."));
+  api(
+    "/system/fail2ban/ban-reason",
+    "GET",
+    { ip: a.ip },
+    function(r) {
+      f2b_reasons[a.ip] = r;
+      td.html("").append(f2b_render_reason(a, r));
+    },
+    function(text, xhr) {
+      if (xhr && xhr.status == 403) return;
+      td.html("").append($('<span class="small text-danger"/>').text("The reasons could not be read: " + text));
+    },
+    null,
+    { quiet: true });
+}
+
+function f2b_render_reason(a, r) {
+  // Per jail: the ban (from the page), "in this jail only", and why.
+  var div = $('<div class="small"/>');
+  if (r.error) div.append($('<div class="text-warning"/>').text(r.error));
+  var by_jail = { };
+  r.jails.forEach(function(j) { by_jail[j.jail] = j; });
+  var bans = a.bans.slice();
+  r.jails.forEach(function(j) {
+    // banned there since the page was loaded
+    if (!bans.some(function(b) { return b.jail == j.jail; })) bans.push({ jail: j.jail });
+  });
+  bans.forEach(function(b) {
+    var head = $('<div class="f2b-ban"/>');
+    head.append($('<strong/>').text(b.jail));
+    var info = null;
+    if (b.start == null) info = "banned since the list was loaded";
+    else if (b.end == null) info = "permanent, since " + f2b_time(b.start);
+    else info = f2b_nice_duration(b.remaining) + " left of " + f2b_nice_duration(b.bantime) + ", since " + f2b_time(b.start);
+    head.append($('<span class="text-muted"/>').text(" – " + info));
+    if (bans.length > 1 && by_jail[b.jail])
+      head.append($('<a href="#">in this jail only</a>').click(function() { f2b_unban(a.ip, b.jail); return false; }));
+    div.append(head);
+    if (by_jail[b.jail])
+      div.append(f2b_reason(by_jail[b.jail]));
+    else
+      div.append($('<div class="f2b-reason text-muted"/>').text("not banned in this jail any more"));
+  });
+  if (!bans.length) div.append($('<div class="text-muted"/>').text("Not banned any more."));
+  return div;
+}
+
+function f2b_relay_hint(relay) {
+  // A banned address in Microsoft's published ranges of Exchange Online
+  // (the servers of Outlook for iOS and Android, B126). The PTR name is
+  // only extra information, and only when it resolves back to the address.
+  var div = $('<div class="small text-warning" style="max-width: 22em"/>');
+  div.append($("<div/>").text("Microsoft server (Outlook for iOS and Android), network " + relay.network));
+  if (relay.name)
+    div.append($('<div class="text-muted"/>').text("name " + relay.name + " (resolves back to this address)"));
+  div.append($('<button type="button" class="btn btn-default btn-xs"/>').text("Put " + relay.network + " on the allowlist").click(function() { f2b_relay_allow(relay); }));
+  return div;
+}
+
+function f2b_relay_allow(relay) {
+  var q = $("<div/>");
+  q.append($("<p/>").text(relay.network + " is one of Microsoft's published networks of Exchange Online, through which Outlook for iOS and Android syncs Exchange (ActiveSync) accounts"
+    + (f2b_state.relays_source && f2b_state.relays_source.retrieved ? " (Microsoft's list as of " + f2b_state.relays_source.retrieved + ")" : "") + "."));
+  q.append($("<p/>").text("Put it on the allowlist only if users of this box use that app with an Exchange account. Addresses on the allowlist are never banned by any jail:"
+    + " wrong passwords that come through Microsoft's servers, also those of anyone who adds an account of this box to the app on purpose, are then no longer banned;"
+    + " what remains is Dovecot's limit for logins from the box itself (Z-Push checks each password with an IMAP login from there): " + (ag_state ? ag_state.applied.limit + " different wrong passwords of one account within " + ag_state.applied.window + " minutes" : "a few different wrong passwords of one account") + ", then that account's ActiveSync, webmail and Nextcloud logins are refused for a while (B126). Its bans are lifted when you save."));
+  show_modal_confirm("Intrusion Detection and Prevention", q, "Put it on the allowlist", function() { f2b_allowlist_add(relay.network); });
+}
+
+function f2b_rule_text(info) {
   // "failed ... logins: 20 failures within 30 s, banned for 10 min from the mail ports"
-  var info = (f2b_state.jail_info || {})[name];
   if (!info || !info.watches) return null;
   var t = info.watches;
   if (info.maxretry) t += ": " + info.maxretry + " failures within " + f2b_nice_duration(info.findtime) + ", banned for " + f2b_nice_duration(info.bantime);
@@ -471,12 +1040,13 @@ function f2b_rule_text(name) {
   return t + ".";
 }
 
-function f2b_reason(b) {
-  // Why the address is banned in this jail: the failures and accounts of the
-  // log lines fail2ban kept (names that are no account here are replaced on
-  // the server), and the jail's rule.
-  var div = $('<div class="small f2b-reason"/>');
-  var r = b.reason;
+function f2b_reason(j) {
+  // Why the address is banned in this jail (an entry of
+  // /system/fail2ban/ban-reason): the failures and accounts of the log lines
+  // fail2ban kept (names that are no account here are replaced on the
+  // server), and the jail's rule.
+  var div = $('<div class="f2b-reason"/>');
+  var r = j.reason;
   var parts = [];
   if (r && r.manual) {
     parts.push("banned by hand (no log lines)");
@@ -493,7 +1063,7 @@ function f2b_reason(b) {
     div.append(" ").append($('<a href="#"/>').text("log lines (" + r.lines.length + ")").click(function() { pre.toggle(); return false; }));
     div.append(pre);
   }
-  var rule = f2b_rule_text(b.jail);
+  var rule = f2b_rule_text(j.rule || (f2b_state && f2b_state.jail_info || {})[j.jail]);
   if (rule) div.append($('<div class="text-muted"/>').text("Rule: " + rule));
   return div;
 }
@@ -683,8 +1253,8 @@ function f2b_render_jails() {
     tr.append(num(j.currently_banned));
     tr.append(num(j.total_banned));
     var td_btn = $('<td/>');
-    if (j.banned.length > 0)
-      td_btn.append($('<button type="button" class="btn btn-default btn-xs"/>').text("Unban all (" + j.banned.length + ")").click(function() { f2b_unban_all(j.name, j.banned.length); }));
+    if (j.banned_count > 0)
+      td_btn.append($('<button type="button" class="btn btn-default btn-xs"/>').text("Unban all (" + f2b_num(j.banned_count) + ")").click(function() { f2b_unban_all(j.name, j.banned_count); }));
     tr.append(td_btn);
     tbody.append(tr);
   });
@@ -700,6 +1270,7 @@ function f2b_render_settings() {
   var s = f2b_state.settings;
   var d = f2b_state.defaults;
   var lim = f2b_state.limits;
+  $('#f2b-enabled').prop('checked', s.enabled !== false);
   $('#f2b-adaptive').prop('checked', s.adaptive);
   $('#f2b-slow_jails').prop('checked', s.slow_jails);
   $('#f2b-slow_web_jails').prop('checked', s.slow_web_jails);
@@ -751,13 +1322,14 @@ function f2b_allowlist_add(net) {
   var ta = $('#f2b-allowlist');
   var cur = ta.val().replace(/\s+$/, "");
   ta.val((cur ? cur + "\n" : "") + net);
-  show_modal_error("Intrusion Protection", $("<p/>").text(net + " was added to the allowlist in the settings form below, which has unsaved changes. Click Save to apply them."),
+  show_modal_error("Intrusion Detection and Prevention", $("<p/>").text(net + " was added to the allowlist in the settings form below, which has unsaved changes. Click Save to apply them."),
     function() { $('html, body').animate({ scrollTop: $('#fail2ban-settings').offset().top }, 300); });
 }
 
 function f2b_save_settings() {
   if (!f2b_state) return;
   var values = {
+    enabled: $('#f2b-enabled').prop('checked') ? "1" : "0",
     adaptive: $('#f2b-adaptive').prop('checked') ? "1" : "0",
     slow_jails: $('#f2b-slow_jails').prop('checked') ? "1" : "0",
     slow_web_jails: $('#f2b-slow_web_jails').prop('checked') ? "1" : "0",
@@ -772,6 +1344,8 @@ function f2b_save_settings() {
   });
 
   var off = [];
+  if (f2b_state.settings.enabled !== false && values.enabled == "0")
+    off.push("fail2ban itself: no address is banned after failed logins any more, and all current bans are lifted. Only for tests: turn it on again afterwards.");
   if (f2b_state.settings.adaptive && values.adaptive == "0")
     off.push("Adaptive banning: repeat offenders get Mail-in-a-Box's fixed bans again, and fail2ban forgets its ban history after one day. All jails are restarted; their current bans are kept.");
   if (f2b_state.settings.slow_jails && values.slow_jails == "0")
@@ -791,12 +1365,12 @@ function f2b_save_settings() {
   q.append(ul);
   if (values.adaptive == "0" && values.slow_jails == "0" && values.slow_web_jails == "0" && values.allowlist.trim() == "")
     q.append($("<p/>").text("fail2ban then runs with Mail-in-a-Box's original configuration."));
-  show_modal_confirm("Intrusion Protection", q, "Turn off", function() { f2b_post_settings(values); });
+  show_modal_confirm("Intrusion Detection and Prevention", q, "Turn off", function() { f2b_post_settings(values); });
 }
 
 function f2b_reset_settings() {
-  show_modal_confirm("Intrusion Protection",
-    "Restore all intrusion protection settings to the defaults? This also empties the allowlist and restores the thresholds of the jails and of Nextcloud's throttle.",
+  show_modal_confirm("Intrusion Detection and Prevention",
+    "Restore all intrusion detection and prevention settings to the defaults? This also empties the allowlist and restores the thresholds of the jails and of Nextcloud's throttle.",
     "Restore defaults",
     function() { f2b_post_settings({ reset: "1" }); });
 }
@@ -809,7 +1383,9 @@ function f2b_post_settings(values) {
     function(r) {
       var msg = $("<div/>");
       var text = "The settings were saved.";
-      if (r.reloaded && r.restarted) text += " fail2ban restarted its jails with the new configuration (current bans are kept).";
+      if (r.service == "started") text += " fail2ban was started: its jails and the bans that had not run out are back.";
+      else if (r.service == "stopped") text += " fail2ban was stopped and turned off: all bans were lifted.";
+      else if (r.reloaded && r.restarted) text += " fail2ban restarted its jails with the new configuration (current bans are kept).";
       else if (r.reloaded) text += " fail2ban was reloaded with the new configuration.";
       else if (r.changed) text += " The configuration files were written; fail2ban is not running, so they apply when it starts.";
       else text += " The fail2ban configuration did not change.";
@@ -826,9 +1402,9 @@ function f2b_post_settings(values) {
         if (r.nextcloud.bypass_removed.length) nc.push("Removed from Nextcloud's bypass list: " + r.nextcloud.bypass_removed.join(", ") + ".");
         nc.forEach(function(t) { msg.append($("<p/>").text(t)); });
       }
-      show_modal_error("Intrusion Protection", msg, function() { show_fail2ban(); });
+      show_modal_error("Intrusion Detection and Prevention", msg, function() { show_fail2ban(); });
     },
-    f2b_api_error("Intrusion Protection"));
+    f2b_api_error("Intrusion Detection and Prevention"));
 }
 
 function f2b_unban_result(r) {
@@ -843,7 +1419,7 @@ function f2b_unban_result(r) {
     msg.append($("<p/>").text("Its ban history was deleted for the running jails; the history of jails that no longer run could not be deleted."));
   if (r.still_banned_in.length)
     msg.append($("<p/>").text("It is still banned in " + r.still_banned_in.join(", ") + "."));
-  show_modal_error("Unban " + r.ip, msg, function() { f2b_load_status(); f2b_load_nc(); f2b_load_report(); });
+  show_modal_error("Unban " + r.ip, msg, function() { f2b_load_status(); f2b_load_bans(); f2b_load_nc(); f2b_load_report(); });
 }
 
 function f2b_unban(ip, jail) {
@@ -863,7 +1439,7 @@ function f2b_unban_form() {
 
 function f2b_unban_all(jail, count) {
   show_modal_confirm("Unban all",
-    "Unban all " + count + " address" + (count == 1 ? "" : "es") + " banned in " + jail + "? They stay banned in other jails, and their ban history in other jails is kept.",
+    "Unban all " + f2b_num(count) + " address" + (count == 1 ? "" : "es") + " banned in " + jail + "? They stay banned in other jails, and their ban history in other jails is kept.",
     "Unban all",
     function() {
       api(
@@ -872,7 +1448,7 @@ function f2b_unban_all(jail, count) {
         { jail: jail },
         function(r) {
           show_modal_error("Unban all", $("<p/>").text(r.unbanned + " address" + (r.unbanned == 1 ? " was" : "es were") + " unbanned in " + r.jail + "."),
-            function() { f2b_load_status(); });
+            function() { f2b_load_status(); f2b_load_bans(); });
         },
         f2b_api_error("Unban all"));
     });

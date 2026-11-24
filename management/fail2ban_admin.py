@@ -14,8 +14,9 @@
 #  * an allowlist of own networks (added to ignoreip),
 #  * a report of failed logins from many IP addresses for one account
 #    (password spraying) and of IPs that keep failing below the ban threshold,
-#  * the thresholds of Mail-in-a-Box's own jails (setting "jails"), and why
-#    each address is banned (the log lines fail2ban kept),
+#  * the thresholds of Mail-in-a-Box's own jails (setting "jails"), the
+#    banned addresses page by page, and why each address is banned (the log
+#    lines fail2ban kept, read on demand),
 #  * the settings of Nextcloud's own brute-force throttle (nc_*), which
 #    management/nextcloud_throttle.py applies.
 #
@@ -42,6 +43,7 @@ JAIL_FILE = "/etc/fail2ban/jail.d/mailinabox_adaptive.conf"
 SERVER_FILE = "/etc/fail2ban/fail2ban.d/mailinabox_adaptive.conf"
 
 DEFAULTS = {
+	"enabled": True,              # fail2ban runs; off (stopped and disabled) only for tests
 	"adaptive": True,             # bantime.increment, per jail
 	"bantime_max": 7 * 86400,     # bantime.maxtime, seconds
 	"memory": 30 * 86400,         # dbpurgeage: how long past bans count, seconds
@@ -70,7 +72,7 @@ LIMITS = {
 	"spray_min_ips": (2, 100000),
 	"nc_max_attempts": (3, 1000),
 }
-BOOLEANS = ("adaptive", "slow_jails", "slow_web_jails", "nc_protection", "nc_allowlist")
+BOOLEANS = ("enabled", "adaptive", "slow_jails", "slow_web_jails", "nc_protection", "nc_allowlist")
 DURATIONS = ("bantime_max", "memory", "slow_findtime", "slow_bantime")
 MAX_ALLOWLIST = 100
 MIN_PREFIX = { 4: 8, 6: 16 } # refuse networks so wide that they switch fail2ban off
@@ -397,9 +399,41 @@ def update_settings(env, values, reset=False):
 			if restored:
 				raise RuntimeError(f"Nextcloud's brute-force settings could not be changed, the previous settings were restored: {e}") from None
 			raise RuntimeError(f"Nextcloud's brute-force settings could not be changed: {e} The previous settings are saved again, but could not be applied everywhere; save them again or re-run setup.") from None
+	# fail2ban itself, when it was turned on or off (the setting "enabled").
+	result["service"] = None
+	if old["enabled"] != new["enabled"] or not new["enabled"]:
+		try:
+			result["service"] = sync_service(new)
+		except RuntimeError:
+			save_settings(env, old)
+			try:
+				sync_service(old)
+			except RuntimeError:
+				pass
+			raise
 	result["settings"] = new
 	result["unbanned_allowlisted"] = unban_allowlisted(new)
 	return result
+
+def sync_service(settings, run=subprocess.run):
+	# fail2ban runs while "enabled" is on (the default). Turned off (for tests)
+	# it is stopped and disabled, so no address is banned and the current bans
+	# are lifted; turned on again it is enabled and started, and bans that
+	# have not run out come back from its database. Returns "started",
+	# "stopped" or None.
+	want = settings.get("enabled", True)
+	running = is_running()
+	if want == running:
+		if not want:
+			run(["systemctl", "disable", "fail2ban"], capture_output=True, timeout=60)
+		return None
+	try:
+		p = run(["systemctl", "enable" if want else "disable", "--now", "fail2ban"], capture_output=True, text=True, timeout=180)
+	except (OSError, subprocess.SubprocessError) as e:
+		raise RuntimeError(f"fail2ban could not be {'started' if want else 'stopped'}: {e}") from None
+	if p.returncode != 0:
+		raise RuntimeError(f"fail2ban could not be {'started' if want else 'stopped'}: " + ((p.stderr or p.stdout or "").strip().splitlines() or [f"exit code {p.returncode}"])[-1])
+	return "started" if want else "stopped"
 
 def unban_allowlisted(settings):
 	# ignoreip only stops new bans: an address banned before its network was
@@ -727,7 +761,52 @@ def jail_kind(name):
 	if name.startswith("miab-") or name in ("dovecot", "recidive", "postfix-sasl", "sshd"): return "miab"
 	return "other"
 
-def get_status(env):
+def jail_info(settings):
+	# {jail: {maxretry, findtime, bantime, watches, blocks}}: each jail's
+	# thresholds and what it watches and blocks (the rule shown with a ban).
+	rules = jail_rules(settings)
+	ret = {}
+	for name in set(rules) | set(JAIL_INFO):
+		watches, blocks = JAIL_INFO.get(name, (None, None))
+		ret[name] = dict(rules.get(name, {}), watches=watches, blocks=blocks)
+	return ret
+
+def banned_ips():
+	# {jail: [addresses]} of the running jails, in one call of
+	# "fail2ban-client banned" (no ban times: those need one call per jail).
+	ret = {}
+	for item in _literal(f2b("banned")):
+		for jail, ips in item.items():
+			ret[str(jail)] = [str(ip) for ip in ips]
+	return ret
+
+TOP_NETWORKS = 10
+TOP_NETWORK_PREFIX = { 4: 24, 6: 64 }
+
+def top_networks(by_ip, limit=TOP_NETWORKS):
+	# The IPv4 /24 and IPv6 /64 networks with the most banned addresses (at
+	# least two), with their jails: a hint at an attack from one network.
+	# by_ip is {address: [jails]}.
+	nets = {}
+	for ip, jails in by_ip.items():
+		try:
+			a = ipaddress.ip_address(ip)
+		except ValueError:
+			continue
+		net = ipaddress.ip_network(f"{a}/{TOP_NETWORK_PREFIX[a.version]}", strict=False)
+		n = nets.setdefault(net, [0, set()])
+		n[0] += 1
+		n[1].update(jails)
+	top = sorted(((net, n) for net, n in nets.items() if n[0] >= 2),
+		key=lambda x: (-x[1][0], x[0].version, x[0]))[:limit]
+	return [{ "network": str(net), "addresses": n[0], "jails": sorted(n[1]) } for net, n in top]
+
+def get_status(env, client_ip=None):
+	# The overview of the page: the jails and their counters, how many
+	# addresses are banned, the networks with the most of them, the relay
+	# hints and the settings. The bans themselves are paged by list_bans(),
+	# the reasons of an address's bans read by ban_reason() (B220): with
+	# thousands of bans the status carried every ban and its log lines.
 	from concurrent.futures import ThreadPoolExecutor
 	settings, warnings = get_settings(env)
 	# The form shows values set in Nextcloud's config.php by hand while the
@@ -741,10 +820,12 @@ def get_status(env):
 		pass
 	ret = {
 		"running": False,
+		"enabled": settings["enabled"],
 		"error": None,
 		"jails": [],
 		"banned_entries": 0,
 		"banned_ips": 0,
+		"top_networks": [],
 		"settings": settings,
 		"settings_warnings": warnings,
 		"nc_hand_set": nc_hand_set,
@@ -757,45 +838,173 @@ def get_status(env):
 		"override_jails": OVERRIDE_JAILS,
 		"jail_defaults": jail_defaults(),
 		"jail_limits": { k: { "min": lo, "max": hi } for k, (lo, hi) in JAIL_LIMITS.items() },
-		"jail_info": {},
+		"jail_info": jail_info(settings),
+		"relays": {},
+		"relays_source": None,
 	}
-	rules = jail_rules(settings)
-	for name in set(rules) | set(JAIL_INFO):
-		watches, blocks = JAIL_INFO.get(name, (None, None))
-		ret["jail_info"][name] = dict(rules.get(name, {}), watches=watches, blocks=blocks)
+	# The address the control panel is used from, and the jails that ban it
+	# (the page offers to unban it).
+	if client_ip is not None:
+		ret["client"] = client_info(env, client_ip, settings)
+		if ret["client"]:
+			ret["client"]["banned_in"] = []
 	try:
 		jails = get_jails()
-		banned = {}
-		for item in _literal(f2b("banned")):
-			banned.update(item)
+		banned = banned_ips()
 	except F2BError as e:
 		ret["error"] = str(e)
 		return ret
 	ret["running"] = True
 
 	def one(jail):
-		info = { "name": jail, "kind": jail_kind(jail), "banned": [] }
+		info = { "name": jail, "kind": jail_kind(jail), "banned_count": len(banned.get(jail, [])) }
 		try:
 			info.update(jail_status(jail))
-			if banned.get(jail):
-				info["banned"] = jail_bans(jail)
 		except F2BError as e:
 			info["error"] = str(e)
 		return info
 
 	with ThreadPoolExecutor(max_workers=8) as pool:
 		ret["jails"] = list(pool.map(one, jails))
-	# Why each address is banned: the failures and log lines fail2ban kept.
+	by_ip = {}
+	for jail in jails:
+		for ip in banned.get(jail, []):
+			by_ip.setdefault(ip, []).append(jail)
+	ret["banned_entries"] = sum(len(v) for v in by_ip.values())
+	ret["banned_ips"] = len(by_ip)
+	ret["top_networks"] = top_networks(by_ip)
+	if ret.get("client"):
+		ret["client"]["banned_in"] = by_ip.get(ret["client"]["ip"], [])
+	# Banned addresses of the servers that relay the ActiveSync logins of
+	# Outlook for iOS and Android (Microsoft's published ranges,
+	# cloud_relays.py, B126): the control panel shows a hint and offers to
+	# put the network on the allowlist; nothing is allowlisted on its own.
 	try:
-		reasons = ban_reasons(env, [(j["name"], b["ip"], b["start"]) for j in ret["jails"] for b in j["banned"]])
+		import cloud_relays
+		ret["relays"], ret["relays_source"] = cloud_relays.relay_hints(by_ip)
+	except Exception as e:
+		ret["relays_error"] = f"The list of Microsoft's servers (conf/fail2ban/microsoft-relays.txt) could not be read: {e}"
+	return ret
+
+# One page of the banned addresses (GET /system/fail2ban/bans, B220).
+
+BANS_PAGE = 50
+BANS_PAGE_MAX = 200
+BANS_OFFSET_MAX = 10 ** 7
+RE_BANS_FILTER = re.compile(r"[0-9A-Za-z:._/-]{0,64}")
+
+def _query_int(value, name, default, lo, hi):
+	if value is None or str(value).strip() == "":
+		return default
+	if not re.fullmatch(r"\s*\d{1,9}\s*", str(value)):
+		raise ValueError(f"{name} must be a whole number.")
+	n = int(value)
+	if not lo <= n <= hi:
+		raise ValueError(f"{name} must be from {lo} to {hi}.")
+	return n
+
+def parse_bans_filter(value):
+	# ("text", lower-case substring of an address or jail), ("network",
+	# ip_network) for a filter in CIDR notation, or ("", None) for none.
+	value = str(value or "").strip()
+	if not RE_BANS_FILTER.fullmatch(value):
+		raise ValueError("The filter takes up to 64 letters, digits and the characters : . _ / - (part of an address or a jail, or a network in CIDR notation).")
+	if not value:
+		return "", None
+	if "/" in value:
+		try:
+			return "network", ipaddress.ip_network(value, strict=False)
+		except ValueError:
+			raise ValueError("The filter is not a network in CIDR notation.") from None
+	return "text", value.lower()
+
+def _matches(kind, value, ip, bans):
+	if kind == "text":
+		return value in ip.lower() or any(value in b["jail"].lower() for b in bans)
+	if kind == "network":
+		try:
+			return ipaddress.ip_address(ip) in value
+		except ValueError:
+			return False
+	return True
+
+def list_bans(filter="", offset=None, limit=None):
+	# The banned addresses that match the filter, newest ban first (ties by
+	# address), from offset on, at most limit of them, each with its bans
+	# per jail and a relay hint (without the PTR name, which the status has).
+	# Raises ValueError for a bad parameter.
+	from concurrent.futures import ThreadPoolExecutor
+	kind, value = parse_bans_filter(filter)
+	offset = _query_int(offset, "offset", 0, 0, BANS_OFFSET_MAX)
+	limit = _query_int(limit, "limit", BANS_PAGE, 1, BANS_PAGE_MAX)
+	ret = { "running": False, "error": None, "total": 0, "matched": 0, "offset": offset, "limit": limit,
+		"filter": str(filter or "").strip(), "addresses": [] }
+	try:
+		banned = banned_ips()
+	except F2BError as e:
+		ret["error"] = str(e)
+		return ret
+	ret["running"] = True
+
+	def one(jail):
+		try:
+			return jail, jail_bans(jail), None
+		except F2BError as e:
+			return jail, [], str(e)
+
+	by_ip = {}
+	errors = {}
+	with ThreadPoolExecutor(max_workers=8) as pool:
+		for jail, bans, error in pool.map(one, [j for j, ips in banned.items() if ips]):
+			if error:
+				errors[jail] = error
+			for b in bans:
+				by_ip.setdefault(b["ip"], []).append({ "jail": jail, "start": b["start"], "bantime": b["bantime"],
+					"end": b["end"], "remaining": b["remaining"] })
+	if errors:
+		ret["jail_errors"] = errors
+	ret["total"] = len(by_ip)
+	matched = [(max(b["start"] for b in bans), ip) for ip, bans in by_ip.items() if _matches(kind, value, ip, bans)]
+	matched.sort(key=lambda x: (-x[0], x[1]))
+	ret["matched"] = len(matched)
+	page = [ip for _start, ip in matched[offset:offset + limit]]
+	relays = {}
+	if page:
+		try:
+			import cloud_relays
+			relays, _source = cloud_relays.relay_hints(page, names=False)
+		except Exception as e:
+			ret["relays_error"] = f"The list of Microsoft's servers (conf/fail2ban/microsoft-relays.txt) could not be read: {e}"
+	for ip in page:
+		bans = sorted(by_ip[ip], key=lambda b: (-b["start"], b["jail"]))
+		permanent = any(b["end"] is None for b in bans)
+		end = None if permanent else max(b["end"] for b in bans)
+		ret["addresses"].append({
+			"ip": ip,
+			"start": bans[0]["start"],  # of its newest ban
+			"end": end,                 # when its last ban ends, None if one is permanent
+			"remaining": None if permanent else max(b["remaining"] for b in bans),
+			"bans": bans,
+			"relay": relays.get(ip),
+		})
+	return ret
+
+def ban_reason(env, ip):
+	# Why an address is banned, per jail that bans it now: the failures,
+	# accounts and log lines that fail2ban kept for its newest ban there
+	# (ban_reasons), and the jail's rule. Loaded on demand by the page.
+	ip = normalize_ip(ip)
+	jails = sorted(banned_in([ip]).get(ip, []))
+	settings, _ = get_settings(env)
+	info = jail_info(settings)
+	ret = { "ip": ip, "jails": [] }
+	try:
+		reasons = ban_reasons(env, [(jail, ip, None) for jail in jails])
 	except Exception as e:
 		reasons = {}
-		ret["reasons_error"] = f"The reasons of the bans could not be read from fail2ban's database: {e}"
-	for j in ret["jails"]:
-		for b in j["banned"]:
-			b["reason"] = reasons.get((j["name"], b["ip"]))
-	ret["banned_entries"] = sum(len(j["banned"]) for j in ret["jails"])
-	ret["banned_ips"] = len({ b["ip"] for j in ret["jails"] for b in j["banned"] })
+		ret["error"] = f"The reasons of the bans could not be read from fail2ban's database: {e}"
+	for jail in jails:
+		ret["jails"].append({ "jail": jail, "reason": reasons.get((jail, ip)), "rule": info.get(jail) })
 	return ret
 
 def normalize_ip(value):
@@ -1365,9 +1574,10 @@ def _reason(data, known):
 
 def ban_reasons(env, bans):
 	# {(jail, ip): reason} for the current bans, a list of (jail, ip, start of
-	# the ban), from the newest row of each in fail2ban's bans table (opened
-	# read-only, like bans_since): the number of failures and the log lines
-	# that fail2ban kept for the ban.
+	# the ban or None), from the newest row of each in fail2ban's bans table
+	# (opened read-only, like bans_since): the number of failures and the log
+	# lines that fail2ban kept for the ban. Without a start the newest row of
+	# the address in the jail, which is that of its current ban.
 	import sqlite3, urllib.parse
 	if not bans:
 		return {}
@@ -1380,8 +1590,12 @@ def ban_reasons(env, bans):
 		# One row per ban, through the index on (jail, ip): the newest that
 		# began by the start of the current ban.
 		for jail, ip, start in bans:
-			r = con.execute("SELECT data FROM bans WHERE jail = ? AND ip = ? AND timeofban <= ? ORDER BY timeofban DESC LIMIT 1",
-				(jail, ip, int(start) + 5)).fetchone()
+			if start is None:
+				r = con.execute("SELECT data FROM bans WHERE jail = ? AND ip = ? ORDER BY timeofban DESC LIMIT 1",
+					(jail, ip)).fetchone()
+			else:
+				r = con.execute("SELECT data FROM bans WHERE jail = ? AND ip = ? AND timeofban <= ? ORDER BY timeofban DESC LIMIT 1",
+					(jail, ip, int(start) + 5)).fetchone()
 			if r is not None:
 				rows[(jail, ip)] = r[0]
 	finally:
@@ -1528,16 +1742,16 @@ def check_failed_logins(rounded_values, env, output):
 	for w in warnings:
 		output.print_warning(w)
 	if not config_is_current(env, settings):
-		output.print_warning("""The fail2ban configuration does not match the intrusion protection settings.
-			Save the settings again in the control panel (System > Intrusion Protection) or re-run setup.""")
+		output.print_warning("""The fail2ban configuration does not match the intrusion detection and prevention settings.
+			Save the settings again in the control panel (System > Intrusion Detection and Prevention) or re-run setup.""")
 	try:
 		import nextcloud_throttle
 		nc_current = nextcloud_throttle.config_is_current(env, settings)
 	except Exception:
 		nc_current = True # Nextcloud not readable now; its own checks report that
 	if not nc_current:
-		output.print_warning("""Nextcloud's brute-force settings do not match the intrusion protection settings.
-			Save the settings again in the control panel (System > Intrusion Protection) or re-run setup.""")
+		output.print_warning("""Nextcloud's brute-force settings do not match the intrusion detection and prevention settings.
+			Save the settings again in the control panel (System > Intrusion Detection and Prevention) or re-run setup.""")
 	# With Nextcloud's protection off, the failures left in its database are
 	# stale but still delay logins for up to 12 hours (a login that was
 	# waiting in the throttle when it was turned off can add one after the
@@ -1574,7 +1788,7 @@ def check_failed_logins(rounded_values, env, output):
 		problems = True
 		if rounded_values:
 			output.print_warning(f"""Some IP addresses kept failing to log in for {report['persistent_min_hours']}
-				hours or more without ever being banned. See System > Intrusion Protection in the control panel.""")
+				hours or more without ever being banned. See System > Intrusion Detection and Prevention in the control panel.""")
 		else:
 			if settings["slow_jails"]:
 				hint = "If this keeps happening, lower the number of failures or lengthen the window of the slow jails."
@@ -1585,7 +1799,7 @@ def check_failed_logins(rounded_values, env, output):
 				count = "At least " + count
 			output.print_warning(f"""{count} IP address(es) kept failing to log in for {report['persistent_min_hours']}
 				hours or more within the last {report['scan_hours']} hours and were not banned once in that time (a slow
-				attack below the ban thresholds). {hint} (System > Intrusion Protection in the control panel)""")
+				attack below the ban thresholds). {hint} (System > Intrusion Detection and Prevention in the control panel)""")
 			for p in lurking[:5]:
 				output.print_line(f"{p['ip']}: {p['failures']} failures in {p['hours']} hours")
 	devices = report["banned_devices"]
@@ -1598,7 +1812,7 @@ def check_failed_logins(rounded_values, env, output):
 		else:
 			output.print_warning(f"""{len(devices)} banned IP address(es) failed to log in only as one or two existing
 				accounts. If one of them is a device of your own with an old password (e.g. a phone in the office),
-				unban it and put its network on the allowlist (System > Intrusion Protection in the control panel);
+				unban it and put its network on the allowlist (System > Intrusion Detection and Prevention in the control panel);
 				otherwise its bans get longer each time.""")
 			for d in devices[:5]:
 				output.print_line(f"{d['ip']}: {', '.join(d['accounts'])}, {d['failures']} failures, banned in {', '.join(d['banned_in'])}")
@@ -1626,6 +1840,8 @@ if __name__ == "__main__":
 		# stops setup: on a problem Mail-in-a-Box's own jails stay in effect.
 		# Exit code 3 when the bantime.* options changed: setup then has
 		# fail2ban restart its jails ("reload --restart", see apply_config).
+		# Exit code 4 when fail2ban is turned off (the setting "enabled", for
+		# tests): setup then stops and disables it instead.
 		settings, warnings = get_settings(env)
 		for w in warnings:
 			print(w)
@@ -1636,7 +1852,9 @@ if __name__ == "__main__":
 			for path in (JAIL_FILE, SERVER_FILE):
 				_write(path, None)
 			# The removed files may have had bantime.* options.
-			sys.exit(3)
+			sys.exit(3 if settings["enabled"] else 4)
+		if not settings["enabled"]:
+			sys.exit(4)
 		for j in result["skipped_jails"]:
 			print(f"fail2ban: {j} left out, its log file does not exist yet.")
 		if result.get("restart_jails"):

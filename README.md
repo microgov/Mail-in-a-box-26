@@ -43,8 +43,8 @@ builds on that port. Its goals:
   upgrade chain).
 * Keep Mail-in-a-Box's design: one setup command, almost no user-configurable
   setup options (the only new switches in `/etc/mailinabox.conf` are
-  `FTS=off` and `NEXTCLOUD_SHARE_SCOPE=all`; the intrusion protection
-  settings are in the control panel under System > Intrusion Protection).
+  `FTS=off` and `NEXTCLOUD_SHARE_SCOPE=all`; the intrusion detection and prevention
+  settings are in the control panel under System > Intrusion Detection and Prevention).
 * Provide a way from an existing box: a migration to a new 26.04 machine, or
   an in-place upgrade from Ubuntu 22.04 or 24.04 (see
   [Supported paths](#supported-paths)). Started outside tmux or screen, both
@@ -55,7 +55,7 @@ builds on that port. Its goals:
   the normal limits, own networks can be put on an allowlist, and the status
   checks report password spraying. Bans (with the reason of each),
   Nextcloud's own login throttle and the settings are managed in the
-  control panel (System > Intrusion Protection).
+  control panel (System > Intrusion Detection and Prevention).
 * Keep the mail domains of a box apart in Nextcloud: in the web interface
   and the system address book, users only find and share with the accounts
   of their own mail domain, members of the Nextcloud group `admin` with
@@ -77,7 +77,7 @@ builds on that port. Its goals:
 | Dovecot | 2.3.16 | 2.4.2 |
 | Full-text search (Dovecot) | none | **new:** fts_xapian 1.9.3, on by default (`FTS=off` turns it off) |
 | Postfix | 3.6.4 | 3.10.6 |
-| fail2ban | 0.11.2 | 1.1.0, **new:** longer bans for repeat offenders, slow jails, allowlist (System > Intrusion Protection) |
+| fail2ban | 0.11.2 | 1.1.0, **new:** longer bans for repeat offenders, slow jails, allowlist (System > Intrusion Detection and Prevention) |
 | SpamAssassin (via spampd) | 3.4.6 (spampd 2.53), learning via dovecot-antispam | 4.0.2 (spampd 2.62), **new:** learning via IMAPSieve |
 | nginx | 1.18.0 | 1.28.3 |
 | OpenSSL | 3.0.2 | 3.5.5 (LTS, supported until April 2030) |
@@ -110,7 +110,7 @@ Ubuntu's main component, which gets security updates during standard support;
 > Tauberer for help with this fork. Use this repository's
 > [issues](https://github.com/LM1337/Mail-in-a-box-26/issues) instead.
 
-**Status: `v78-r2604.4`, the fourth small release after the first release
+**Status: `v78-r2604.5`, the fifth release after the first release
 `v78-r2604.0`.** The first release is tested on test machines, on a copy of
 a production box and on a box on the Internet; `v78-r2604.1` only by a
 browser test and the API smoke test on a test box; `v78-r2604.2` by a fresh
@@ -118,7 +118,10 @@ install, an update of a copy of a production box, and a migration and an
 in-place upgrade from v78 on Ubuntu 22.04, on test machines; `v78-r2604.3`
 (post-quantum key exchange in Postfix, B175) and `v78-r2604.4` (Nextcloud's
 throttle and the reasons of bans in the control panel, B176, B177) each by a
-fresh install and an update of a copy of a production box (which tests ran
+fresh install and an update of a copy of a production box; `v78-r2604.5`
+(the account lock, the sending limit, System > Notifications and many
+fixes) by the full set of tests on test machines, among them updates of a
+copy of a production box under client load (which tests ran
 for each release, their results and what was not tested are in
 [TESTING-fork.md](TESTING-fork.md)). Make a backup, and try an update on a
 copy or a spare machine before you run it on the box that holds your mail.

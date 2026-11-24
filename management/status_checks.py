@@ -8,12 +8,12 @@ import sys, os, os.path, re, datetime, multiprocessing.pool
 import asyncio
 import dateutil.parser, dateutil.relativedelta, dateutil.tz
 
-import dns.reversename, dns.resolver
+import dns.exception, dns.name, dns.reversename, dns.resolver
 import idna
 import psutil
 import postfix_mta_sts_resolver.resolver
 
-from dns_update import get_dns_zones, build_tlsa_record, get_custom_dns_config, get_secondary_dns, get_custom_dns_records
+from dns_update import get_dns_zones, build_tlsa_record, get_custom_dns_config, get_secondary_dns, get_custom_dns_records, read_dnssec_ksk_pubkey
 from web_update import get_web_domains, get_domains_with_a_records
 from ssl_certificates import get_ssl_certificates, get_domain_ssl_files, check_certificate
 from mailconfig import get_mail_domains, get_mail_aliases
@@ -32,6 +32,7 @@ def get_services():
 		{ "name": "Spamassassin", "port": 10025, "public": False, },
 		{ "name": "OpenDKIM", "port": 8891, "public": False, },
 		{ "name": "OpenDMARC", "port": 8893, "public": False, },
+		{ "name": "Sending limit (miab-sendlimit)", "port": 8895, "public": False, },
 		{ "name": "Mail-in-a-Box Management Daemon", "port": 10222, "public": False, },
 		{ "name": "SSH Login (ssh)", "port": get_ssh_port(), "public": True, },
 		{ "name": "Public DNS (nsd4)", "port": 53, "public": True, },
@@ -79,11 +80,20 @@ def run_services_checks(env, output, pool):
 		fatal = fatal or fatal2
 		output2.playback(output)
 
-	# Check fail2ban.
-	code, ret = shell('check_output', ["fail2ban-client", "status"], capture_stderr=True, trap=True)
-	if code != 0:
-		output.print_error("fail2ban is not running.")
-		all_running = False
+	# Check fail2ban, unless it is turned off (System > Intrusion Detection
+	# and Prevention, for tests): then a warning, so that it is not forgotten.
+	try:
+		from fail2ban_admin import get_settings as fail2ban_settings
+		f2b_on = fail2ban_settings(env)[0]["enabled"]
+	except Exception:
+		f2b_on = True
+	if not f2b_on:
+		output.print_warning("fail2ban is turned off (System > Intrusion Detection and Prevention): no address is banned after failed logins. Turn it on again after the tests.")
+	else:
+		code, ret = shell('check_output', ["fail2ban-client", "status"], capture_stderr=True, trap=True)
+		if code != 0:
+			output.print_error("fail2ban is not running.")
+			all_running = False
 
 	if all_running:
 		output.print_ok("All system services are running.")
@@ -155,11 +165,28 @@ def run_system_checks(rounded_values, env, output):
 	check_ssh_password(env, output)
 	check_software_updates(env, output)
 	check_miab_version(env, output)
+	check_local_changes_after_upgrade(env, output)
 	check_system_aliases(env, output)
 	check_free_disk_space(rounded_values, env, output)
 	check_free_memory(rounded_values, env, output)
 	check_backup(rounded_values, env, output)
 	check_failed_logins(rounded_values, env, output)
+
+# The netcat that tests outbound port 25. Its output is discarded: the nc of
+# Ubuntu 26.04 says "Connection to ... succeeded!" on standard error for -z,
+# and the nightly job (daily_tasks.sh) mails everything that
+# "status_checks.py --show-changes 2>&1" prints, so that line alone sent a
+# "Status Checks Change Notice" every night (B184).
+NC = "/bin/nc"
+
+def outbound_port25_open():
+	import subprocess
+	try:
+		return subprocess.run([NC, "-z", "-w5", "aspmx.l.google.com", "25"], stdin=subprocess.DEVNULL,
+			stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env={"PATH": "/sbin:/bin:/usr/sbin:/usr/bin"},
+			timeout=30, check=False).returncode == 0
+	except (OSError, subprocess.TimeoutExpired):
+		return False
 
 def check_ufw(env, output):
 	if not os.path.isfile('/usr/sbin/ufw'):
@@ -268,6 +295,11 @@ def check_free_memory(rounded_values, env, output):
 def check_backup(rounded_values, env, output):
 	# Check backups
 	backup_config = get_backup_config(env, for_ui=True)
+
+	# The backup directory or its custom.yaml cannot be trusted (B212).
+	if backup_config.get("dir_error"):
+		output.print_error("Backups are not made: " + backup_config["dir_error"])
+		return
 	
 	# Is the backup enabled?
 	if backup_config.get("target", "off") == "off":
@@ -315,8 +347,7 @@ def run_network_checks(env, output):
 	# Stop if we cannot make an outbound connection on port 25. Many residential
 	# networks block outbound port 25 to prevent their network from sending spam.
 	# See if we can reach one of Google's MTAs with a 5-second timeout.
-	_code, ret = shell("check_call", ["/bin/nc", "-z", "-w5", "aspmx.l.google.com", "25"], trap=True)
-	if ret == 0:
+	if outbound_port25_open():
 		output.print_ok("Outbound mail (SMTP port 25) is not blocked.")
 	else:
 		output.print_error("""Outbound mail (SMTP port 25) seems to be blocked by your network. You
@@ -436,8 +467,12 @@ def run_domain_checks_on_domain(domain, rounded_time, env, dns_domains, dns_zone
 	if domain == env["PRIMARY_HOSTNAME"]:
 		check_primary_hostname_dns(domain, env, output, dns_domains, dns_zonefiles)
 
+	# The zone's DS records, looked up once for its checks, so that they all
+	# see the same answer (B182).
+	ds = query_ds(domain) if domain in dns_domains else None
+
 	if domain in dns_domains:
-		check_dns_zone(domain, env, output, dns_zonefiles)
+		check_dns_zone(domain, env, output, dns_zonefiles, ds=ds)
 
 	if domain in mail_domains:
 		check_mail_domain(domain, env, output)
@@ -446,7 +481,7 @@ def run_domain_checks_on_domain(domain, rounded_time, env, dns_domains, dns_zone
 		check_web_domain(domain, rounded_time, ssl_certificates, env, output)
 
 	if domain in dns_domains:
-		check_dns_zone_suggestions(domain, env, output, dns_zonefiles, domains_with_a_records)
+		check_dns_zone_suggestions(domain, env, output, dns_zonefiles, domains_with_a_records, ds=ds)
 
 	# Check auto-configured subdomains. See run_domain_checks.
 	# Skip mta-sts because we check the policy directly.
@@ -474,11 +509,14 @@ def check_primary_hostname_dns(domain, env, output, dns_domains, dns_zonefiles):
 	# If a DS record is set on the zone containing this domain, check DNSSEC now.
 	has_dnssec = False
 	for zone in dns_domains:
-		# A failed DS lookup ("[error]") counts as no DS record, as it did
-		# before query_dns told it apart (B150).
-		if (zone == domain or domain.endswith("." + zone)) and query_dns(zone, "DS", nxdomain=None) not in {None, "[error]"}:
-			has_dnssec = True
-			check_dnssec(zone, env, output, dns_zonefiles, is_checking_primary=True)
+		if zone == domain or domain.endswith("." + zone):
+			ds = query_ds(zone)
+			# A failed lookup ("[timeout]", "[error]") is reported in the
+			# checks of the zone itself, not here again; it does not count
+			# as DNSSEC (B182).
+			if isinstance(ds, list) and ds:
+				has_dnssec = True
+				check_dnssec(zone, env, output, dns_zonefiles, is_checking_primary=True, ds=ds)
 
 	ip = query_dns(domain, "A")
 	ns_ips = query_dns("ns1." + domain, "A") + '/' + query_dns("ns2." + domain, "A")
@@ -558,12 +596,14 @@ def check_alias_exists(alias_name, alias, env, output):
 	else:
 		output.print_error(f"""You must add a mail alias for {alias} which directs email to you or another administrator.""")
 
-def check_dns_zone(domain, env, output, dns_zonefiles):
+def check_dns_zone(domain, env, output, dns_zonefiles, ds=None):
 	# If a DS record is set at the registrar, check DNSSEC first because it will affect the NS query.
-	# If it is not set, we suggest it last. A failed lookup ("[error]")
-	# counts as not set, as it did before query_dns told it apart (B150).
-	if query_dns(domain, "DS", nxdomain=None) not in {None, "[error]"}:
-		check_dnssec(domain, env, output, dns_zonefiles)
+	# If it is not set, we suggest it last. A failed lookup (B182) is
+	# reported here too: DNSSEC may be on, and nothing can be suggested.
+	if ds is None:
+		ds = query_ds(domain)
+	if ds != []:
+		check_dnssec(domain, env, output, dns_zonefiles, ds=ds)
 
 	# We provide a DNS zone for the domain. It should have NS records set up
 	# at the domain name's registrar pointing to this box. The secondary DNS
@@ -573,7 +613,12 @@ def check_dns_zone(domain, env, output, dns_zonefiles):
 	# this query being answered by the box, which would mean the test is only
 	# half working.)
 
-	custom_dns_records = list(get_custom_dns_config(env)) # generator => list so we can reuse it
+	try:
+		custom_dns_records = list(get_custom_dns_config(env)) # generator => list so we can reuse it
+	except ValueError as e:
+		# dns/ or its custom.yaml cannot be trusted (B212), or it is broken.
+		output.print_error(f"The custom DNS records cannot be read: {e}")
+		custom_dns_records = []
 	correct_ip = "; ".join(sorted(get_custom_dns_records(custom_dns_records, domain, "A"))) or env['PUBLIC_IP']
 	custom_secondary_ns = get_secondary_dns(custom_dns_records, mode="NS")
 	secondary_ns = custom_secondary_ns or ["ns2." + env['PRIMARY_HOSTNAME']]
@@ -646,7 +691,7 @@ def check_dns_zone(domain, env, output, dns_zonefiles):
 					output.print_error(f"""Secondary nameserver {ns} has inconsistent SOA record (primary: {SOARecord} versus secondary: {SOASecondary}).
 					Check that synchronization between secondary and primary DNS servers is properly set-up.""")
 
-def check_dns_zone_suggestions(domain, env, output, dns_zonefiles, domains_with_a_records):
+def check_dns_zone_suggestions(domain, env, output, dns_zonefiles, domains_with_a_records, ds=None):
 	# Warn if a custom DNS record is preventing this or the automatic www redirect from
 	# being served.
 	if domain in domains_with_a_records:
@@ -655,13 +700,30 @@ def check_dns_zone_suggestions(domain, env, output, dns_zonefiles, domains_with_
 		output.print_warning(f"""A redirect from 'www.{domain}' has been disabled for this domain because you have set a custom DNS record on the www subdomain.""")
 
 	# Since DNSSEC is optional, if a DS record is NOT set at the registrar suggest it.
-	# (If it was set, we did the check earlier.) A failed lookup counts as
-	# not set, as in check_dns_zone (B150).
-	if query_dns(domain, "DS", nxdomain=None) in {None, "[error]"}:
-		check_dnssec(domain, env, output, dns_zonefiles)
+	# (If it was set, or the lookup failed, check_dns_zone did the check.)
+	if ds is None:
+		ds = query_ds(domain)
+	if ds == []:
+		check_dnssec(domain, env, output, dns_zonefiles, ds=ds)
 
 
-def check_dnssec(domain, env, output, dns_zonefiles, is_checking_primary=False):
+# Where the DS records to set at the registrar are: in the lines that
+# check_dnssec prints after its message, which the control panel folds
+# away under "show more" (B179).
+DS_INSTRUCTIONS_WHERE = 'The DS records to set at your domain name registrar are listed below this message (in the control panel: click "show more").'
+
+def query_ds(domain):
+	# The DS records of the domain at its registrar (its parent zone): a list,
+	# empty when there is none, or "[timeout]" or "[error]" when the lookup
+	# failed, which says nothing about whether one is set (B182).
+	ds = query_dns(domain, "DS", nxdomain=None, as_list=True)
+	if ds is None:
+		return []
+	if isinstance(ds, str):
+		return ds
+	return list(ds)
+
+def check_dnssec(domain, env, output, dns_zonefiles, is_checking_primary=False, ds=None):
 	# See if the domain has a DS record set at the registrar. The DS record must
 	# match one of the keys that we've used to sign the zone. It may use one of
 	# several hashing algorithms. We've pre-generated all possible valid DS
@@ -672,6 +734,7 @@ def check_dnssec(domain, env, output, dns_zonefiles, is_checking_primary=False):
 
 	# Read in the pre-generated DS records
 	expected_ds_records = { }
+	pubkeys = { }
 	ds_file = '/etc/nsd/zones/' + dns_zonefiles[domain] + '.ds'
 	if not os.path.exists(ds_file): return # Domain is in our database but DNS has not yet been updated.
 	with open(ds_file, encoding="utf-8") as f:
@@ -681,10 +744,16 @@ def check_dnssec(domain, env, output, dns_zonefiles, is_checking_primary=False):
 
 			# Some registrars may want the public key so they can compute the digest. The DS
 			# record that we suggest using is for the KSK (and that's how the DS records were generated).
-			# We'll also give the nice name for the key algorithm.
-			dnssec_keys = load_env_vars_from_file(os.path.join(env['STORAGE_ROOT'], f'dns/dnssec/{alg_name_map[ds_alg]}.conf'))
-			with open(os.path.join(env['STORAGE_ROOT'], 'dns/dnssec/' + dnssec_keys['KSK'] + '.key'), encoding="utf-8") as f:
-				dnsssec_pubkey = f.read().split("\t")[3].split(" ")[3]
+			# We'll also give the nice name for the key algorithm. The key is read only
+			# through the checked dns/ directory (B212, B183); when it cannot be trusted
+			# or read, the DS records are suggested without it (they come from nsd's
+			# zone directory, not from $STORAGE_ROOT), and the status checks go on.
+			if ds_alg not in pubkeys:
+				try:
+					pubkeys[ds_alg] = (read_dnssec_ksk_pubkey(env, alg_name_map[ds_alg]), None)
+				except ValueError as e:
+					pubkeys[ds_alg] = (None, str(e))
+			dnsssec_pubkey, pubkey_error = pubkeys[ds_alg]
 
 			expected_ds_records[ ds_keytag, ds_alg, ds_digalg, ds_digest ] = {
 				"record": rr_ds,
@@ -695,11 +764,19 @@ def check_dnssec(domain, env, output, dns_zonefiles, is_checking_primary=False):
 				"digalg_name": digalg_name_map[ds_digalg],
 				"digest": ds_digest,
 				"pubkey": dnsssec_pubkey,
+				"pubkey_error": pubkey_error,
 			}
 
-	# Query public DNS for the DS record at the registrar.
-	ds = query_dns(domain, "DS", nxdomain=None, as_list=True)
-	if ds is None or isinstance(ds, str): ds = []
+	# Query public DNS for the DS record at the registrar, unless the caller
+	# did. A lookup that timed out or failed is no answer: it does not mean
+	# that no DS record is set, and the DS records to set are no help then
+	# (they are shown again when the lookup works, B182).
+	if ds is None:
+		ds = query_ds(domain)
+	if isinstance(ds, str):
+		output.print_warning(f"""Could not check this domain's DNSSEC DS record: the DNS lookup {"timed out" if ds == "[timeout]" else "failed"}.
+			Please try again later. If this persists, see the other issues listed here for this domain.""")
+		return
 
 	# There may be more that one record, so we get the result as a list.
 	# Filter out records that don't look valid, just in case, and split
@@ -707,7 +784,7 @@ def check_dnssec(domain, env, output, dns_zonefiles, is_checking_primary=False):
 	ds = [tuple(str(rr).split(" ")) for rr in ds if len(str(rr).split(" ")) == 4]
 
 	if len(ds) == 0:
-		output.print_warning("""This domain's DNSSEC DS record is not set. The DS record is optional. The DS record activates DNSSEC. See below for instructions.""")
+		output.print_warning(f"""This domain's DNSSEC DS record is not set. The DS record is optional. The DS record activates DNSSEC. {DS_INSTRUCTIONS_WHERE}""")
 	else:
 		matched_ds = set(ds) & set(expected_ds_records)
 		if matched_ds:
@@ -723,16 +800,16 @@ def check_dnssec(domain, env, output, dns_zonefiles, is_checking_primary=False):
 				output.print_ok("DNSSEC 'DS' record is set correctly at registrar. (Records using algorithm other than ECDSAP256SHA256 and digest types other than SHA-256/384 should be removed.)")
 				return
 			# no record uses alg 13
-			output.print_warning("""DNSSEC 'DS' record set at registrar is valid but should be updated to ECDSAP256SHA256 and SHA-256 (see below).
+			output.print_warning(f"""DNSSEC 'DS' record set at registrar is valid but should be updated to ECDSAP256SHA256 and SHA-256. {DS_INSTRUCTIONS_WHERE}
 				IMPORTANT: Do not delete existing DNSSEC 'DS' records for this domain until confirmation that the new DNSSEC 'DS' record
 				for this domain is valid.""")
 		else:
 			if is_checking_primary:
-				output.print_error(f"""The DNSSEC 'DS' record for {domain} is incorrect. See further details below.""")
+				output.print_error(f"""The DNSSEC 'DS' record for {domain} is incorrect. The details and the DS records to set are in the checks of {domain} below.""")
 				return
-			output.print_error("""This domain's DNSSEC DS record is incorrect. The chain of trust is broken between the public DNS system
+			output.print_error(f"""This domain's DNSSEC DS record is incorrect. The chain of trust is broken between the public DNS system
 				and this machine's DNS server. It may take several hours for public DNS to update after a change. If you did not recently
-				make a change, you must resolve this immediately (see below).""")
+				make a change, you must resolve this immediately. {DS_INSTRUCTIONS_WHERE}""")
 
 	output.print_line("""Follow the instructions provided by your domain name registrar to set a DS record.
 		Registrars support different sorts of DS records. Use the first option that works:""")
@@ -754,8 +831,11 @@ def check_dnssec(domain, env, output, dns_zonefiles, is_checking_primary=False):
 		output.print_line("Algorithm: {} / {}".format(ds_suggestion['alg'], ds_suggestion['alg_name']))
 		output.print_line("Digest Type: {} / {}".format(ds_suggestion['digalg'], ds_suggestion['digalg_name']))
 		output.print_line("Digest: " + ds_suggestion['digest'])
-		output.print_line("Public Key: ")
-		output.print_line(ds_suggestion['pubkey'], monospace=True)
+		if ds_suggestion['pubkey'] is not None:
+			output.print_line("Public Key: ")
+			output.print_line(ds_suggestion['pubkey'], monospace=True)
+		else:
+			output.print_line("Public Key: not shown, the key cannot be read: " + ds_suggestion['pubkey_error'])
 		output.print_line("")
 		output.print_line("Bulk/Record Format:")
 		output.print_line(ds_suggestion['record'], monospace=True)
@@ -840,13 +920,32 @@ def check_mail_domain(domain, env, output):
 	# The user might have chosen a domain that was previously in use by a spammer
 	# and will not be able to reliably send mail.
 	
+	check_domain_dbl(domain, output)
+
+def dns_name_too_long(qname):
+	# Whether qname is longer than a DNS name may be (255 octets), so that
+	# no lookup of it can be made (query_dns gives "[error]", B181).
+	try:
+		dns.name.from_text(qname)
+	except dns.name.NameTooLong:
+		return True
+	except dns.exception.DNSException:
+		pass
+	return False
+
+def check_domain_dbl(domain, output):
 	# See https://www.spamhaus.org/news/article/807/using-our-public-mirrors-check-your-return-codes-now. for
 	# information on spamhaus return codes
-	dbl = query_dns(domain+'.dbl.spamhaus.org', "A", nxdomain=None)
+	dbl_qname = domain + '.dbl.spamhaus.org'
+	dbl = query_dns(dbl_qname, "A", nxdomain=None)
 	if dbl is None:
 		output.print_ok("Domain is not blacklisted by dbl.spamhaus.org.")
 	elif dbl == "[timeout]":
 		output.print_warning(f"Connection to dbl.spamhaus.org timed out. Could not determine whether the domain {domain} is blacklisted. Please try again later.")
+	elif dbl == "[error]" and dns_name_too_long(dbl_qname):
+		# A domain of more than about 237 characters: with the suffix the
+		# name is too long for DNS, so it cannot be looked up (B181).
+		output.print_warning(f"Could not determine whether the domain {domain} is blacklisted by dbl.spamhaus.org: its name is too long to be looked up there.")
 	elif dbl == "[error]":
 		# The lookup failed, which is no answer (B150).
 		output.print_warning(f"Could not connect to dbl.spamhaus.org. Could not determine whether the domain {domain} is blacklisted. Please try again later.")
@@ -901,8 +1000,10 @@ def query_dns(qname, rtype, nxdomain='[Not Set]', at=None, as_list=False):
 	# as the nameserver.
 	resolver = dns.resolver.get_default_resolver()
 
-	# Make sure at is not a string that cannot be used as a nameserver
-	if at and at not in {'[Not set]', '[timeout]'}:
+	# Ask the nameserver at the address 'at' instead. The callers pass the
+	# box's own address or the result of a successful lookup, never a
+	# sentinel such as '[Not Set]', '[timeout]' or '[error]'.
+	if at:
 		resolver = dns.resolver.Resolver()
 		resolver.nameservers = [at]
 
@@ -923,6 +1024,12 @@ def query_dns(qname, rtype, nxdomain='[Not Set]', at=None, as_list=False):
 		# No server gave an answer: each one answered SERVFAIL, REFUSED or
 		# another error, or could not be reached. That is not "no such
 		# record", so it has a value of its own, like a timeout (B150).
+		return "[error]"
+	except (dns.name.NameTooLong, dns.resolver.YXDOMAIN):
+		# The name cannot be asked: it is longer than DNS allows (a long
+		# domain with ".dbl.spamhaus.org" appended), or a DNAME would make
+		# it so. No answer either, and no traceback that ends the whole
+		# status check run (B181).
 		return "[error]"
 	except dns.exception.Timeout:
 		return "[timeout]"
@@ -1069,9 +1176,159 @@ def check_miab_version(env, output):
 		else:
 			output.print_error(f"A new version of this fork (Mail-in-a-Box for Ubuntu 26.04) is available. You are running version {this_ver}. The latest version is {latest_ver}. For upgrade instructions, see {FORK_REPO_URL}. ")
 
+# The local changes (Roundcube plugins and settings) that the in-place upgrade
+# or the migration to this fork found and did not carry over: written by
+# tools/upgrade-in-place-to-2604.sh and tools/migrate-to-2604.sh in their
+# root-only state directories, removed by their --ack-local.
+LOCAL_CHANGES_FILES = [
+	("/root/upgrade-2604", "The in-place upgrade to this fork", "/root/upgrade-2604/upgrade-in-place-to-2604.sh --ack-local"),
+	("/root/migration", "The migration to this fork", "tools/migrate-to-2604.sh --ack-local"),
+]
+LOCAL_CHANGES_NAME = "local-changes.json"
+LOCAL_CHANGES_OWNER = 0 # root (another uid only in tests/fork/roundcube-local.py)
+
+def read_local_changes(state_dir):
+	# The document in STATE_DIR/local-changes.json, or None. Opened through the
+	# directory without following links, and only from root's own directory
+	# and file that no other account can write (they are root's only, 0700 and
+	# 0600). Returns {"created": text, "ack": text or None, "items": [text]}.
+	import json, stat
+	try:
+		dfd = os.open(state_dir, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+	except OSError:
+		return None
+	try:
+		st = os.fstat(dfd)
+		if st.st_uid != LOCAL_CHANGES_OWNER or st.st_mode & 0o022:
+			return None
+		try:
+			fd = os.open(LOCAL_CHANGES_NAME, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=dfd)
+		except OSError:
+			return None
+		with os.fdopen(fd, "rb") as f:
+			st = os.fstat(f.fileno())
+			if not stat.S_ISREG(st.st_mode) or st.st_uid != LOCAL_CHANGES_OWNER or st.st_mode & 0o022:
+				return None
+			data = f.read(256 * 1024 + 1)
+	finally:
+		os.close(dfd)
+	def text(v, n):
+		# No control or format characters (they reach the panel and the
+		# status mail), at most n characters.
+		import unicodedata
+		v = "".join("?" if unicodedata.category(c)[0] == "C" else c for c in str(v))
+		return v if len(v) <= n else v[:n - 3] + "..."
+	try:
+		doc = json.loads(data.decode("utf-8")) if len(data) <= 256 * 1024 else None
+	except ValueError:
+		doc = None
+	if not isinstance(doc, dict) or not isinstance(doc.get("items"), list):
+		return {"created": None, "ack": None, "items": ["(the file could not be read)"]}
+	created = doc.get("created")
+	created = created if isinstance(created, str) and re.fullmatch(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:]{8}Z", created) else None
+	ack = doc.get("ack")
+	ack = ack if isinstance(ack, str) and re.fullmatch(r"/[A-Za-z0-9._/-]+ --ack-local", ack) else None
+	items = [text(x, 300) for x in doc["items"][:101] if isinstance(x, str)]
+	return {"created": created, "ack": ack, "items": items}
+
+def check_local_changes_after_upgrade(env, output):
+	for state_dir, what, ack in LOCAL_CHANGES_FILES:
+		doc = read_local_changes(state_dir)
+		if doc is None:
+			continue
+		path = os.path.join(state_dir, LOCAL_CHANGES_NAME)
+		when = " (%s)" % doc['created'] if doc['created'] else ""
+		ack_command = doc['ack'] or ack
+		output.print_warning(f"""{what}{when} found local changes to Roundcube that it did not
+			carry over: setup installs its own plugins and writes its own configuration. The old files
+			are in {state_dir}/old-roundcube. Bring back what the new Roundcube supports (see
+			README-fork.md), then end this warning with "sudo {ack_command}" or by removing {path}.""")
+		for item in doc["items"]:
+			output.print_line(item)
+
+def status_changes(prev, cur):
+	# The changes between two recorded runs of the status checks (lists of
+	# BufferedOutput calls), as BufferedOutput calls to play back: per
+	# category (heading) what was added, removed or changed.
+	#
+	# A check is compared as a whole: its message (print_ok, print_error,
+	# print_warning, print_block) together with the print_line lines that
+	# follow it, its instructions and details. A changed message comes with
+	# all of its lines, also when those stayed the same (so a "See below"
+	# is never sent without what it refers to), and a changed line comes
+	# with its message. Before, lines were compared one by one (B179).
+	import json
+	from collections import OrderedDict
+	from difflib import SequenceMatcher
+
+	def group_by_heading(lines):
+		ret = OrderedDict()
+		k = []
+		ret["No Category"] = k
+		for line_type, line_args, line_kwargs in lines:
+			if line_type == "add_heading":
+				k = []
+				ret[line_args[0]] = k
+			else:
+				k.append((line_type, line_args, line_kwargs))
+		return ret
+
+	def group_by_check(lines):
+		# A message and the print_line lines after it; print_line lines
+		# before the first message of a category form a check of their own.
+		checks = []
+		for line in lines:
+			if line[0] == "print_line" and checks:
+				checks[-1].append(line)
+			else:
+				checks.append([line])
+		return checks
+
+	ret = []
+	def play(checks):
+		for check in checks:
+			ret.extend(check)
+
+	prev_status = group_by_heading(prev)
+	cur_status = group_by_heading(cur)
+
+	# Compare the previous to the current status checks
+	# category by category.
+	for category, cur_lines in cur_status.items():
+		cur_checks = group_by_check(cur_lines)
+		if category not in prev_status:
+			if cur_checks:
+				ret.append(("add_heading", (category + " -- Added",), {}))
+				play(cur_checks)
+			continue
+		prev_checks = group_by_check(prev_status[category])
+		def stringify(checks):
+			return [json.dumps(check) for check in checks]
+		diff = SequenceMatcher(None, stringify(prev_checks), stringify(cur_checks), autojunk=False).get_opcodes()
+		for op, i1, i2, j1, j2 in diff:
+			if op == "replace":
+				ret.append(("add_heading", (category + " -- Previously:",), {}))
+			elif op == "delete":
+				ret.append(("add_heading", (category + " -- Removed",), {}))
+			if op in {"replace", "delete"}:
+				play(prev_checks[i1:i2])
+
+			if op == "replace":
+				ret.append(("add_heading", (category + " -- Currently:",), {}))
+			elif op == "insert":
+				ret.append(("add_heading", (category + " -- Added",), {}))
+			if op in {"replace", "insert"}:
+				play(cur_checks[j1:j2])
+
+	for category in prev_status:
+		if category not in cur_status:
+			ret.append(("add_heading", (category,), {}))
+			ret.append(("print_warning", ("This section was removed.",), {}))
+
+	return ret
+
 def run_and_output_changes(env, pool):
 	import json
-	from difflib import SequenceMatcher
 
 	out = ConsoleOutput()
 
@@ -1088,53 +1345,7 @@ def run_and_output_changes(env, pool):
 			except json.JSONDecodeError:
 				prev = []
 
-		# Group the serial output into categories by the headings.
-		def group_by_heading(lines):
-			from collections import OrderedDict
-			ret = OrderedDict()
-			k = []
-			ret["No Category"] = k
-			for line_type, line_args, line_kwargs in lines:
-				if line_type == "add_heading":
-					k = []
-					ret[line_args[0]] = k
-				else:
-					k.append((line_type, line_args, line_kwargs))
-			return ret
-		prev_status = group_by_heading(prev)
-		cur_status = group_by_heading(cur.buf)
-
-		# Compare the previous to the current status checks
-		# category by category.
-		for category, cur_lines in cur_status.items():
-			if category not in prev_status:
-				out.add_heading(category + " -- Added")
-				BufferedOutput(with_lines=cur_lines).playback(out)
-			else:
-				# Actual comparison starts here...
-				prev_lines = prev_status[category]
-				def stringify(lines):
-					return [json.dumps(line) for line in lines]
-				diff = SequenceMatcher(None, stringify(prev_lines), stringify(cur_lines)).get_opcodes()
-				for op, i1, i2, j1, j2 in diff:
-					if op == "replace":
-						out.add_heading(category + " -- Previously:")
-					elif op == "delete":
-						out.add_heading(category + " -- Removed")
-					if op in {"replace", "delete"}:
-						BufferedOutput(with_lines=prev_lines[i1:i2]).playback(out)
-
-					if op == "replace":
-						out.add_heading(category + " -- Currently:")
-					elif op == "insert":
-						out.add_heading(category + " -- Added")
-					if op in {"replace", "insert"}:
-						BufferedOutput(with_lines=cur_lines[j1:j2]).playback(out)
-
-		for category, prev_lines in prev_status.items():
-			if category not in cur_status:
-				out.add_heading(category)
-				out.print_warning("This section was removed.")
+		BufferedOutput(with_lines=status_changes(prev, cur.buf)).playback(out)
 
 	# Store the current status checks output for next time.
 	os.makedirs(os.path.dirname(cache_fn), exist_ok=True)

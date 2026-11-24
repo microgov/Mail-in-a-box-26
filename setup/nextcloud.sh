@@ -538,6 +538,18 @@ if [ -e "$STORAGE_ROOT/owncloud/owncloud.db" ]; then
 	fi
 fi
 
+# Each update of Nextcloud or of one of its apps leaves a copy in
+# $STORAGE_ROOT/owncloud-backup (the database, config.php and the replaced
+# code, up to a few hundred MB each), and nothing removed them; the directory
+# is not in the box's backup. Keep the three newest (the one of this run, if
+# any, among them) and all of the last 14 days (the copy before an upgrade
+# that failed and was tried again), and remove the older ones, through a
+# descriptor of the
+# directory and without following a symbolic link (the storage user owns
+# $STORAGE_ROOT). A problem is reported, and setup goes on.
+tools/owncloud_backup_prune.py "$STORAGE_ROOT" 3 \
+	|| echo "Old Nextcloud backup copies in $STORAGE_ROOT/owncloud-backup were not removed (see above); setup goes on."
+
 # ### Configuring Nextcloud
 
 # With NEXTCLOUD_SHARE_SCOPE=domain (the default, see tools/nextcloud-share-scope.sh)
@@ -630,6 +642,9 @@ fi
 #   Without it Nextcloud saw every client of these paths as 127.0.0.1, which
 #   is on its brute-force bypass list (B121, see below). Another header in
 #   that list would let a client name its own address through the proxy.
+#   nginx passes X-Forwarded-For to Nextcloud's PHP only from that proxy,
+#   which proves itself with a secret header (setup/web.sh), so another
+#   process on the box cannot name an address from 127.0.0.1 (B213).
 # Use PHP to read the settings file, modify it, and write out the new settings array.
 # This runs as www-data, which owns config.php and its directory, and replaces the
 # file atomically (a new file in the same directory, renamed over it). Up to rc7
@@ -771,7 +786,10 @@ tools/editconf.py /etc/php/"$PHP_VER"/fpm/php.ini -c ';' \
 # We moved to v0.6.3 in 193763f8. Ignore errors - maybe there are duplicated users with the
 # correct backend already.
 # As www-data, which owns the database and its directory, not as root by path (B147).
-sudo -u www-data sqlite3 "$STORAGE_ROOT/owncloud/owncloud.db" "UPDATE oc_users_external SET backend='127.0.0.1';" || /bin/true
+# With a busy timeout: Nextcloud's cron job or a CalDAV/CardDAV client may hold
+# the write lock, and without one sqlite3 gave up at once ("database is
+# locked", B189).
+sudo -u www-data sqlite3 -cmd ".timeout 60000" "$STORAGE_ROOT/owncloud/owncloud.db" "UPDATE oc_users_external SET backend='127.0.0.1';" || /bin/true
 
 # Set up a general cron job for Nextcloud.
 # Also add another job for Calendar updates, per advice in the Nextcloud docs
@@ -819,11 +837,14 @@ hide_output sudo -u www-data php"$PHP_VER" -f /usr/local/lib/owncloud/occ config
 #   path that reaches Nextcloud through a connection of the box itself, the
 #   proxy of /caldav, /carddav and /webdav in conf/nginx-primaryonly.conf,
 #   passes the client's address in X-Forwarded-For, which Nextcloud takes
-#   from 127.0.0.1 only (trusted_proxies, set above): a client on the
-#   Internet keeps its own address there, the throttle and the miab-owncloud
-#   jail. An administrator's own proxy in front of /cloud (www/custom.yaml)
-#   adds the client's address to X-Forwarded-For as well (web_update), and
-#   Nextcloud takes the last address that is not a trusted proxy.
+#   from 127.0.0.1 only (trusted_proxies, set above), and nginx passes it to
+#   PHP only from that proxy (B213): a client on the Internet keeps its own
+#   address there, the throttle and the miab-owncloud jail. A proxy of an
+#   administrator's own (www/custom.yaml) to the box's own /cloud is seen as
+#   127.0.0.1 since B213, and so is neither throttled nor banned, and
+#   Dovecot answers its IMAP logins at once (B126; README-fork.md); one that
+#   runs on another host and connects to the box's public address is not
+#   127.0.0.1 at all.
 # * Z-Push checks each password against Dovecot (IMAP) before it calls
 #   Nextcloud, so Nextcloud's throttle of 127.0.0.1 never slowed down a
 #   password guesser there; it only stopped the sync of everyone. A local

@@ -4,12 +4,13 @@
 # and mail aliases and restarts nsd.
 ########################################################################
 
-import sys, os, os.path, datetime, re, hashlib, base64, tempfile
+import sys, os, os.path, datetime, re, hashlib, base64, tempfile, stat
 import ipaddress
 import rtyaml
 import dns.resolver
 
 from utils import shell, load_env_vars_from_file, safe_domain_name, sort_domains, get_ssh_port, get_ssh_config_values
+from utils import open_root_dir, read_root_file, write_root_file
 from ssl_certificates import get_ssl_certificates, check_certificate
 
 # From https://stackoverflow.com/questions/3026957/how-to-validate-a-domain-name-using-regex-php/16491074#16491074
@@ -678,14 +679,51 @@ zone:
 
 ########################################################################
 
-def find_dnssec_signing_keys(domain, env):
+# The keys are in $STORAGE_ROOT/dns/dnssec, which root reads to sign the
+# zones. The storage user owns $STORAGE_ROOT and could put a dns/ of its own
+# there (B212), whose .conf names a key file elsewhere (KSK=../../x): root
+# would copy that file and write the copy outside its temporary directory.
+# The .conf files and the keys are read only through dns/ and dnssec/ opened
+# once and checked (utils.open_root_dir), as regular files of root's, and a
+# key name is a plain file name (B191).
+DNSSEC_KEY_NAME_RE = re.compile(r"^K[A-Za-z0-9._+-]+$")
+
+def open_dnssec_dir(env):
+	# The descriptor of $STORAGE_ROOT/dns/dnssec, through dns/; both must be
+	# directories of root's own. ValueError with the reason otherwise.
+	path = os.path.join(env['STORAGE_ROOT'], 'dns', 'dnssec')
+	try:
+		dfd = open_root_dir(os.path.join(env['STORAGE_ROOT'], 'dns'))
+	except OSError as e:
+		raise ValueError(str(e)) from e
+	try:
+		return open_root_dir('dnssec', dir_fd=dfd)
+	except OSError as e:
+		raise ValueError(str(e).replace("dnssec", path, 1)) from e
+	finally:
+		os.close(dfd)
+
+def read_dnssec_file(env, kfd, name, limit=65536):
+	# The text of the regular file `name` of root's in dnssec/ (kfd).
+	path = os.path.join(env['STORAGE_ROOT'], 'dns', 'dnssec')
+	try:
+		return read_root_file(kfd, name, limit=limit).decode("utf-8", "replace")
+	except FileNotFoundError as e:
+		raise ValueError(f"{path}/{name} does not exist") from e
+	except OSError as e:
+		raise ValueError(f"{path}/{e}") from e
+
+def find_dnssec_signing_keys(domain, env, kfd):
 	# For key that we generated (one per algorithm)...
-	d = os.path.join(env['STORAGE_ROOT'], 'dns/dnssec')
-	keyconfs = [f for f in os.listdir(d) if f.endswith(".conf")]
+	path = os.path.join(env['STORAGE_ROOT'], 'dns', 'dnssec')
+	keyconfs = [f for f in os.listdir(kfd) if f.endswith(".conf")]
 	for keyconf in keyconfs:
-		# Load the file holding the KSK and ZSK key filenames.
-		keyconf_fn = os.path.join(d, keyconf)
-		keyinfo = load_env_vars_from_file(keyconf_fn)
+		# Load the file holding the KSK and ZSK key filenames (KEY=VALUE
+		# lines, the first of a name counts, as load_env_vars_from_file).
+		keyinfo = {}
+		for line in read_dnssec_file(env, kfd, keyconf, limit=4096).splitlines():
+			if "=" in line.strip():
+				keyinfo.setdefault(*line.strip().split("=", 1))
 
 		# Skip this key if the conf file has a setting named DOMAINS,
 		# holding a comma-separated list of domain names, and if this
@@ -698,17 +736,23 @@ def find_dnssec_signing_keys(domain, env):
 			continue
 
 		for keytype in ("KSK", "ZSK"):
-			yield keytype, keyinfo[keytype]
+			keyfn = keyinfo.get(keytype)
+			if not keyfn or not DNSSEC_KEY_NAME_RE.match(keyfn):
+				msg = f"{path}/{keyconf} names no {keytype} key file (a plain file name K...)."
+				raise ValueError(msg)
+			yield keytype, keyfn
 
 def hash_dnssec_keys(domain, env):
 	# Create a stable (by sorting the items) hash of all of the private keys
 	# that will be used to sign this domain.
 	keydata = []
-	for keytype, keyfn in sorted(find_dnssec_signing_keys(domain, env)):
-		oldkeyfn = os.path.join(env['STORAGE_ROOT'], 'dns/dnssec', keyfn + ".private")
-		keydata.extend((keytype, keyfn))
-		with open(oldkeyfn, encoding="utf-8") as fr:
-			keydata.append( fr.read() )
+	kfd = open_dnssec_dir(env)
+	try:
+		for keytype, keyfn in sorted(find_dnssec_signing_keys(domain, env, kfd)):
+			keydata.extend((keytype, keyfn))
+			keydata.append(read_dnssec_file(env, kfd, keyfn + ".private"))
+	finally:
+		os.close(kfd)
 	keydata = "".join(keydata).encode("utf8")
 	return hashlib.sha1(keydata).hexdigest()
 
@@ -727,34 +771,40 @@ def sign_zone(domain, zonefile, env):
 	# Each key has a .key and .private file. Collect a list of filenames
 	# for all of the keys (and separately just the key-signing keys).
 	with tempfile.TemporaryDirectory(prefix="mailinabox-dnssec-") as tmpdir:
-		sign_zone_with_keys(domain, zonefile, tmpdir, env)
+		kfd = open_dnssec_dir(env)
+		try:
+			sign_zone_with_keys(domain, zonefile, tmpdir, env, kfd)
+		finally:
+			os.close(kfd)
 
-def sign_zone_with_keys(domain, zonefile, tmpdir, env):
+def sign_zone_with_keys(domain, zonefile, tmpdir, env, kfd):
 	all_keys = []
 	ksk_keys = []
-	for keytype, keyfn in find_dnssec_signing_keys(domain, env):
-		newkeyfn = os.path.join(tmpdir, keyfn.replace("_domain_", domain))
+	tfd = os.open(tmpdir, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+	try:
+		for keytype, keyfn in find_dnssec_signing_keys(domain, env, kfd):
+			newname = keyfn.replace("_domain_", domain)
+			if "/" in newname or newname in (".", ".."):
+				msg = f"{keyfn} with the domain {domain} is no file name."
+				raise ValueError(msg)
+			newkeyfn = os.path.join(tmpdir, newname)
 
-		for ext in (".private", ".key"):
-			# Copy the .key and .private files to the temporary directory to
-			# patch them up.
-			#
-			# Use os.umask and open().write() to securely create a copy that only
-			# we (root) can read.
-			oldkeyfn = os.path.join(env['STORAGE_ROOT'], 'dns/dnssec', keyfn + ext)
-			with open(oldkeyfn, encoding="utf-8") as fr:
-				keydata = fr.read()
-			keydata = keydata.replace("_domain_", domain)
-			prev_umask = os.umask(0o77) # ensure written file is not world-readable
-			try:
-				with open(newkeyfn + ext, "w", encoding="utf-8") as fw:
+			for ext in (".private", ".key"):
+				# Copy the .key and .private files (read through the checked
+				# dnssec/) to the temporary directory to patch them up: a new
+				# file that only we (root) can read, created in that
+				# directory (never through a link or over another file).
+				keydata = read_dnssec_file(env, kfd, keyfn + ext)
+				keydata = keydata.replace("_domain_", domain)
+				fd = os.open(newname + ext, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600, dir_fd=tfd)
+				with os.fdopen(fd, "w", encoding="utf-8") as fw:
 					fw.write(keydata)
-			finally:
-				os.umask(prev_umask) # other files we write should be world-readable
 
-		# Put the patched key filename base (without extension) into the list of keys we'll sign with.
-		all_keys.append(newkeyfn)
-		if keytype == "KSK": ksk_keys.append(newkeyfn)
+			# Put the patched key filename base (without extension) into the list of keys we'll sign with.
+			all_keys.append(newkeyfn)
+			if keytype == "KSK": ksk_keys.append(newkeyfn)
+	finally:
+		os.close(tfd)
 
 	# Do the signing.
 	expiry_date = (datetime.datetime.now() + datetime.timedelta(days=30)).strftime("%Y%m%d")
@@ -853,10 +903,67 @@ def write_opendkim_tables(domains, env):
 
 ########################################################################
 
-def get_custom_dns_config(env, only_real_records=False):
+# $STORAGE_ROOT/dns belongs to root, but the storage user owns $STORAGE_ROOT
+# and could rename dns/ and put a directory of its own there: the records in
+# its custom.yaml would go into the zones, and root wrote custom.yaml there by
+# path with open("w"), which follows a symbolic link. custom.yaml is read and
+# written only through the checked directory (utils.open_root_dir, B212).
+def open_dns_dir(env):
+	path = os.path.join(env['STORAGE_ROOT'], 'dns')
 	try:
-		with open(os.path.join(env['STORAGE_ROOT'], 'dns/custom.yaml'), encoding="utf-8") as f:
-			custom_dns = rtyaml.load(f)
+		return open_root_dir(path)
+	except FileNotFoundError:
+		raise
+	except OSError as e:
+		msg = f"{e}. The custom DNS records in it are not used until it is a directory of root's own again (chown root:root, chmod 755; check custom.yaml in it)."
+		raise ValueError(msg) from e
+
+def read_custom_dns_yaml(env):
+	# The text of dns/custom.yaml, None when it (or dns/) is missing.
+	# ValueError when the directory or the file cannot be trusted: the zones
+	# are then not built (the old ones stay), rather than built without the
+	# custom records.
+	try:
+		dfd = open_dns_dir(env)
+	except FileNotFoundError:
+		return None
+	try:
+		return read_root_file(dfd, 'custom.yaml').decode("utf-8", "replace")
+	except FileNotFoundError:
+		return None
+	except OSError as e:
+		msg = f"{env['STORAGE_ROOT']}/dns/{e}. The custom DNS records in it are not used until it is a regular file of root's again."
+		raise ValueError(msg) from e
+	finally:
+		os.close(dfd)
+
+def read_dnssec_ksk_pubkey(env, alg_name):
+	# The public key (the key data of its DNSKEY record) of the KSK of the
+	# algorithm, for the DS records that the status checks suggest. Read
+	# only through the checked dns/ and its dnssec/, which must be root's own
+	# as well, and only regular files of root's (B183): the storage user can
+	# replace dns/, and the status checks read these files as root.
+	# ValueError with the reason when they cannot be trusted or read.
+	path = os.path.join(env['STORAGE_ROOT'], 'dns', 'dnssec')
+	kfd = open_dnssec_dir(env)
+	try:
+		ksk = None
+		for line in read_dnssec_file(env, kfd, f"{alg_name}.conf", 4096).splitlines():
+			if line.startswith("KSK="):
+				ksk = line[4:].strip()
+		if not ksk or not DNSSEC_KEY_NAME_RE.match(ksk):
+			raise ValueError(f"{path}/{alg_name}.conf names no KSK")
+		fields = read_dnssec_file(env, kfd, ksk + ".key", 65536).split("\t")
+		if len(fields) < 4 or len(fields[3].split(" ")) < 4:
+			raise ValueError(f"{path}/{ksk}.key is not a DNSKEY record")
+		return fields[3].split(" ")[3].strip()
+	finally:
+		os.close(kfd)
+
+def get_custom_dns_config(env, only_real_records=False):
+	text = read_custom_dns_yaml(env)
+	try:
+		custom_dns = rtyaml.load(text) if text is not None else None
 		if not isinstance(custom_dns, dict): raise ValueError # caught below
 	except:
 		return [ ]
@@ -935,10 +1042,26 @@ def write_custom_dns_config(config, env):
 					values = values[0]
 				dns[qname][rtype] = values
 
-	# Write.
+	# Write, through the checked directory (B212): a new file of root's,
+	# renamed over the old one, with the read bits of the old one (0644 for a
+	# new one, as upstream's open("w") made it).
 	config_yaml = rtyaml.dump(dns)
-	with open(os.path.join(env['STORAGE_ROOT'], 'dns/custom.yaml'), "w", encoding="utf-8") as f:
-		f.write(config_yaml)
+	try:
+		dfd = open_dns_dir(env)
+	except FileNotFoundError:
+		os.mkdir(os.path.join(env['STORAGE_ROOT'], 'dns'), 0o755)
+		dfd = open_dns_dir(env)
+	try:
+		mode = 0o644
+		try:
+			st = os.stat('custom.yaml', dir_fd=dfd, follow_symlinks=False)
+			if stat.S_ISREG(st.st_mode):
+				mode = stat.S_IMODE(st.st_mode) & 0o644
+		except FileNotFoundError:
+			pass
+		write_root_file(dfd, 'custom.yaml', config_yaml.encode("utf-8"), mode)
+	finally:
+		os.close(dfd)
 
 def set_custom_dns_record(qname, rtype, value, action, env):
 	# validate qname

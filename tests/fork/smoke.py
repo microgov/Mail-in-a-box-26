@@ -85,6 +85,7 @@ import base64
 import hashlib
 import http.client
 import imaplib
+import ipaddress
 import json
 import os
 import poplib
@@ -1469,7 +1470,7 @@ def c_mig_dkim(ctx):
     return "DKIM key unchanged"
 
 
-def roundcube_login(ctx, user):
+def roundcube_login(ctx, user, pw=None):
     """Returns cookie jar dict after a successful login, raises Fail otherwise."""
     jar = {}
 
@@ -1490,7 +1491,7 @@ def roundcube_login(ctx, user):
         raise Fail("no login token on /mail/")
     r = http_req(ctx, "POST", "/mail/?_task=login", headers={"Cookie": cookie()}, form={
         "_token": m.group(1), "_task": "login", "_action": "login", "_timezone": "Europe/Berlin",
-        "_url": "", "_user": user, "_pass": ctx.user_pw})
+        "_url": "", "_user": user, "_pass": ctx.user_pw if pw is None else pw})
     eat(r)
     loc = (r.header("Location") or [""])[0]
     if r.status not in (301, 302) or "_task=login" in loc:
@@ -1750,7 +1751,7 @@ def c_backup_saved(ctx):
 
 
 def c_fail2ban_api(ctx):
-    # Read-only: status of the adaptive fail2ban (intrusion protection).
+    # Read-only: status of the adaptive fail2ban (intrusion detection and prevention).
     r = admin_api(ctx, "GET", "system/fail2ban")
     if r.status != 200:
         raise Fail("HTTP %d %s" % (r.status, r.text()[:200]))
@@ -1773,10 +1774,70 @@ def c_fail2ban_api(ctx):
         raise Fail("miab-zpush has kind %s, expected miab" % kinds.get("miab-zpush"))
     if not j.get("config_current"):
         raise Fail("rendered jail file does not match the settings")
-    if "client" not in j:
-        raise Fail("no client address in the status (needed for the panel's allowlist hint)")
-    return "%d jails, %d bans; adaptive=%s slow_jails=%s allowlist=%d" % (
-        len(names), j.get("banned_entries", 0), s.get("adaptive"), s.get("slow_jails"), len(s.get("allowlist") or []))
+    if not isinstance((j.get("client") or {}).get("banned_in"), list):
+        raise Fail("no client address with its jails in the status (needed for the panel's allowlist hint): %s" % j.get("client"))
+    # The overview carries no per-ban lists or reasons (B220): counters, the
+    # networks with the most bans, the pages come from /system/fail2ban/bans.
+    if any("banned" in x for x in j["jails"]) or "reasons_error" in j:
+        raise Fail("the status still lists the bans")
+    if sum(x.get("banned_count", 0) for x in j["jails"]) != j.get("banned_entries"):
+        raise Fail("banned_count of the jails (%d) does not add up to banned_entries (%s)" % (
+            sum(x.get("banned_count", 0) for x in j["jails"]), j.get("banned_entries")))
+    if not isinstance(j.get("top_networks"), list) or any(n["addresses"] < 2 for n in j["top_networks"]):
+        raise Fail("top_networks: %s" % j.get("top_networks"))
+    p = admin_api(ctx, "GET", "system/fail2ban/bans?limit=200").json()
+    if abs(p.get("total", 0) - j.get("banned_ips", 0)) > 5: # bans that begin or end between the two calls
+        raise Fail("the pages count %s banned addresses, the status %s" % (p.get("total"), j.get("banned_ips")))
+    starts = [a["start"] for a in p["addresses"]]
+    if starts != sorted(starts, reverse=True):
+        raise Fail("the page is not newest first")
+    # Microsoft's ranges (B126): the shipped list is read, and a hint names
+    # only a banned address (never one on the allowlist, which is unbanned).
+    if j.get("relays_error") or not (j.get("relays_source") or {}).get("networks"):
+        raise Fail("Microsoft's ranges not read: %s" % (j.get("relays_error") or j.get("relays_source")))
+    banned = {a["ip"] for a in p["addresses"]}
+    if p["total"] <= 200 and set(j.get("relays") or {}) - banned:
+        raise Fail("relay hints for addresses that are not banned: %s" % sorted(set(j["relays"]) - banned))
+    return "%d jails, %d bans of %d addresses; adaptive=%s slow_jails=%s allowlist=%d; %d Microsoft ranges, %d relay hints" % (
+        len(names), j.get("banned_entries", 0), j.get("banned_ips", 0), s.get("adaptive"), s.get("slow_jails"), len(s.get("allowlist") or []),
+        j["relays_source"]["networks"], len(j.get("relays") or {}))
+
+
+def c_fail2ban_bans_api(ctx):
+    # Read-only: the pages of the banned addresses and their parameters
+    # (B220): bad values are refused with 400, a page is at most 200
+    # addresses, the filter by part of an address and by network.
+    for q in ("limit=0", "limit=201", "limit=x", "offset=-1", "offset=1.5", "filter=%3Cscript%3E", "filter=192.0.2.0/33", "filter=" + "1" * 65):
+        r = admin_api(ctx, "GET", "system/fail2ban/bans?" + q)
+        if r.status != 400:
+            raise Fail("GET /system/fail2ban/bans?%s: HTTP %d, expected 400" % (q, r.status))
+    for q in ("ip=", "ip=192.0.2.0/24", "ip=not-an-address"):
+        r = admin_api(ctx, "GET", "system/fail2ban/ban-reason?" + q)
+        if r.status != 400:
+            raise Fail("GET /system/fail2ban/ban-reason?%s: HTTP %d, expected 400" % (q, r.status))
+    p = admin_api(ctx, "GET", "system/fail2ban/bans?limit=200").json()
+    if not p.get("running"):
+        raise Fail("fail2ban not running: %s" % p.get("error"))
+    if len(p["addresses"]) > 200 or p["limit"] != 200 or any("reason" in b or "lines" in b for a in p["addresses"] for b in a["bans"]):
+        raise Fail("page: %d addresses, limit %s" % (len(p["addresses"]), p.get("limit")))
+    note = "%d banned addresses" % p["total"]
+    if p["addresses"]:
+        ip = p["addresses"][0]["ip"]
+        one = admin_api(ctx, "GET", "system/fail2ban/bans?" + urllib.parse.urlencode({"filter": ip})).json()
+        if ip not in [a["ip"] for a in one["addresses"]]:
+            raise Fail("filter %s does not find it" % ip)
+        net = str(ipaddress.ip_network(ip + ("/24" if ":" not in ip else "/64"), strict=False))
+        bynet = admin_api(ctx, "GET", "system/fail2ban/bans?" + urllib.parse.urlencode({"filter": net, "limit": "200"})).json()
+        if ip not in [a["ip"] for a in bynet["addresses"]] or any(ipaddress.ip_address(a["ip"]) not in ipaddress.ip_network(net) for a in bynet["addresses"]):
+            raise Fail("filter %s: %s" % (net, [a["ip"] for a in bynet["addresses"]][:10]))
+        r = admin_api(ctx, "GET", "system/fail2ban/ban-reason?" + urllib.parse.urlencode({"ip": ip})).json()
+        # The jails of the reasons are those of the page (a ban that ends
+        # between the two calls aside).
+        lasting = {b["jail"] for b in p["addresses"][0]["bans"] if b["remaining"] is None or b["remaining"] > 60}
+        if not lasting <= {x["jail"] for x in r["jails"]}:
+            raise Fail("reasons of %s: jails %s, the page has %s" % (ip, [x["jail"] for x in r["jails"]], sorted(lasting)))
+        note += "; the newest found by address and by %s (%d), reasons in %d jails" % (net, bynet["matched"], len(r["jails"]))
+    return note
 
 
 def c_fail2ban_settings_roundtrip(ctx):
@@ -1857,16 +1918,18 @@ def c_fail2ban_ban_reason(ctx):
     if rc != 0:
         raise Fail("fail2ban-client banip: %s" % err.strip()[:200])
     try:
-        st = admin_api(ctx, "GET", "system/fail2ban").json()
-        bans = [b for j in st["jails"] if j["name"] == "miab-roundcube" for b in j["banned"] if b["ip"] == F2B_REASON_IP]
+        page = admin_api(ctx, "GET", "system/fail2ban/bans?filter=%s" % F2B_REASON_IP).json()
+        bans = [b for a in page["addresses"] if a["ip"] == F2B_REASON_IP for b in a["bans"] if b["jail"] == "miab-roundcube"]
         if not bans:
-            raise Fail("the ban of %s in miab-roundcube is not in the status" % F2B_REASON_IP)
-        reason = bans[0].get("reason")
+            raise Fail("the ban of %s in miab-roundcube is not in the list of bans" % F2B_REASON_IP)
+        st = admin_api(ctx, "GET", "system/fail2ban/ban-reason?ip=%s" % F2B_REASON_IP).json()
+        found = [j for j in st["jails"] if j["jail"] == "miab-roundcube"]
+        reason = found[0].get("reason") if found else None
         if not reason or reason.get("manual") is not True or reason.get("lines"):
             raise Fail("reason of a ban by hand: %s" % reason)
-        if st.get("reasons_error"):
-            raise Fail(st["reasons_error"])
-        info = st["jail_info"].get("miab-roundcube") or {}
+        if st.get("error"):
+            raise Fail(st["error"])
+        info = found[0].get("rule") or {}
         if not info.get("watches") or not info.get("maxretry"):
             raise Fail("no rule for miab-roundcube: %s" % info)
     finally:
@@ -2146,7 +2209,9 @@ def c_nc_hand_set(ctx):
 
 def c_local_test(ctx, script):
     # A local test of tests/fork (no box needed): ban-reasons.py (the
-    # masking of user names in the reasons of bans), nextcloud-throttle.py
+    # masking of user names in the reasons of bans), ban-list.py (the
+    # overview, the pages and the reasons of the banned addresses with
+    # 10,000 synthetic bans, B220), nextcloud-throttle.py
     # (the reader of Nextcloud's throttle, the stale failures, the takeover
     # of values set by hand).
     here = os.path.dirname(os.path.abspath(__file__))
@@ -2399,15 +2464,45 @@ def c_fail2ban_filters(ctx):
 
 
 def c_fail2ban_panel(ctx):
-    # The control panel page (System > Intrusion Protection) is part of index.html.
+    # The control panel page (System > Intrusion Detection and Prevention) is part of index.html.
     r = http_req(ctx, "GET", "/admin/")
     if r.status != 200:
         raise Fail("HTTP %d" % r.status)
     page = r.text()
-    missing = [m for m in ('id="panel_fail2ban"', 'href="#fail2ban"', "function show_fail2ban(") if m not in page]
+    missing = [m for m in ('id="panel_fail2ban"', 'href="#fail2ban"', "function show_fail2ban(", "function f2b_load_bans(", "function sl_load(", "Intrusion Detection and Prevention") if m not in page]
     if missing:
         raise Fail("control panel lacks %s" % missing)
-    return "Intrusion Protection page present"
+    return "Intrusion Detection and Prevention page present"
+
+
+def c_panel_assets(ctx):
+    # Every script, style and icon that the control panel's page names under
+    # /admin/assets/ is served (HTTP 200), and the fork's icons are the files
+    # of branding/ (a favicon.ico that setup did not install was a planned
+    # item from rc7 to v78-r2604.4; tests/fork/panel-assets.py checks the
+    # same offline).
+    r = http_req(ctx, "GET", "/admin/")
+    if r.status != 200:
+        raise Fail("/admin/: HTTP %d" % r.status)
+    paths = sorted(set(re.findall(r"/admin/assets/[^\"'\s?#)]+", r.text())))
+    if "/admin/assets/branding/favicon.ico" not in paths:
+        raise Fail("the page names no /admin/assets/branding/favicon.ico")
+    repo = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".."))
+    bad = []
+    for path in paths:
+        a = http_req(ctx, "GET", path)
+        if a.status != 200 or not a.body:
+            bad.append("%s: HTTP %d, %d bytes" % (path, a.status, len(a.body)))
+            continue
+        if path.startswith("/admin/assets/branding/"):
+            fn = os.path.join(repo, "branding", path[len("/admin/assets/branding/"):])
+            if os.path.isfile(fn):
+                with open(fn, "rb") as f:
+                    if f.read() != a.body:
+                        bad.append("%s is not the file of branding/" % path)
+    if bad:
+        raise Fail("; ".join(bad))
+    return "%d assets served" % len(paths)
 
 
 def c_fail2ban_report(ctx):
@@ -2494,6 +2589,23 @@ def c_dns_custom_roundtrip(ctx):
 # ---------------------------------------------------------------------------
 # checks: web (Nextcloud, Roundcube, Z-Push)
 # ---------------------------------------------------------------------------
+
+def c_web_hsts_admin(ctx):
+    # The control panel (/admin/) sends the same HSTS header as the other
+    # pages of the box's name: its location sets headers of its own, which
+    # replace the server's in nginx (B180). /admin/assets/ has none of its
+    # own and inherits the server's.
+    ref = http_req(ctx, "GET", "/").header("Strict-Transport-Security")
+    bad = []
+    for path in ("/admin/", "/admin/assets/branding/favicon.ico"):
+        r = http_req(ctx, "GET", path)
+        got = r.header("Strict-Transport-Security")
+        if got != ref:
+            bad.append("%s: %r (HTTP %d), / has %r" % (path, got, r.status, ref))
+    if bad:
+        raise Fail("; ".join(bad))
+    return "HSTS %s" % (ref[0] if ref else "off (custom.yaml)")
+
 
 def c_nc_status(ctx):
     r = http_req(ctx, "GET", "/cloud/status.php")
@@ -2932,6 +3044,55 @@ echo "reset=$?"
     if not attempts:
         raise Fail("Nextcloud counted no attempt for %s" % public)
     return "remoteAddr %s, attempts %s (reset)" % (remote, attempts)
+
+
+def c_nc_forwarded_for_local(ctx):
+    # Only nginx's own proxy may pass X-Forwarded-For to Nextcloud (B213): a
+    # request from 127.0.0.1 straight to /cloud with a forged X-Forwarded-For
+    # (and a forged proof header) must be logged as 127.0.0.1, which fail2ban
+    # ignores, and count nothing for the forged address. One failed login of
+    # a user that does not exist; the attempts of both addresses are reset.
+    occ = "sudo -n -u www-data php /usr/local/lib/owncloud/occ"
+    script = r"""
+set -u
+. /etc/mailinabox.conf
+cd /
+log="$STORAGE_ROOT/owncloud/nextcloud.log"
+before=$(sudo -n stat -c %%s "$log" 2> /dev/null || echo 0)
+code=$(curl -sk -o /dev/null -w '%%{http_code}' --max-time 60 --resolve "$PRIMARY_HOSTNAME:443:127.0.0.1" \
+    -H 'X-Forwarded-For: %(fake)s' -H 'X-Miab-Nextcloud-Proxy: 0000000000000000000000000000000000000000000000000000000000000000' \
+    -u '%(user)s:not-the-password' -X PROPFIND -H 'Depth: 0' "https://$PRIMARY_HOSTNAME/cloud/remote.php/webdav/")
+echo "http=$code"
+for i in 1 2 3 4 5 6 7 8 9 10; do
+    line=$(sudo -n tail -c +$((before + 1)) "$log" | grep -F "Login failed: '%(user)s'" | tail -1)
+    [ -n "$line" ] && break
+    sleep 1
+done
+echo "log=$line"
+echo "fake=$(%(occ)s security:bruteforce:attempts %(fake)s --output=json 2>&1 | tail -1)"
+%(occ)s security:bruteforce:reset %(fake)s > /dev/null 2>&1
+%(occ)s security:bruteforce:reset 127.0.0.1 > /dev/null 2>&1
+echo "reset=$?"
+""" % {"user": XFF_USER, "occ": occ, "fake": "192.0.2.213"}
+    if not ctx.remote.available():
+        raise Skip("needs --ssh")
+    rc, so, se = ctx.remote.run("bash -c %s" % shlex.quote(script), timeout=300)
+    vals = dict(l.split("=", 1) for l in so.splitlines() if "=" in l)
+    if vals.get("http") != "401":
+        raise Fail("PROPFIND /cloud/remote.php/webdav/ from 127.0.0.1 with a wrong login: HTTP %s (expected 401)" % vals.get("http"))
+    try:
+        remote = json.loads(vals.get("log", "")).get("remoteAddr")
+    except ValueError:
+        raise Fail("no 'Login failed' line for the test login in nextcloud.log")
+    try:
+        attempts = json.loads(vals.get("fake", "")).get("attempts")
+    except (ValueError, AttributeError):
+        raise Fail("occ security:bruteforce:attempts 192.0.2.213: %s" % vals.get("fake", "")[:200])
+    if remote != "127.0.0.1":
+        raise Fail("Nextcloud took the forged X-Forwarded-For of a local request: remoteAddr %s" % remote)
+    if attempts:
+        raise Fail("Nextcloud counted %s attempts for the forged address" % attempts)
+    return "a local request with a forged X-Forwarded-For was logged as %s, 0 attempts for the forged address" % remote
 
 
 def _load_eas():
@@ -3876,9 +4037,9 @@ def c_fail2ban(ctx, proto, jails, port, wait=30):
     reason_note = ""
     if new and ctx.admin_auth:
         try:
-            st = admin_api(ctx, "GET", "system/fail2ban").json()
             j0, ip0 = sorted(new)[0]
-            reasons = [b.get("reason") for j in st["jails"] if j["name"] == j0 for b in j["banned"] if b["ip"] == ip0]
+            st = admin_api(ctx, "GET", "system/fail2ban/ban-reason?" + urllib.parse.urlencode({"ip": ip0})).json()
+            reasons = [j.get("reason") for j in st["jails"] if j["jail"] == j0]
             reason = reasons[0] if reasons else None
             if reason and not reason.get("manual") and reason.get("lines") and (reason.get("failures") or 0) > 0:
                 reason_note = "; reason in %s: %d failures, %d log lines" % (j0, reason["failures"], len(reason["lines"]))
@@ -3991,10 +4152,15 @@ API_READ_ONLY = [
     ("GET", "/system/backup/status/saved", "application/json"),
     ("GET", "/system/backup/config", "application/json"),
     ("GET", "/system/fail2ban", "application/json"),
+    ("GET", "/system/fail2ban/bans", "application/json"),
+    ("GET", "/system/fail2ban/ban-reason", "application/json"),
     ("GET", "/system/fail2ban/settings", "application/json"),
     ("GET", "/system/fail2ban/report", "application/json"),
     ("GET", "/system/nextcloud-throttle", "application/json"),
     ("GET", "/system/munin/alerts", "application/json"),
+    ("GET", "/system/notifications", "application/json"),
+    ("GET", "/system/auth-guard", "application/json"),
+    ("GET", "/system/send-limit", "application/json"),
     ("GET", "/ssl/status", "application/json"),
     ("POST", "/ssl/csr/{domain}", "text/html"),
     ("GET", "/dns/zones", "application/json"),
@@ -4020,6 +4186,7 @@ API_WRITES = [
     ("POST", "/system/backup/status/refresh"),
     ("POST", "/login"),
     ("POST", "/logout"),
+    ("POST", "/me/password"),
     ("POST", "/mail/users/add"),
     ("POST", "/mail/users/password"),
     ("POST", "/mail/users/quota"),
@@ -4034,6 +4201,12 @@ API_WRITES = [
     ("POST", "/system/privacy"),
     ("POST", "/system/munin/alerts"),
     ("POST", "/system/munin/alerts/test"),
+    ("POST", "/system/notifications"),
+    ("POST", "/system/notifications/test"),
+    ("POST", "/system/auth-guard"),
+    ("POST", "/system/auth-guard/unlock"),
+    ("POST", "/system/send-limit"),
+    ("POST", "/system/send-limit/held"),
 ]
 
 # Not called: (method, documented path, reason).
@@ -4186,6 +4359,13 @@ def api_shape(ctx, path, r):
         _need(isinstance(j.get("running"), bool) and isinstance(j.get("jails"), list) and isinstance(j.get("settings"), dict)
               and isinstance(j.get("config_current"), bool), "fail2ban status: keys missing")
         return "%d jails" % len(j["jails"])
+    if path == "/system/fail2ban/bans":
+        _need(isinstance(j.get("running"), bool) and isinstance(j.get("addresses"), list) and isinstance(j.get("total"), int)
+              and j.get("limit") == 50 and j.get("offset") == 0 and len(j["addresses"]) <= 50, "fail2ban bans: keys missing")
+        return "%d of %d addresses" % (len(j["addresses"]), j["total"])
+    if path == "/system/fail2ban/ban-reason":
+        _need(isinstance(j.get("jails"), list) and j.get("ip") == F2B_REASON_IP, "fail2ban ban reason: keys missing")
+        return "%d jails" % len(j["jails"])
     if path == "/system/fail2ban/settings":
         _need(isinstance(j.get("settings"), dict) and isinstance(j.get("defaults"), dict) and isinstance(j.get("warnings"), list),
               "fail2ban settings: keys missing")
@@ -4202,9 +4382,46 @@ def api_shape(ctx, path, r):
     if path == "/system/munin/alerts":
         _need(j.get("recipient") in ("admin", "custom", "off") and j.get("level") in ("warning", "critical")
               and isinstance(j.get("address"), str) and isinstance(j.get("warnings"), list), "munin alerts: keys missing")
-        _need(j.get("default_address") == "administrator@" + ctx.hostname, "munin alerts: default_address %s" % j.get("default_address"))
+        # The standard recipient is the one of the box's reports (System > Notifications).
+        reports = admin_api(ctx, "GET", "system/notifications").json().get("to")
+        _need(j.get("default_address") == reports, "munin alerts: default_address %s, reports go to %s" % (j.get("default_address"), reports))
         _need(j.get("config_current") is True, "munin alerts: munin.conf does not match the setting")
         return "%s/%s" % (j["recipient"], j["level"])
+    if path == "/system/notifications":
+        _need(j.get("recipient") in ("admin", "custom") and isinstance(j.get("address"), str)
+              and isinstance(j.get("targets"), list) and isinstance(j.get("warnings"), list)
+              and isinstance(j.get("admin_alias"), dict) and isinstance(j.get("mails"), list)
+              and isinstance(j.get("deliveries"), list), "notifications: keys missing")
+        _need(j.get("admin_address") == "administrator@" + ctx.hostname, "notifications: admin_address %s" % j.get("admin_address"))
+        _need(j["recipient"] != "admin" or j.get("to") == j["admin_address"], "notifications: standard recipient goes to %s" % j.get("to"))
+        _need(j["targets"] and j["admin_alias"].get("targets"), "notifications: no target (%s)" % "; ".join(j["warnings"])[:200])
+        _need({m.get("to") for m in j["mails"]} == {"reports", "munin", "alias"}, "notifications: list of mails")
+        return "%s -> %s" % (j["recipient"], ", ".join(t["address"] for t in j["targets"]))
+    if path == "/system/auth-guard":
+        # Dovecot's limit of failed logins from the box itself (B126).
+        _need(all(isinstance(j.get(k), dict) and all(isinstance(j[k].get(x), int) for x in ("limit", "window", "span"))
+                  for k in ("settings", "defaults", "applied")), "auth-guard: settings missing")
+        _need(j["defaults"] == {"limit": 30, "window": 30, "span": 4}, "auth-guard: defaults %s" % j["defaults"])
+        _need(isinstance(j.get("ranges"), dict) and isinstance(j.get("warnings"), list) and isinstance(j.get("names"), list)
+              and isinstance(j.get("more"), int), "auth-guard: keys missing")
+        _need(all({"key", "name", "failures", "last", "refused", "account"} <= set(n) for n in j["names"]), "auth-guard: names")
+        _need(not j["warnings"], "auth-guard: %s" % "; ".join(j["warnings"])[:200])
+        return "limit %d in %d min, %d names" % (j["applied"]["limit"], j["applied"]["window"], len(j["names"]))
+    if path == "/system/send-limit":
+        # The sending limit of the box (B221).
+        _need(all(isinstance(j.get(k), dict) and isinstance(j[k].get("enabled"), bool) and all(isinstance(j[k].get(x), int) for x in ("rate", "per"))
+                  for k in ("settings", "defaults", "applied")), "send-limit: settings missing")
+        _need(j["defaults"] == {"enabled": True, "rate": 30, "per": 1, "stop": False, "brake_rate": 10, "brake_per": 60, "calm": 30,
+                                "long_enabled": True, "long_rate": 1000, "long_per": 3600}, "send-limit: defaults %s" % j["defaults"])
+        _need(isinstance(j.get("brake"), dict) and j["brake"].get("on") is False, "send-limit: the brake is on (%s)" % j.get("brake"))
+        _need(isinstance(j.get("events"), list) and isinstance(j.get("day"), dict) and isinstance(j.get("more"), int)
+              and isinstance(j.get("warnings"), list), "send-limit: keys missing")
+        _need(j.get("running") is True, "send-limit: the milter does not run (%s)" % j.get("running"))
+        _need(j.get("release_running") is True, "send-limit: the release service does not run (%s)" % j.get("release_running"))
+        _need(isinstance(j.get("held"), dict) and isinstance(j["held"].get("senders"), list), "send-limit: held missing")
+        _need(not j["warnings"], "send-limit: %s" % "; ".join(j["warnings"])[:200])
+        return "%d mails in %d s%s, %d minutes with waits in 24 h" % (j["applied"]["rate"], j["applied"]["per"],
+            "" if j["applied"]["enabled"] else " (off)", j["day"]["minutes"])
     if path == "/ssl/status":
         _need(_is_str_list(j.get("can_provision")) and isinstance(j.get("status"), list)
               and all({"domain", "status", "text"} <= set(e) for e in j["status"]), "ssl status: keys missing")
@@ -4275,6 +4492,8 @@ def api_request(ctx, method, path):
         real += "?format=json"
     elif path in ("/mail/users/privileges", "/mail/users/quota"):
         real += "?" + urllib.parse.urlencode({"email": ctx.admin_user})
+    elif path == "/system/fail2ban/ban-reason":
+        real += "?ip=" + F2B_REASON_IP # TEST-NET-3, not banned: no jails
     elif path == "/ssl/csr/{domain}":
         form = {"countrycode": "US"}
     elif method == "POST":
@@ -4405,6 +4624,326 @@ def c_api_write_roundtrip(ctx):
     return "%s; users, aliases, custom records and privacy the same afterwards" % ", ".join(steps)
 
 
+def imap_works(ctx, user, pw):
+    M = ctx.net.imap()
+    try:
+        M.login(user, pw)
+    except imaplib.IMAP4.error:
+        return False
+    M.logout()
+    return True
+
+
+def roundcube_password_save(ctx, cookie, cur, new):
+    # Roundcube's Settings > Password: the form's token, then its POST; returns
+    # the text of the message that Roundcube shows.
+    r = http_req(ctx, "GET", "/mail/?_task=settings&_action=plugin.password", headers={"Cookie": cookie()})
+    m = re.search(r'name="_token" value="([^"]+)"', r.text())
+    _need(r.status == 200 and m, "Roundcube password page: HTTP %d, token %s" % (r.status, bool(m)))
+    r = http_req(ctx, "POST", "/mail/?_task=settings&_action=plugin.password-save", headers={"Cookie": cookie()}, form={
+        "_token": m.group(1), "_task": "settings", "_action": "plugin.password-save",
+        "_curpasswd": cur, "_newpasswd": new, "_confpasswd": new})
+    _need(r.status == 200, "Roundcube password save: HTTP %d" % r.status)
+    m = re.search(r'display_message\("((?:[^"\\]|\\.)*)","(confirmation|error)"', r.text())
+    return (m.group(2) + ": " + m.group(1)) if m else "(no message)"
+
+
+def c_api_self_password(ctx):
+    # POST /me/password (B210): a user changes their own password with the
+    # current one through Roundcube's Settings > Password (its driver calls
+    # the daemon on 127.0.0.1:10222): Roundcube's own message for a wrong
+    # current password, the change and the change back, the old password no
+    # longer working. nginx answers the endpoint from outside with 404 (its
+    # answers 403, 400 and 401 are in tests/fork/self-password.py).
+    if not ctx.user_pw or not ctx.admin_auth:
+        raise Skip("TEST_USER_PW or the admin session missing")
+    user = "smokepw-%s@%s" % (ctx.tok, ctx.domain)
+    pw3 = "Smk-%s" % uuid.uuid4().hex
+    SECRETS.add(pw3)
+    steps = []
+    api_expect(admin_api(ctx, "POST", "mail/users/add", form={"email": user, "password": ctx.user_pw}), 200, "text/html", "users/add")
+    try:
+        # The right current password, so that nothing is counted if nginx
+        # passed it on after all.
+        r = http_req(ctx, "POST", "/admin/me/password", auth=(user, ctx.user_pw), form={"password": pw3})
+        _need(r.status == 404, "from outside: HTTP %d, not 404" % r.status)
+        _need(imap_works(ctx, user, ctx.user_pw), "IMAP after the request from outside: the password changed")
+        steps.append("from outside 404")
+        _jar, cookie = roundcube_login(ctx, user)
+        msg = roundcube_password_save(ctx, cookie, "wrong-%s" % ctx.tok, pw3)
+        _need(msg.startswith("error:") and "incorrect" in msg.lower(), "Roundcube, wrong current password: %s" % msg)
+        msg = roundcube_password_save(ctx, cookie, ctx.user_pw, pw3)
+        _need(msg.startswith("confirmation:"), "Roundcube, change: %s" % msg)
+        _need(imap_works(ctx, user, pw3) and not imap_works(ctx, user, ctx.user_pw), "IMAP after the change in Roundcube: new or old password wrong")
+        msg = roundcube_password_save(ctx, cookie, pw3, ctx.user_pw)
+        _need(msg.startswith("confirmation:"), "Roundcube, change back: %s" % msg)
+        _need(imap_works(ctx, user, ctx.user_pw), "IMAP after the change back in Roundcube")
+        steps.append("Roundcube: wrong current refused, changed and back")
+    finally:
+        r = admin_api(ctx, "POST", "mail/users/remove", form={"email": user})
+        try:
+            mailbox = remove_test_mailbox(ctx, user)
+        except Exception as e:
+            mailbox = e
+        if ctx.remote.available():
+            # Roundcube's own record of the test user (its login made it).
+            cmd = ('root=$(sed -n "s/^STORAGE_ROOT=//p" /etc/mailinabox.conf | tail -n 1); '
+                   'sudo -n -u www-data sqlite3 "$root/mail/roundcube/roundcube.sqlite" %s'
+                   % shlex.quote("PRAGMA foreign_keys=ON; DELETE FROM users WHERE username='%s';" % user))
+            ctx.remote.run("bash -c %s" % shlex.quote(cmd), timeout=60)
+    api_expect(r, 200, "text/html", "users/remove")
+    if isinstance(mailbox, Exception):
+        raise mailbox
+    return "; ".join(steps) + "; user removed, " + mailbox
+
+
+AUTH_GUARD_SNIPPET = r'''
+import imaplib, json, ssl, sys, time
+spec = json.loads(sys.stdin.readline())
+# The box to itself on 127.0.0.1: its certificate names the host name (and
+# is self-signed in the lab); this tests the login, not the certificate.
+tls = ssl.create_default_context(); tls.check_hostname = False; tls.verify_mode = ssl.CERT_NONE
+class IMAP4_SSL_FROM(imaplib.IMAP4_SSL):
+    # IMAP over TLS from a chosen local address (127.0.0.0/8 counts as the box).
+    def __init__(self, host, port, src, **kw):
+        self._src = src
+        super().__init__(host, port, **kw)
+    def _create_socket(self, timeout):
+        import socket
+        sock = socket.create_connection((self.host, self.port), timeout, source_address=(self._src, 0) if self._src else None)
+        return self.ssl_context.wrap_socket(sock, server_hostname=self.host)
+def login(user, pw, src=None):
+    t = time.time()
+    try:
+        M = IMAP4_SSL_FROM("127.0.0.1", 993, src, ssl_context=tls, timeout=60)
+    except Exception as e:
+        return "connect: %s" % e, time.time() - t
+    try:
+        M.login(user, pw)
+        M.logout()
+        return "ok", time.time() - t
+    except imaplib.IMAP4.error as e:
+        return str(e), time.time() - t
+    finally:
+        try: M.shutdown()
+        except Exception: pass
+out = {}
+if spec.get("same"):
+    fails = 0
+    for i in range(spec["same"]):
+        r, _ = login(spec["user"], "old-%s" % spec["tok"])
+        fails += r != "ok"
+    out["same"] = fails
+if spec.get("wrong"):
+    t = time.time(); fails = 0
+    for i in range(spec["wrong"]):
+        # From changing addresses of 127.0.0.0/8: they all count as the box.
+        r, _ = login(spec["user"], "wrong-%s-%d" % (spec["tok"], i), "127.0.%d.%d" % (i // 200, 2 + i % 200))
+        fails += r != "ok"
+    out["wrong"] = [fails, round(time.time() - t, 2)]
+for name, user, pw in spec.get("right", []):
+    r, d = login(user, pw)
+    out[name] = [r[:120], round(d, 2)]
+print(json.dumps(out))
+'''
+
+
+def auth_guard_on_box(ctx, spec):
+    # Logins from 127.0.0.1 on the box (the passwords go through stdin, not
+    # the command line).
+    argv = ["bash", "-c", "python3 -c %s" % shlex.quote(AUTH_GUARD_SNIPPET)] if ctx.remote.spec == "local" else \
+        ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=20", ctx.remote.spec, "python3 -c %s" % shlex.quote(AUTH_GUARD_SNIPPET)]
+    p = subprocess.run(argv, input=json.dumps(spec) + "\n", capture_output=True, text=True, timeout=600)
+    if p.returncode != 0:
+        raise Fail("logins on the box: %s" % p.stderr.strip()[-300:])
+    return json.loads(p.stdout.strip().splitlines()[-1])
+
+
+def c_login_auth_guard(ctx):
+    # Dovecot's limit of failed logins from the box itself (B126,
+    # setup/mail-users.sh, conf/dovecot-auth-guard/, System > Intrusion
+    # Protection): 150 logins of one account with the same wrong password (a
+    # phone with an old one) count once and do not lock it. With the limit
+    # set to 5 through the API (it applies at once, no reload), 40 different
+    # wrong passwords of another account from changing addresses of
+    # 127.0.0.0/8 are answered at once
+    # (no 2 s delay each); that account is then refused from 127.0.0.1 even
+    # with its right password, while the first account logs in from there at
+    # once (no penalty of 127.0.0.1) and the refused one still logs in from
+    # outside; GET /system/auth-guard and auth_guard.py --status name it,
+    # POST /system/auth-guard/unlock ends the lock. The setting is restored.
+    if not ctx.remote.available():
+        raise Skip("needs --ssh")
+    if not ctx.user_pw or not ctx.admin_auth:
+        raise Skip("TEST_USER_PW or the admin session missing")
+    rc, miab, _err = ctx.remote.run("awk '$1 == \"cd\" { print $2; exit }' /usr/local/bin/mailinabox")
+    miab = miab.strip()
+    _need(rc == 0 and miab.startswith("/"), "the box's checkout not found")
+    tool = shlex.quote(miab + "/management/auth_guard.py")
+    victim = "smokeguard-%s@%s" % (ctx.tok, ctx.domain)
+    other = "smokeguardb-%s@%s" % (ctx.tok, ctx.domain)
+    steps = []
+    r = admin_api(ctx, "GET", "system/auth-guard")
+    api_expect(r, 200, "application/json", "GET system/auth-guard")
+    before = r.json()["settings"]
+    for u in (victim, other):
+        api_expect(admin_api(ctx, "POST", "mail/users/add", form={"email": u, "password": ctx.user_pw}), 200, "text/html", "users/add")
+    try:
+        r = auth_guard_on_box(ctx, {"user": other, "tok": ctx.tok, "same": 150, "right": [["other", other, ctx.user_pw]]})
+        _need(r["same"] == 150 and r["other"][0] == "ok", "150 times the same wrong password, then the right one: %s" % r)
+        steps.append("150 times the same wrong password: not locked")
+        r = admin_api(ctx, "POST", "system/auth-guard", form={"limit": "5", "window": "30", "span": "4"})
+        api_expect(r, 200, "application/json", "POST system/auth-guard")
+        _need(r.json()["settings"] == {"limit": 5, "window": 30, "span": 4}, "setting: %s" % r.text()[:200])
+        r = admin_api(ctx, "POST", "system/auth-guard", form={"span": "5"})
+        _need(r.status == 400, "span 5: HTTP %d, not 400" % r.status)
+        r = admin_api(ctx, "POST", "system/auth-guard", form={"limit": "2"})
+        _need(r.status == 400, "limit 2: HTTP %d, not 400" % r.status)
+        r = auth_guard_on_box(ctx, {"user": victim, "tok": ctx.tok, "wrong": 40})
+        fails, secs = r["wrong"]
+        _need(fails == 40, "%d of 40 wrong logins failed" % fails)
+        _need(secs < 30, "40 wrong logins from 127.0.0.1 took %.1f s (Dovecot's delay of 2 s each?)" % secs)
+        steps.append("limit 5 set; 40 different wrong from 127.0.0.1 in %.1f s" % secs)
+        r = auth_guard_on_box(ctx, {"right": [["victim", victim, ctx.user_pw], ["other", other, ctx.user_pw]]})
+        _need(r["victim"][0] != "ok" and "Too many failed logins" in r["victim"][0], "the account after 5 different wrong passwords, right password: %s" % r["victim"][0])
+        _need(r["other"][0] == "ok" and r["other"][1] < 3, "another account from 127.0.0.1: %s in %.1f s" % tuple(r["other"]))
+        steps.append("refused with its right password, another account in %.2f s" % r["other"][1])
+        _need(imap_works(ctx, victim, ctx.user_pw), "the refused account from outside: IMAP login failed")
+        steps.append("from outside ok")
+        st = admin_api(ctx, "GET", "system/auth-guard").json()
+        entry = [n for n in st["names"] if n["name"] == victim]
+        _need(entry and entry[0]["refused"] and entry[0]["account"] is True and entry[0]["failures"] >= 5,
+              "GET system/auth-guard: %s" % entry)
+        rc, out, err = ctx.remote.run(tool + " --status", sudo=True, timeout=120)
+        _need(rc == 0 and re.search(r"\b\d+\s+" + re.escape(victim) + r"\s+REFUSED", out), "--status: %s" % (out or err).strip()[:300])
+        r = admin_api(ctx, "POST", "system/auth-guard/unlock", form={"key": entry[0]["key"]})
+        api_expect(r, 200, "application/json", "POST system/auth-guard/unlock")
+        r = auth_guard_on_box(ctx, {"right": [["victim", victim, ctx.user_pw]]})
+        _need(r["victim"][0] == "ok", "after the unlock: %s" % r["victim"][0])
+        steps.append("the API and --status name it, the API's unlock ends the lock")
+    finally:
+        admin_api(ctx, "POST", "system/auth-guard", form={"limit": str(before["limit"]), "window": str(before["window"]), "span": str(before["span"])})
+        for u in (victim, other):
+            ctx.remote.run(tool + " --unlock " + shlex.quote(u), sudo=True, timeout=120)
+            admin_api(ctx, "POST", "mail/users/remove", form={"email": u})
+            try:
+                remove_test_mailbox(ctx, u)
+            except Exception:
+                pass
+    now = admin_api(ctx, "GET", "system/auth-guard").json()["settings"]
+    _need(now == before, "setting not restored: %s, before %s" % (now, before))
+    return "; ".join(steps) + "; setting restored, users removed"
+
+
+def c_send_limit(ctx):
+    # The sending limit of the box (B221, conf/send-limit/, management/
+    # send_limit.py, System > Intrusion Detection and Prevention): invalid
+    # values get 400; with 1 mail per hour set through the API (read at once),
+    # a first mail by SMTP AUTH on 587 goes out and a second is accepted too
+    # (no error for the sender) and put on hold; GET /system/send-limit lists
+    # it under "held" with its sender, POST /system/send-limit/held deletes it
+    # (the release service would send it at the limit). The minute is listed
+    # once the milter wrote it (at the next full minute). With the setting
+    # restored, a third mail goes out at once. The test mails go to the test
+    # account itself.
+    if not ctx.user_pw or not ctx.admin_auth:
+        raise Skip("TEST_USER_PW or the admin session missing")
+    r = admin_api(ctx, "GET", "system/send-limit")
+    api_expect(r, 200, "application/json", "GET system/send-limit")
+    before = r.json()["settings"]
+    _need(r.json().get("release_running") is True, "the release service miab-sendlimit-release does not run")
+    steps = []
+
+    def send(n):
+        s = ctx.net.smtp_starttls()
+        try:
+            s.login(ctx.alice, ctx.user_pw)
+            sid = "sendlimit-%s-%d" % (ctx.tok, n)
+            s.sendmail(ctx.alice, [ctx.alice], mkmsg(ctx.alice, ctx.alice, "send limit %d" % n, sid).encode())
+            return "ok"
+        except smtplib.SMTPResponseException as e:
+            return "%d %s" % (e.smtp_code, e.smtp_error.decode(errors="replace") if isinstance(e.smtp_error, bytes) else e.smtp_error)
+        finally:
+            try: s.quit()
+            except Exception: pass
+
+    def held_of_alice():
+        h = admin_api(ctx, "GET", "system/send-limit").json()["held"]
+        return [x for x in h["senders"] if x["sender"].lower() == ctx.alice.lower()]
+    try:
+        for form in ({"rate": "0"}, {"per": "3601"}, {"enabled": "maybe"}):
+            r = admin_api(ctx, "POST", "system/send-limit", form=form)
+            _need(r.status == 400, "%s: HTTP %d, not 400" % (form, r.status))
+        r = admin_api(ctx, "POST", "system/send-limit/held", form={"action": "bounce", "sender": ""})
+        _need(r.status == 400, "held action bounce: HTTP %d, not 400" % r.status)
+        steps.append("invalid values refused")
+        r = admin_api(ctx, "POST", "system/send-limit", form={"enabled": "1", "rate": "1", "per": "3600"})
+        api_expect(r, 200, "application/json", "POST system/send-limit")
+        got = r.json()["settings"]
+        _need({k: got.get(k) for k in ("enabled", "rate", "per", "stop")} == {"enabled": True, "rate": 1, "per": 3600, "stop": False},
+            "setting: %s" % r.text()[:200])
+        time.sleep(2) # the milter looks at its settings file once a second
+        first, second = send(1), send(2)
+        _need(first == "ok", "first mail with 1 per hour: %s" % first)
+        _need(second == "ok", "second mail with 1 per hour: %s (the sender must get no error, the mail is held)" % second)
+        deadline = time.time() + 20
+        while not held_of_alice():
+            _need(time.time() < deadline, "the second mail is not listed as held after 20 s")
+            time.sleep(2)
+        st = admin_api(ctx, "GET", "system/send-limit").json()
+        _need(st.get("brake", {}).get("on") is True, "the held mail did not set off the brake: %s" % st.get("brake"))
+        steps.append("1 per hour: both accepted, the second held, the brake on")
+        r = admin_api(ctx, "POST", "system/send-limit/held", form={"action": "delete", "sender": held_of_alice()[0]["sender"]})
+        api_expect(r, 200, "application/json", "POST system/send-limit/held")
+        _need(r.json().get("mails", 0) >= 1, "delete: %s" % r.text()[:200])
+        deadline = time.time() + 20
+        while held_of_alice():
+            _need(time.time() < deadline, "the held mail is still listed 20 s after it was deleted")
+            time.sleep(2)
+        steps.append("deleted through the API")
+        r = admin_api(ctx, "POST", "system/send-limit/held", form={"action": "end", "sender": ""})
+        api_expect(r, 200, "application/json", "POST system/send-limit/held end")
+        deadline = time.time() + 15
+        while admin_api(ctx, "GET", "system/send-limit").json()["brake"]["on"]:
+            _need(time.time() < deadline, "the brake is still on 15 s after it was ended")
+            time.sleep(2)
+        steps.append("brake ended through the API")
+        deadline = time.time() + 75
+        while True:
+            day = admin_api(ctx, "GET", "system/send-limit").json()["day"]
+            if day["held"] >= 1 and any(x["sender"].lower() == ctx.alice.lower() for x in day["senders"]):
+                break
+            _need(time.time() < deadline, "GET system/send-limit does not list the held mail's minute after 75 s: %s" % day)
+            time.sleep(5)
+        steps.append("its minute listed with its sender")
+    finally:
+        admin_api(ctx, "POST", "system/send-limit", form={"enabled": "1" if before["enabled"] else "0", "rate": str(before["rate"]), "per": str(before["per"]),
+                                                           "stop": "1" if before["stop"] else "0", "brake_rate": str(before["brake_rate"]),
+                                                           "brake_per": str(before["brake_per"]), "calm": str(before["calm"]),
+                                                           "long_enabled": "1" if before["long_enabled"] else "0",
+                                                           "long_rate": str(before["long_rate"]), "long_per": str(before["long_per"])})
+        # Never leave the box braked (later checks send mail): delete what the
+        # test left held and end the brake.
+        for x in admin_api(ctx, "GET", "system/send-limit").json()["held"]["senders"]:
+            if x["sender"].lower() == ctx.alice.lower():
+                admin_api(ctx, "POST", "system/send-limit/held", form={"action": "delete", "sender": x["sender"]})
+        admin_api(ctx, "POST", "system/send-limit/held", form={"action": "end", "sender": ""})
+    time.sleep(2)
+    third = send(3)
+    _need(third == "ok", "a mail after the setting was restored: %s" % third)
+    # Accepted is not enough (held mail is accepted too): it must not be
+    # held, and the brake must stay off.
+    deadline = time.time() + 10
+    while time.time() < deadline:
+        st = admin_api(ctx, "GET", "system/send-limit").json()
+        _need(not held_of_alice(), "the mail after the setting was restored was put on hold")
+        _need(not st["brake"]["on"], "the mail after the setting was restored set off the brake")
+        time.sleep(2)
+    now = admin_api(ctx, "GET", "system/send-limit").json()["settings"]
+    _need(now == before, "setting not restored: %s, before %s" % (now, before))
+    return "; ".join(steps) + "; setting restored, the next mail goes out"
+
+
 def munin_conf_contact(ctx):
     # (contact lines before the host tree, "contacts" of the host tree)
     rc, out, err = ctx.remote.run("cat /etc/munin/munin.conf", sudo=True, timeout=60)
@@ -4524,6 +5063,96 @@ def c_api_munin_alerts(ctx):
     after = admin_api(ctx, "GET", "system/munin/alerts").json()
     if after != orig:
         raise Fail("setting not restored: %s" % [k for k in orig if orig.get(k) != after.get(k)])
+    if conf0 and munin_conf_contact(ctx)[2] != conf0[2]:
+        raise Fail("munin.conf not restored byte for byte")
+    notes.append("setting%s restored" % (" and munin.conf" if conf0 else ""))
+    return "; ".join(notes)
+
+
+def notif_set(ctx, form, what):
+    r = admin_api(ctx, "POST", "system/notifications", form=form)
+    api_expect(r, 200, "application/json", what)
+    j = r.json()
+    _need(j.get("status") == "ok", "%s: %s" % (what, r.text()[:150]))
+    return j
+
+
+def c_api_notifications(ctx):
+    # System > Notifications: invalid input refused, the reports to a test
+    # mailbox (alice, with TEST_USER_PW) with Munin's standard recipient
+    # following (munin.conf with --ssh), the test mail in that INBOX and in
+    # the list of deliveries, and the old setting and munin.conf restored.
+    r = admin_api(ctx, "GET", "system/notifications")
+    api_expect(r, 200, "application/json", "GET notifications")
+    orig = r.json()
+    keep = {"recipient": orig["recipient"], "address": orig["address"]}
+    conf0 = munin_conf_contact(ctx) if ctx.remote.available() else None
+    munin0 = admin_api(ctx, "GET", "system/munin/alerts").json()
+    notes = []
+    try:
+        for bad in ({"recipient": "custom", "address": "a@b.example\nBcc: x@example.com"},
+                    {"recipient": "custom", "address": "-oQ/tmp/x@example.com"},
+                    {"recipient": "custom", "address": "a b@example.com"},
+                    {"recipient": "custom", "address": "$(id)@example.com"},
+                    {"recipient": "custom", "address": ""},
+                    {"recipient": "everyone"}):
+            r = admin_api(ctx, "POST", "system/notifications", form=bad)
+            _need(r.status == 400, "invalid %r accepted: HTTP %d" % (bad, r.status))
+        now = admin_api(ctx, "GET", "system/notifications").json()
+        _need({k: now[k] for k in keep} == keep, "a refused value changed the setting")
+        notes.append("6 invalid values refused")
+
+        users = admin_api(ctx, "GET", "mail/users").text().split("\n")
+        if not (ctx.user_pw and ctx.alice in users):
+            raise Skip("needs the test mailbox %s (TEST_USER_PW)" % ctx.alice)
+        target = ctx.alice
+        j = notif_set(ctx, {"recipient": "custom", "address": target}, "set custom")
+        _need(j["to"] == target and [t["address"] for t in j["targets"]] == [target], "custom: to=%s targets=%s" % (j["to"], j["targets"]))
+        m = admin_api(ctx, "GET", "system/munin/alerts").json()
+        if munin0.get("recipient") == "admin":
+            _need(m.get("to") == target and m.get("default_address") == target, "munin does not follow: %s" % m.get("to"))
+            if conf0:
+                contact, _, _ = munin_conf_contact(ctx)
+                _need("contact.admin.command %s --to %s" % (MUNIN_NOTIFY, target) in contact, "munin.conf: %s" % contact[:1])
+            notes.append("Munin's standard recipient follows")
+        M = imap_login(ctx, target)
+        try:
+            uidnext = folder_status(M, "INBOX")["uidnext"]
+        finally:
+            M.logout()
+        r = admin_api(ctx, "POST", "system/notifications/test")
+        api_expect(r, 200, "application/json", "test mail")
+        _need(r.json().get("to") == target, "test mail to %s" % r.json().get("to"))
+        deadline = time.time() + 90
+        while True:
+            M = imap_login(ctx, target)
+            try:
+                uids = uid_search(M, "INBOX", "UID", "%d:*" % uidnext, "SUBJECT", '"Test of the administrator mail"',
+                                  "HEADER", TEST_HEADER, "1", readonly=False)
+                uids = [u for u in uids if int(u) >= uidnext]
+                if uids:
+                    typ, data = M.uid("FETCH", uids[-1].decode(), "(BODY.PEEK[HEADER])")
+                    msg = parse_mail(data[0][1])
+                    M.uid("STORE", b",".join(uids).decode(), "+FLAGS.SILENT", "(\\Deleted)")
+                    M.expunge()
+                    break
+            finally:
+                M.logout()
+            if time.time() > deadline:
+                raise Fail("no test mail in %s's INBOX after 90 s" % target)
+            time.sleep(5)
+        _need(len(uids) == 1, "%d test mails arrived" % len(uids))
+        _need("administrator@" + ctx.hostname in msg.get("From", ""), "test mail From: %s" % msg.get("From"))
+        _need(msg.get("Auto-Submitted") == "auto-generated", "test mail without Auto-Submitted")
+        d = admin_api(ctx, "GET", "system/notifications").json()["deliveries"]
+        _need(any(x["to"] == target and x["status"] == "sent" for x in d), "test mail not in the deliveries")
+        notes.append("test mail arrived in %s's INBOX (deleted) and is listed" % target.split("@")[0])
+    finally:
+        r = admin_api(ctx, "POST", "system/notifications", form=keep)
+    api_expect(r, 200, "application/json", "restore")
+    after = admin_api(ctx, "GET", "system/notifications").json()
+    if {k: after[k] for k in keep} != keep:
+        raise Fail("setting not restored")
     if conf0 and munin_conf_contact(ctx)[2] != conf0[2]:
         raise Fail("munin.conf not restored byte for byte")
     notes.append("setting%s restored" % (" and munin.conf" if conf0 else ""))
@@ -4662,6 +5291,7 @@ def main():
         run_check("tls-key-exchange", c_tls_key_exchange, ctx)
         run_check("mail-log-logins", c_mail_log_logins, ctx)
         run_check("services-enabled", c_services_enabled, ctx)
+        run_check("login-auth-guard", c_login_auth_guard, ctx)
     if want("migrated"):
         print("== migrated (manifest comparison, before new mail)")
         run_check("mig-users-aliases", c_mig_users_aliases, ctx)
@@ -4681,6 +5311,7 @@ def main():
         run_check("admin-backup-status", c_backup_status, ctx)
         run_check("admin-backup-saved", c_backup_saved, ctx)
         run_check("admin-fail2ban-status", c_fail2ban_api, ctx)
+        run_check("admin-fail2ban-bans", c_fail2ban_bans_api, ctx)
         run_check("admin-fail2ban-settings", c_fail2ban_settings_roundtrip, ctx)
         run_check("admin-fail2ban-report", c_fail2ban_report, ctx)
         run_check("admin-fail2ban-filters", c_fail2ban_filters, ctx)
@@ -4694,7 +5325,21 @@ def main():
         run_check("admin-nextcloud-setup-no-drift", c_nc_setup_no_drift, ctx)
         run_check("admin-nextcloud-hand-set", c_nc_hand_set, ctx)
         run_check("admin-ban-reasons-masking", c_local_test, ctx, "ban-reasons.py")
+        run_check("admin-ban-list-unit", c_local_test, ctx, "ban-list.py")
+        run_check("admin-cloud-relays-unit", c_local_test, ctx, "cloud-relays.py")
         run_check("admin-nextcloud-throttle-unit", c_local_test, ctx, "nextcloud-throttle.py")
+        run_check("admin-notifications-unit", c_local_test, ctx, "admin-mail.py")
+        run_check("admin-status-changes-unit", c_local_test, ctx, "status-changes.py")
+        run_check("admin-status-dns-unit", c_local_test, ctx, "status-dns.py")
+        run_check("admin-panel-fragments", c_local_test, ctx, "panel-fragments.py")
+        run_check("admin-self-password-unit", c_local_test, ctx, "self-password.py")
+        run_check("admin-migration-record-unit", c_local_test, ctx, "migration-record.py")
+        run_check("admin-storage-dirs-unit", c_local_test, ctx, "storage-dirs.py")
+        run_check("admin-auth-guard-unit", c_local_test, ctx, "auth-guard.py")
+        run_check("admin-send-limit", c_send_limit, ctx)
+        run_check("admin-send-limit-unit", c_local_test, ctx, "send-limit.py")
+        run_check("admin-panel-assets", c_panel_assets, ctx)
+        run_check("admin-panel-assets-unit", c_local_test, ctx, "panel-assets.py")
         run_check("admin-nextcloud-app-versions", c_nc_app_versions, ctx)
         run_check("admin-nextcloud-backup-private", c_nc_backup_private, ctx)
     if want("api"):
@@ -4702,7 +5347,9 @@ def main():
         run_check("api-auth", c_api_auth, ctx)
         run_check("api-read-only", c_api_read_only, ctx)
         run_check("api-write-roundtrip", c_api_write_roundtrip, ctx)
+        run_check("api-self-password", c_api_self_password, ctx)
         run_check("api-munin-alerts", c_api_munin_alerts, ctx)
+        run_check("api-notifications", c_api_notifications, ctx)
     if want("admin") or want("api"):
         run_check("admin-journal-no-hash", c_admin_journal_no_hash, ctx)
     if want("dns"):
@@ -4716,6 +5363,8 @@ def main():
     if want("web"):
         print("== web")
         run_check("nextcloud-status", c_nc_status, ctx)
+        run_check("web-hsts-admin", c_web_hsts_admin, ctx)
+        run_check("web-nginx-hsts-unit", c_local_test, ctx, "nginx-hsts.py")
         run_check("nextcloud-caldav-propfind", c_nc_dav, ctx, "caldav")
         run_check("nextcloud-carddav-propfind", c_nc_dav, ctx, "carddav")
         run_check("nextcloud-webdav-propfind", c_nc_dav, ctx, "webdav")
@@ -4730,6 +5379,7 @@ def main():
         print("== activesync (calendars and contacts through Z-Push and Nextcloud)")
         run_check("nextcloud-bruteforce-loopback", c_nc_bruteforce_loopback, ctx)
         run_check("nextcloud-forwarded-for", c_nc_forwarded_for, ctx)
+        run_check("nextcloud-forwarded-for-local", c_nc_forwarded_for_local, ctx)
         run_check("zpush-sync", c_zpush_sync, ctx)
         run_check("zpush-ping", c_zpush_ping, ctx)
         run_check("zpush-patches", c_zpush_patches, ctx)

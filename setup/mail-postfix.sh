@@ -42,7 +42,7 @@ source /etc/mailinabox.conf # load global vars
 # * `ca-certificates`: A trust store used to squelch postfix warnings about
 #   untrusted opportunistically-encrypted connections.
 echo "Installing Postfix (SMTP server)..."
-apt_install postfix postfix-sqlite postfix-pcre postgrey ca-certificates
+apt_install postfix postfix-sqlite postfix-pcre postgrey ca-certificates python3-milter
 
 # The listen settings as they were before this run: Postfix needs a restart
 # (not a reload) only when they change, see the end of this file.
@@ -64,6 +64,16 @@ tools/editconf.py /etc/postfix/main.cf \
 	myhostname="$PRIMARY_HOSTNAME"\
 	smtpd_banner="\$myhostname ESMTP Hi, I'm a Mail-in-a-Box (Ubuntu 26.04 fork/Postfix; see https://github.com/LM1337/Mail-in-a-box-26)" \
 	mydestination=localhost
+
+# When a new process of a service exits before it served its first client,
+# Postfix's master starts no new one for service_throttle_time (default
+# 60 s). A submission process does so when it cannot reach Dovecot's auth
+# socket, which happens for a moment at each restart of Dovecot (setup, a
+# package update, a reboot): the mail programs of the users then got no
+# answer on ports 465 and 587 for a minute (B224). 10 s still keeps a
+# service that is really broken from being started again and again.
+tools/editconf.py /etc/postfix/main.cf \
+	service_throttle_time=10s
 
 # Tweak some queue settings:
 # * Inform users when their e-mail delivery is delayed more than 3 hours (default is not to warn).
@@ -87,13 +97,48 @@ tools/editconf.py /etc/postfix/main.cf \
 
 # ### Outgoing Mail
 
+# The sending limit of the box (fork, B221): the milter conf/send-limit/sendlimit-milter.py
+# (package python3-milter, universe) lets at most a number of mails within a
+# number of seconds go out (default 30 in 1 s, each recipient counts as one),
+# of all mail sent through the submission ports 465/587 (mail programs,
+# Roundcube), through sendmail (Z-Push, Nextcloud, Sieve redirects, cron) and
+# by SMTP from the box itself (127.0.0.0/8, ::1 on port 25). Mail that other
+# servers send to the box is not counted. A mail that does not fit is
+# accepted and put on hold; conf/send-limit/sendlimit-release.py (service
+# miab-sendlimit-release, root) releases the held mails at the limit, the
+# senders in turn. Without the release service the milter holds nothing: a
+# mail waits at most 60 s and is then deferred (4.7.1). The limit is set in
+# System > Intrusion Detection and Prevention (management/send_limit.py
+# writes the settings file, which both read again when it changes); the cron
+# job of setup/management.sh mails the minutes in which mail waited or was
+# held to the administrator. The milter runs as a dynamic user, its state in
+# /var/lib/miab-sendlimit; when it does not answer, Postfix refuses the mail
+# with a temporary error instead of passing it on without a limit
+# (default_action tempfail for this milter only, dkim.sh). Both are started
+# before the milter
+# is added to Postfix, and restarted only when their program, unit or
+# package changed.
+install -d -m 0755 -o root -g root /usr/local/lib/mailinabox/miab-sendlimit
+for f in sendlimit_common.py sendlimit-milter.py sendlimit-release.py; do
+	install -m 0755 -o root -g root conf/send-limit/$f /usr/local/lib/mailinabox/miab-sendlimit/$f
+done
+install_unit miab-sendlimit.service
+install_unit miab-sendlimit-release.service
+restart_on_change miab-sendlimit "python3-milter libmilter1.0.1" /usr/local/lib/mailinabox/miab-sendlimit/sendlimit-milter.py \
+	/usr/local/lib/mailinabox/miab-sendlimit/sendlimit_common.py /lib/systemd/system/miab-sendlimit.service
+restart_on_change miab-sendlimit-release "" /usr/local/lib/mailinabox/miab-sendlimit/sendlimit-release.py \
+	/usr/local/lib/mailinabox/miab-sendlimit/sendlimit_common.py /lib/systemd/system/miab-sendlimit-release.service
+
 # Enable the 'submission' ports 465 and 587 and tweak their settings.
 #
 # * Enable authentication. It's disabled globally so that it is disabled on port 25,
 #   so we need to explicitly enable it here.
 # * Do not add the OpenDMAC Authentication-Results header. That should only be added
 #   on incoming mail. Omit the OpenDMARC milter by re-setting smtpd_milters to the
-#   OpenDKIM milter only. See dkim.sh.
+#   OpenDKIM milter and the sending limit (above) only ($sendlimit_submission_milters,
+#   the sending limit with default_action tempfail, so that it fails closed), and
+#   smtpd_milter_maps (port 25's milters for mail from the box itself) to none.
+#   See dkim.sh.
 # * Even though we dont allow auth over non-TLS connections (smtpd_tls_auth_only below, and without auth the client cant
 #   send outbound mail), don't allow non-TLS mail submission on this port anyway to prevent accidental misconfiguration.
 #   Setting smtpd_tls_security_level=encrypt also triggers the use of the 'mandatory' settings below (but this is ignored with smtpd_tls_wrappermode=yes.)
@@ -102,22 +147,61 @@ tools/editconf.py /etc/postfix/main.cf \
 #   that filters out privacy-sensitive headers on mail being sent out by
 #   authenticated users.  By default Postfix also applies this to attached
 #   emails but we turn this off by setting nested_header_checks empty.
+# Without the sending limit when it is turned off (see dkim.sh).
+if grep -qx 'enabled 0' /usr/local/lib/mailinabox/miab-sendlimit/settings 2> /dev/null; then
+	tools/editconf.py /etc/postfix/main.cf "sendlimit_submission_milters=inet:127.0.0.1:8891"
+else
+	tools/editconf.py /etc/postfix/main.cf \
+		"sendlimit_submission_milters=inet:127.0.0.1:8891 { inet:127.0.0.1:8895, default_action=tempfail }"
+fi
 tools/editconf.py /etc/postfix/master.cf -s -w \
 	"smtps=inet n       -       -       -       -       smtpd
 	  -o smtpd_tls_wrappermode=yes
 	  -o smtpd_sasl_auth_enable=yes
 	  -o syslog_name=postfix/submission
-	  -o smtpd_milters=inet:127.0.0.1:8891
+	  -o smtpd_milters=\$sendlimit_submission_milters
+	  -o smtpd_milter_maps=
 	  -o cleanup_service_name=authclean" \
 	"submission=inet n       -       -       -       -       smtpd
 	  -o smtpd_sasl_auth_enable=yes
 	  -o syslog_name=postfix/submission
-	  -o smtpd_milters=inet:127.0.0.1:8891
+	  -o smtpd_milters=\$sendlimit_submission_milters
+	  -o smtpd_milter_maps=
 	  -o smtpd_tls_security_level=encrypt
 	  -o cleanup_service_name=authclean" \
 	"authclean=unix  n       -       -       -       0       cleanup
 	  -o header_checks=pcre:/etc/postfix/outgoing_mail_header_filters
 	  -o nested_header_checks="
+
+# The listener of the box's own reports (fork, B221): management/email_administrator.py
+# and admin_mail.py send the status checks, backup and TLS reports, the
+# usage report and the mails of the guard and of the sending limit to
+# 127.0.0.1:10587, which does not pass the milter of the sending limit: that
+# milter fails closed (dkim.sh), and the mail that says it is down must still
+# reach the administrator. It takes mail only to administrator@ and the report
+# recipient (the table written by management/send_limit.py --apply; a first
+# one with administrator@ here), only from the box itself, and at most 20
+# mails and 20 recipients a minute (no exception for mynetworks), so that a
+# process on the box cannot use it to send mail elsewhere or many mails.
+# OpenDKIM signs it as before.
+if [ ! -f /etc/postfix/sendlimit-admin-recipients ]; then
+	printf '# Mail-in-a-Box --- written again by management/send_limit.py --apply.\nadministrator@%s\tOK\n' "$PRIMARY_HOSTNAME" \
+		| tools/write_conf.py /etc/postfix/sendlimit-admin-recipients
+fi
+tools/editconf.py /etc/postfix/master.cf -s -w \
+	"127.0.0.1:10587=inet n       -       -       -       -       smtpd
+	  -o syslog_name=postfix/adminmail
+	  -o smtpd_milters=inet:127.0.0.1:8891
+	  -o smtpd_milter_maps=
+	  -o smtpd_client_restrictions=permit_mynetworks,reject
+	  -o smtpd_helo_restrictions=
+	  -o smtpd_sender_restrictions=
+	  -o smtpd_relay_restrictions=check_recipient_access,texthash:/etc/postfix/sendlimit-admin-recipients,reject
+	  -o smtpd_recipient_restrictions=check_recipient_access,texthash:/etc/postfix/sendlimit-admin-recipients,reject
+	  -o smtpd_client_message_rate_limit=20
+	  -o smtpd_client_recipient_rate_limit=20
+	  -o smtpd_client_event_limit_exceptions=
+	  -o smtpd_tls_security_level=none"
 
 # Install the `outgoing_mail_header_filters` file required by the new 'authclean' service.
 cp conf/postfix_outgoing_mail_header_filters /etc/postfix/outgoing_mail_header_filters
@@ -406,4 +490,6 @@ if [ "$(postconf -h inet_interfaces inet_protocols)" != "$postfix_listen_before"
 else
 	reload_postfix
 fi
-restart_service postgrey
+# Its Perl modules (Net::Server) are read, not mapped: their updates count too.
+restart_on_change postgrey "postgrey libnet-server-perl" /etc/default/postgrey tree:/etc/postgrey \
+	tree:/etc/systemd/system/postgrey.service.d

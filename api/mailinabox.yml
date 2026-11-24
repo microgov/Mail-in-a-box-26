@@ -12,7 +12,7 @@ info:
 
     Requests without valid administrator credentials get `401 Unauthorized`, or `403 Forbidden` when they are sent with `X-Requested-With: XMLHttpRequest` as the control panel does. Each request with wrong credentials counts as a failed login for fail2ban.
 
-    The Ubuntu 26.04 fork adds the endpoints for the intrusion protection (`/system/fail2ban...`), Munin's alerts (`/system/munin/alerts...`) and documents the quota endpoints (`/mail/users/quota`) and the Munin session (`/munin/`). `tests/fork/api-routes.py` checks that this file and the routes of `management/daemon.py` agree.
+    The Ubuntu 26.04 fork adds the endpoints for the intrusion detection and prevention (`/system/fail2ban...`), Munin's alerts (`/system/munin/alerts...`), the notifications (`/system/notifications...`), Dovecot's limit of failed logins from the box itself (`/system/auth-guard...`) and documents the quota endpoints (`/mail/users/quota`) and the Munin session (`/munin/`). `tests/fork/api-routes.py` checks that this file and the routes of `management/daemon.py` agree.
   contact:
     name: Mail-in-a-Box support
     url: https://mailinabox.email/
@@ -153,6 +153,81 @@ paths:
                     privileges:
                       - admin
                     status: ok
+  /me/password:
+    post:
+      tags:
+        - User
+      summary: Change the password of the calling user.
+      description: |
+        A mail user changes their own password. Authenticate with HTTP Basic
+        authentication as `email:current password` (as for `/login`); a user with
+        two-factor authentication also sends the current code in the `x-auth-token`
+        header, as for `/login`. Session API keys and the system API key are not
+        accepted: only the password of the account whose current password was given
+        is changed. The new password must meet the same rules as for
+        `/mail/users/password`.
+
+        Roundcube's password plugin uses this (the fork's driver calls the management
+        daemon on 127.0.0.1), so that the web server's account needs no access to the
+        user database. Only on 127.0.0.1:10222: nginx answers `/admin/me/password`
+        with 404. A wrong current password is logged as a failed login (the
+        `miab-management` jail of fail2ban); after 5 failures for an account that
+        exists or 10 for a client address within 10 minutes, further attempts are
+        refused with 429 for the rest of that time.
+      operationId: changeOwnPassword
+      requestBody:
+        required: true
+        content:
+          application/x-www-form-urlencoded:
+            schema:
+              $ref: '#/components/schemas/ChangeOwnPasswordRequest'
+            example:
+              password: s3curE_pa5Sw0rD
+      x-codeSamples:
+        - lang: curl
+          source: |
+            curl -X POST "https://{host}/admin/me/password" \
+              -d "password=<new password>" \
+              -u "<email>:<current password>"
+      responses:
+        200:
+          description: The password was changed.
+          content:
+            text/plain:
+              schema:
+                type: string
+              example: OK
+        400:
+          description: The new password was refused.
+          content:
+            text/plain:
+              schema:
+                type: string
+              example: Passwords must be at least eight characters.
+        401:
+          description: No email address and current password were given.
+          content:
+            text/plain:
+              schema:
+                type: string
+              example: Give the email address and the current password (HTTP Basic authentication).
+        403:
+          description: |
+            The email address or the current password is wrong, the two-factor code is
+            not valid, or the account uses two-factor authentication and no code was
+            given.
+          content:
+            text/plain:
+              schema:
+                type: string
+              example: Incorrect email address or password.
+        429:
+          description: Too many failed attempts for the account or the client address.
+          content:
+            text/plain:
+              schema:
+                type: string
+              example: Too many failed attempts. Try again in a few minutes.
   /system/status:
     post:
       tags:
@@ -1927,18 +2002,27 @@ paths:
     get:
       tags:
         - System
-      summary: Get the status of the intrusion protection
+      summary: Get the status of the intrusion detection and prevention
       description: |
-        Returns the status of fail2ban (fork: adaptive fail2ban): its jails with
-        their counters and current bans, the settings, their defaults and
-        limits, whether the written jail files match the settings, and the
-        address of the calling client (for the allowlist hint of the control
-        panel). Each ban has a `reason`: the failures and the log lines that
-        fail2ban kept for it (user names that are no account of the box
-        replaced), the accounts of the box they name, and `manual` for a ban
-        without lines. `jail_info` gives each jail's thresholds and what it
-        watches. With fail2ban not running, `running` is false and `error` says
-        why.
+        Returns the overview of fail2ban (fork: adaptive fail2ban): its jails
+        with their counters (`banned_count`: the addresses the jail bans now),
+        how many addresses and bans there are, `top_networks` (the IPv4 /24
+        and IPv6 /64 networks with the most banned addresses, at least two,
+        up to 10, with their jails), the settings, their defaults and limits,
+        whether the written jail files match the settings, and the address of
+        the calling client (for the allowlist hint of the control panel) with
+        the jails that ban it (`banned_in`). The bans themselves are not
+        listed here (they can be thousands): `GET /system/fail2ban/bans` gives
+        them page by page, `GET /system/fail2ban/ban-reason` why an address is
+        banned. `jail_info` gives each jail's thresholds and what it
+        watches. `relays` names the banned addresses that are in Microsoft's
+        published IP ranges of Exchange Online, through which Outlook for iOS
+        and Android syncs Exchange ActiveSync accounts (the list shipped in
+        `conf/fail2ban/microsoft-relays.txt`; `relays_source` says its version
+        and date), with the network that the control panel offers for the
+        allowlist and the address's PTR name only when it resolves back to the
+        address (nothing is put on the allowlist by this call). With fail2ban
+        not running, `running` is false and `error` says why.
       operationId: getFail2banStatus
       x-codeSamples:
         - lang: curl
@@ -1956,11 +2040,136 @@ paths:
           $ref: '#/components/responses/Unauthorized'
         403:
           $ref: '#/components/responses/Forbidden'
+  /system/fail2ban/bans:
+    get:
+      tags:
+        - System
+      summary: Get one page of the banned addresses
+      description: |
+        Returns the addresses that fail2ban bans now, newest ban first (ties
+        by address), each with its bans per jail (start, ban time, end,
+        remaining seconds; `end` and `remaining` are null for a permanent ban)
+        and, for an address in Microsoft's published ranges of Exchange
+        Online, its `relay` hint (without the PTR name, which
+        `GET /system/fail2ban` gives). `total` counts all banned addresses,
+        `matched` those that match the filter. No log lines: see
+        `GET /system/fail2ban/ban-reason`. With fail2ban not running,
+        `running` is false and `error` says why.
+      operationId: getFail2banBans
+      parameters:
+        - name: filter
+          in: query
+          required: false
+          description: |
+            Part of an address or of a jail's name (case does not matter), or
+            a network in CIDR notation (`192.0.2.0/24`, `2001:db8::/48`; host
+            bits are ignored). Up to 64 letters, digits and `:` `.` `_` `/`
+            `-`.
+          schema:
+            type: string
+          example: 192.0.2.0/24
+        - name: offset
+          in: query
+          required: false
+          description: The number of matching addresses to skip (0 to 10000000).
+          schema:
+            type: integer
+            minimum: 0
+            maximum: 10000000
+            default: 0
+        - name: limit
+          in: query
+          required: false
+          description: The number of addresses to return (1 to 200).
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 200
+            default: 50
+      x-codeSamples:
+        - lang: curl
+          source: |
+            curl -X GET "https://{host}/admin/system/fail2ban/bans?filter=recidive&offset=0&limit=50" \
+              -u "<email>:<password>"
+      responses:
+        200:
+          description: Successful operation
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Fail2banBansResponse'
+        400:
+          description: Invalid filter, offset or limit
+          content:
+            text/html:
+              schema:
+                type: string
+        500:
+          description: fail2ban answered with something unexpected
+          content:
+            text/html:
+              schema:
+                type: string
+        401:
+          $ref: '#/components/responses/Unauthorized'
+        403:
+          $ref: '#/components/responses/Forbidden'
+  /system/fail2ban/ban-reason:
+    get:
+      tags:
+        - System
+      summary: Get why an address is banned
+      description: |
+        Returns, for each jail that bans `ip` now, the reason of its newest
+        ban there: the failures and the log lines that fail2ban kept for it
+        (user names that are no account of the box replaced), the accounts
+        of the box they name, and `manual` for a ban without lines (`reason`
+        is null when fail2ban's database has no row of it), with the jail's
+        rule (thresholds and what it watches and blocks). An address that is
+        not banned gives an empty list. When fail2ban's database cannot be
+        read, `error` says why.
+      operationId: getFail2banBanReason
+      parameters:
+        - name: ip
+          in: query
+          required: true
+          description: A single IP address.
+          schema:
+            type: string
+          example: 192.0.2.5
+      x-codeSamples:
+        - lang: curl
+          source: |
+            curl -X GET "https://{host}/admin/system/fail2ban/ban-reason?ip=<address>" \
+              -u "<email>:<password>"
+      responses:
+        200:
+          description: Successful operation
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Fail2banBanReasonResponse'
+        400:
+          description: Not an address
+          content:
+            text/html:
+              schema:
+                type: string
+        500:
+          description: fail2ban failed
+          content:
+            text/html:
+              schema:
+                type: string
+        401:
+          $ref: '#/components/responses/Unauthorized'
+        403:
+          $ref: '#/components/responses/Forbidden'
   /system/fail2ban/settings:
     get:
       tags:
         - System
-      summary: Get the intrusion protection settings
+      summary: Get the intrusion detection and prevention settings
       description: Returns the settings of the adaptive fail2ban, their defaults and warnings about stored values that were replaced.
       operationId: getFail2banSettings
       x-codeSamples:
@@ -1982,9 +2191,9 @@ paths:
     post:
       tags:
         - System
-      summary: Change the intrusion protection settings
+      summary: Change the intrusion detection and prevention settings
       description: |
-        Form fields named like the settings (`adaptive`, `bantime_max`,
+        Form fields named like the settings (`enabled`, `adaptive`, `bantime_max`,
         `memory`, `slow_jails`, `slow_web_jails`, `slow_maxretry`,
         `slow_findtime`, `slow_bantime`, `allowlist`, `spray_min_ips`, `jails`,
         `nc_protection`, `nc_max_attempts`, `nc_allowlist`); fields that are
@@ -2430,6 +2639,516 @@ paths:
           $ref: '#/components/responses/Unauthorized'
         403:
           $ref: '#/components/responses/Forbidden'
+  /system/send-limit:
+    get:
+      tags:
+        - System
+      summary: Get the sending limit of the box
+      description: |
+        All mail that the users and the box itself send (SMTP with login on
+        ports 465 and 587, and sendmail: ActiveSync, Nextcloud, Sieve
+        redirects, programs on the box, and SMTP from 127.0.0.1 and ::1)
+        passes a milter that lets at most
+        `rate` mails within `per` seconds go out; each recipient counts as one
+        mail. The first mail that does not fit sets off the brake (`brake`):
+        all counted mail is accepted and put on hold, the administrator is
+        mailed, and the release service (`release_running`) sends held mail
+        only at `brake_rate` mails in `brake_per` seconds, the senders in turn
+        (`held`: by sender, most recipients first), or nothing until the brake
+        is ended (`stop`). Without the stop the brake ends by itself after
+        `calm` minutes without held mail and without more mail than the
+        limit. The box's mail to administrator@ and to the report recipient
+        alone is never held. Without the release service nothing is held: an
+        SMTP mail waits at most 20 seconds (sendmail 60) and is then deferred
+        with a temporary error (4.7.1). Mail that other servers send to the
+        box is not counted. Returns the setting (`settings`, only values that differ from
+        `defaults` are stored), the values the milter uses now (`applied`),
+        the allowed `ranges`, whether the milter runs (`running`, null when
+        unknown), and the minutes of the last 24 hours in which mail had to
+        wait (`events`, newest first, at most 200; `more` counts the rest;
+        `day` sums them up).
+      operationId: getSendLimit
+      x-codeSamples:
+        - lang: curl
+          source: |
+            curl -X GET "https://{host}/admin/system/send-limit" \
+              -u "<email>:<password>"
+      responses:
+        200:
+          description: Successful operation
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SendLimitResponse'
+        500:
+          description: The state could not be read
+          content:
+            text/html:
+              schema:
+                type: string
+        401:
+          $ref: '#/components/responses/Unauthorized'
+        403:
+          $ref: '#/components/responses/Forbidden'
+    post:
+      tags:
+        - System
+      summary: Change the sending limit of the box
+      description: |
+        Form fields `enabled` (1 or 0), `rate` (mails, 1 to 100000), `per`
+        (seconds, 1 to 3600), `stop` (1: send nothing while the brake is on),
+        `brake_rate` (1 to 100000), `brake_per` (seconds, 1 to 86400),
+        `calm` (minutes, 1 to 1440), and the long limit `long_enabled` (1 or
+        0), `long_rate` (mails, 1 to 100000) and `long_per` (seconds, 60 to
+        604800); fields that are not sent keep their value, `reset=1`
+        restores the defaults (on, 30 mails in 1 second and 1000 in an hour;
+        the brake 10 mails in 60 seconds, ending after 30 calm minutes). The
+        milter and the release service read the setting again when it
+        changes: no restart.
+      operationId: setSendLimit
+      requestBody:
+        required: true
+        content:
+          application/x-www-form-urlencoded:
+            schema:
+              $ref: '#/components/schemas/SendLimitUpdateRequest'
+            examples:
+              stricter:
+                summary: 100 mails a minute
+                value:
+                  rate: 100
+                  per: 60
+              reset:
+                summary: Back to the defaults
+                value:
+                  reset: 1
+      x-codeSamples:
+        - lang: curl
+          source: |
+            curl -X POST "https://{host}/admin/system/send-limit" \
+              -d "rate=100" \
+              -d "per=60" \
+              -u "<email>:<password>"
+      responses:
+        200:
+          description: Successful operation
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - status
+                  - settings
+                  - changed
+                properties:
+                  status:
+                    type: string
+                    example: ok
+                  settings:
+                    $ref: '#/components/schemas/SendLimitSettings'
+                  changed:
+                    type: boolean
+        400:
+          description: Invalid value (nothing was changed)
+          content:
+            text/html:
+              schema:
+                type: string
+        500:
+          description: The settings file could not be written (the previous setting was restored)
+          content:
+            text/html:
+              schema:
+                type: string
+        401:
+          $ref: '#/components/responses/Unauthorized'
+        403:
+          $ref: '#/components/responses/Forbidden'
+  /system/send-limit/held:
+    post:
+      tags:
+        - System
+      summary: Release or delete the mail that the sending limit holds back
+      description: |
+        Mail over the sending limit is accepted and put on hold (the brake).
+        Form fields `action` (`release`: send it now, past the limit;
+        `delete`: remove it from the queue, it is never sent and its senders
+        are not told; `end`: end the brake, the held mail then goes out at
+        the limit) and `sender` (one of the senders of `held` of
+        `GET /system/send-limit`, or empty for all held mail; not used by
+        `end`).
+      operationId: sendLimitHeld
+      requestBody:
+        required: true
+        content:
+          application/x-www-form-urlencoded:
+            schema:
+              type: object
+              required:
+                - action
+              properties:
+                action:
+                  type: string
+                  enum: [release, delete, end]
+                sender:
+                  type: string
+                  example: user@example.com
+      x-codeSamples:
+        - lang: curl
+          source: |
+            curl -X POST "https://{host}/admin/system/send-limit/held" \
+              -d "action=delete" \
+              -d "sender=user@example.com" \
+              -u "<email>:<password>"
+      responses:
+        200:
+          description: Successful operation
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - status
+                  - action
+                  - mails
+                properties:
+                  status:
+                    type: string
+                    example: ok
+                  action:
+                    type: string
+                  sender:
+                    type: string
+                    nullable: true
+                  mails:
+                    type: integer
+                    description: Held mails released or deleted
+        400:
+          description: Invalid action, a sender without held mail, or no list of held mail (the release service does not run)
+          content:
+            text/html:
+              schema:
+                type: string
+        500:
+          description: postsuper failed
+          content:
+            text/html:
+              schema:
+                type: string
+        401:
+          $ref: '#/components/responses/Unauthorized'
+        403:
+          $ref: '#/components/responses/Forbidden'
+  /system/auth-guard:
+    get:
+      tags:
+        - System
+      summary: Get Dovecot's limit of failed logins from the box itself
+      description: |
+        Logins that come from the box itself (127.0.0.1 and ::1: ActiveSync
+        and Autodiscover through Z-Push, webmail, Nextcloud, and any process
+        on the box) are not delayed by Dovecot; instead an account name with
+        `limit` different wrong passwords within `window` minutes is refused
+        for these logins until it has fewer (a password sent again counts
+        once). Returns the setting (`settings`, only values that differ from
+        `defaults` are stored), the values Dovecot uses now (`applied`), the
+        allowed `ranges`, and the names with different wrong passwords in
+        the window (`names`, at most 500, most first; `more` counts the
+        rest; `account` is false for a name that is no account of the box).
+      operationId: getAuthGuard
+      x-codeSamples:
+        - lang: curl
+          source: |
+            curl -X GET "https://{host}/admin/system/auth-guard" \
+              -u "<email>:<password>"
+      responses:
+        200:
+          description: Successful operation
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AuthGuardResponse'
+        500:
+          description: The state could not be read
+          content:
+            text/html:
+              schema:
+                type: string
+        401:
+          $ref: '#/components/responses/Unauthorized'
+        403:
+          $ref: '#/components/responses/Forbidden'
+    post:
+      tags:
+        - System
+      summary: Change Dovecot's limit of failed logins from the box itself
+      description: |
+        Form fields `limit` (different wrong passwords, 3 to 1000),
+        `window` (minutes, 1 to 1440) and `span` (windows that a burst of
+        more than `limit` at once counts against, 1 to 4: the longest lock
+        is `span` windows); fields that are not sent keep their value,
+        `reset=1` restores the defaults (30 in 30 minutes, 4 windows). Dovecot
+        reads the setting on every login from the box: no reload.
+      operationId: setAuthGuard
+      requestBody:
+        required: true
+        content:
+          application/x-www-form-urlencoded:
+            schema:
+              $ref: '#/components/schemas/AuthGuardUpdateRequest'
+            examples:
+              stricter:
+                summary: 20 different wrong passwords in 60 minutes
+                value:
+                  limit: 20
+                  window: 60
+              reset:
+                summary: Back to the defaults
+                value:
+                  reset: 1
+      x-codeSamples:
+        - lang: curl
+          source: |
+            curl -X POST "https://{host}/admin/system/auth-guard" \
+              -d "limit=20" \
+              -d "window=60" \
+              -u "<email>:<password>"
+      responses:
+        200:
+          description: Successful operation
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - status
+                  - settings
+                  - changed
+                properties:
+                  status:
+                    type: string
+                    example: ok
+                  settings:
+                    $ref: '#/components/schemas/AuthGuardSettings'
+                  changed:
+                    type: boolean
+        400:
+          description: Invalid value (nothing was changed)
+          content:
+            text/html:
+              schema:
+                type: string
+        500:
+          description: The settings file could not be written (the previous setting was restored)
+          content:
+            text/html:
+              schema:
+                type: string
+        401:
+          $ref: '#/components/responses/Unauthorized'
+        403:
+          $ref: '#/components/responses/Forbidden'
+  /system/auth-guard/unlock:
+    post:
+      tags:
+        - System
+      summary: Forget the wrong passwords of a name (end its lock)
+      description: |
+        Form field `key`: the `key` of an entry of `names` of
+        `GET /system/auth-guard`. Its count starts again from zero, so a
+        refused account can log in from the box again at once.
+      operationId: unlockAuthGuard
+      requestBody:
+        required: true
+        content:
+          application/x-www-form-urlencoded:
+            schema:
+              type: object
+              required:
+                - key
+              properties:
+                key:
+                  type: string
+                  example: a-user@example.com
+      x-codeSamples:
+        - lang: curl
+          source: |
+            curl -X POST "https://{host}/admin/system/auth-guard/unlock" \
+              -d "key=a-user@example.com" \
+              -u "<email>:<password>"
+      responses:
+        200:
+          description: Successful operation
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - status
+                  - key
+                  - name
+                properties:
+                  status:
+                    type: string
+                    example: ok
+                  key:
+                    type: string
+                  name:
+                    type: string
+        400:
+          description: Not a key of the list
+          content:
+            text/html:
+              schema:
+                type: string
+        500:
+          description: The state could not be changed
+          content:
+            text/html:
+              schema:
+                type: string
+        401:
+          $ref: '#/components/responses/Unauthorized'
+        403:
+          $ref: '#/components/responses/Forbidden'
+  /system/notifications:
+    get:
+      tags:
+        - System
+      summary: Get where the box's reports and alerts go
+      description: |
+        Returns the recipient of the box's reports (`recipient`: `admin` for
+        administrator@ of the box's name, `custom` for `address`) and the
+        resulting address `to`, where that address leads (`targets`: the
+        mailboxes of the box and the outside addresses, followed through the
+        aliases as Postfix does), where the alias administrator@ itself leads
+        (`admin_alias`; it also gets the mail to root, of cron jobs and to
+        postmaster@, abuse@, admin@ and hostmaster@ of the domains), what the
+        box mails (`mails`), Munin's recipient (`munin`) and the last
+        deliveries of such mail from the mail log (`deliveries`, oldest
+        first). `warnings` names what cannot work, such as a loop of aliases.
+      operationId: getNotifications
+      x-codeSamples:
+        - lang: curl
+          source: |
+            curl -X GET "https://{host}/admin/system/notifications" \
+              -u "<email>:<password>"
+      responses:
+        200:
+          description: Successful operation
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/NotificationsResponse'
+        401:
+          $ref: '#/components/responses/Unauthorized'
+        403:
+          $ref: '#/components/responses/Forbidden'
+    post:
+      tags:
+        - System
+      summary: Change the recipient of the box's reports
+      description: |
+        Form fields `recipient` (`admin`, `custom`) and `address` (for
+        `custom`: a plain address, also outside the box: ASCII letters,
+        digits and `_ + - .` before the @, no name or quotes); fields that
+        are not sent keep their value, except `address`: it is cleared unless
+        `recipient` is `custom`. The status check changes, backup status, TLS
+        results and usage report go to this address, and Munin's alerts with
+        their standard recipient (`/etc/munin/munin.conf` is written again).
+        The alias administrator@ is not changed.
+      operationId: setNotifications
+      requestBody:
+        required: true
+        content:
+          application/x-www-form-urlencoded:
+            schema:
+              $ref: '#/components/schemas/NotificationsUpdateRequest'
+            examples:
+              custom:
+                summary: Reports to another address
+                value:
+                  recipient: custom
+                  address: ops@example.com
+              admin:
+                summary: Reports to administrator@ again
+                value:
+                  recipient: admin
+      x-codeSamples:
+        - lang: curl
+          source: |
+            curl -X POST "https://{host}/admin/system/notifications" \
+              -d "recipient=custom" \
+              -d "address=<email>" \
+              -u "<email>:<password>"
+      responses:
+        200:
+          description: Successful operation (the new state, with `status` and `changed`)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/NotificationsResponse'
+        400:
+          description: Invalid value (nothing was changed)
+          content:
+            text/html:
+              schema:
+                type: string
+        500:
+          description: munin.conf could not be written (the previous setting was restored)
+          content:
+            text/html:
+              schema:
+                type: string
+        401:
+          $ref: '#/components/responses/Unauthorized'
+        403:
+          $ref: '#/components/responses/Forbidden'
+  /system/notifications/test:
+    post:
+      tags:
+        - System
+      summary: Send a test mail to the report recipient
+      description: |
+        Sends one test mail to the report recipient as the box's reports are
+        sent (SMTP to Postfix on 127.0.0.1, from administrator@). Its subject
+        is "[<box>] Test of the administrator mail" and it has the headers
+        `X-Miab-Test: 1` and `Auto-Submitted: auto-generated`.
+      operationId: testNotifications
+      x-codeSamples:
+        - lang: curl
+          source: |
+            curl -X POST "https://{host}/admin/system/notifications/test" \
+              -u "<email>:<password>"
+      responses:
+        200:
+          description: The mail was handed to Postfix
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - status
+                  - to
+                  - message_id
+                properties:
+                  status:
+                    type: string
+                    example: ok
+                  to:
+                    $ref: '#/components/schemas/Email'
+                  message_id:
+                    type: string
+        400:
+          description: The recipient reaches no mailbox and no outside address, or Postfix did not take the mail
+          content:
+            text/html:
+              schema:
+                type: string
+        401:
+          $ref: '#/components/responses/Unauthorized'
+        403:
+          $ref: '#/components/responses/Forbidden'
   /munin/:
     get:
       tags:
@@ -2844,6 +3563,16 @@ components:
         - 'off'
       example: private
       description: System privacy status.
+    ChangeOwnPasswordRequest:
+      type: object
+      required:
+        - password
+      properties:
+        password:
+          type: string
+          format: password
+          description: The new password.
+      description: The new password of the calling user.
     MailUserSetPasswordRequest:
       type: object
       required:
@@ -3510,6 +4239,9 @@ components:
     Fail2banSettings:
       type: object
       properties:
+        enabled:
+          type: boolean
+          description: fail2ban runs (the default); off, it is stopped and disabled (for tests).
         adaptive:
           type: boolean
         bantime_max:
@@ -3659,6 +4391,9 @@ components:
       properties:
         running:
           type: boolean
+        enabled:
+          type: boolean
+          description: The setting `enabled`; false while fail2ban is turned off for tests.
         error:
           type: string
           nullable: true
@@ -3671,42 +4406,12 @@ components:
                 type: string
               kind:
                 type: string
-              banned:
-                type: array
-                items:
-                  type: object
-                  properties:
-                    ip:
-                      type: string
-                    start:
-                      type: number
-                    bantime:
-                      type: integer
-                    end:
-                      type: number
-                      nullable: true
-                    remaining:
-                      type: integer
-                      nullable: true
-                    reason:
-                      type: object
-                      nullable: true
-                      properties:
-                        failures:
-                          type: integer
-                          nullable: true
-                        accounts:
-                          type: array
-                          items:
-                            type: string
-                        unknown_names:
-                          type: integer
-                        lines:
-                          type: array
-                          items:
-                            type: string
-                        manual:
-                          type: boolean
+              banned_count:
+                type: integer
+                description: The addresses that the jail bans now.
+              error:
+                type: string
+                description: Why the jail's counters could not be read (only then).
               currently_failed:
                 type: integer
               total_failed:
@@ -3719,6 +4424,21 @@ components:
           type: integer
         banned_ips:
           type: integer
+        top_networks:
+          type: array
+          description: The IPv4 /24 and IPv6 /64 networks with the most banned addresses (at least two), up to 10, most first.
+          items:
+            type: object
+            properties:
+              network:
+                type: string
+                example: 192.0.2.0/24
+              addresses:
+                type: integer
+              jails:
+                type: array
+                items:
+                  type: string
         settings:
           $ref: '#/components/schemas/Fail2banSettings'
         settings_warnings:
@@ -3753,6 +4473,174 @@ components:
             network:
               type: string
               nullable: true
+            banned_in:
+              type: array
+              description: The jails that ban the client's address now.
+              items:
+                type: string
+        relays:
+          type: object
+          description: The banned addresses in Microsoft's published ranges, by address.
+          additionalProperties:
+            type: object
+            properties:
+              provider:
+                type: string
+                example: Microsoft
+              service:
+                type: string
+              network:
+                type: string
+                description: The published network that contains the address.
+                example: 52.96.0.0/14
+              name:
+                type: string
+                nullable: true
+                description: The PTR name of the address, only when it resolves back to the address.
+        relays_source:
+          type: object
+          nullable: true
+          properties:
+            version:
+              type: string
+              description: The version of Microsoft's web service that the list was made from.
+            retrieved:
+              type: string
+              description: The date the list was made.
+            networks:
+              type: integer
+        relays_error:
+          type: string
+          description: Why the list of Microsoft's ranges could not be used (only then).
+    Fail2banBan:
+      type: object
+      properties:
+        jail:
+          type: string
+        start:
+          type: integer
+        bantime:
+          type: integer
+          description: Seconds, -1 for a permanent ban.
+        end:
+          type: integer
+          nullable: true
+        remaining:
+          type: integer
+          nullable: true
+    Fail2banBansResponse:
+      type: object
+      required:
+        - running
+        - total
+        - matched
+        - offset
+        - limit
+        - addresses
+      properties:
+        running:
+          type: boolean
+        error:
+          type: string
+          nullable: true
+        total:
+          type: integer
+          description: All banned addresses.
+        matched:
+          type: integer
+          description: The banned addresses that match the filter.
+        offset:
+          type: integer
+        limit:
+          type: integer
+        filter:
+          type: string
+        addresses:
+          type: array
+          items:
+            type: object
+            properties:
+              ip:
+                type: string
+              start:
+                type: integer
+                description: The start of its newest ban.
+              end:
+                type: integer
+                nullable: true
+                description: When its last ban ends, null if one is permanent.
+              remaining:
+                type: integer
+                nullable: true
+              bans:
+                type: array
+                description: Its bans per jail, newest first.
+                items:
+                  $ref: '#/components/schemas/Fail2banBan'
+              relay:
+                type: object
+                nullable: true
+                description: As in `relays` of `GET /system/fail2ban`, with `name` always null.
+        jail_errors:
+          type: object
+          description: Jails whose bans could not be read, with the error (only then).
+          additionalProperties:
+            type: string
+        relays_error:
+          type: string
+    Fail2banBanReasonResponse:
+      type: object
+      required:
+        - ip
+        - jails
+      properties:
+        ip:
+          type: string
+        jails:
+          type: array
+          items:
+            type: object
+            properties:
+              jail:
+                type: string
+              reason:
+                type: object
+                nullable: true
+                properties:
+                  failures:
+                    type: integer
+                    nullable: true
+                  accounts:
+                    type: array
+                    items:
+                      type: string
+                  unknown_names:
+                    type: integer
+                  lines:
+                    type: array
+                    items:
+                      type: string
+                  manual:
+                    type: boolean
+              rule:
+                type: object
+                nullable: true
+                properties:
+                  maxretry:
+                    type: integer
+                  findtime:
+                    type: integer
+                  bantime:
+                    type: integer
+                  watches:
+                    type: string
+                    nullable: true
+                  blocks:
+                    type: string
+                    nullable: true
+        error:
+          type: string
+          description: Why fail2ban's database could not be read (only then).
     Fail2banSettingsResponse:
       type: object
       required:
@@ -3881,6 +4769,451 @@ components:
             type: object
         seconds:
           type: number
+    NotificationsRecipient:
+      type: string
+      enum:
+        - admin
+        - custom
+      description: |
+        `admin`: administrator@ of the box's name (the default), `custom`: the
+        address in `address`.
+    NotificationsTarget:
+      type: object
+      required:
+        - address
+        - kind
+        - via
+      properties:
+        address:
+          $ref: '#/components/schemas/Email'
+        kind:
+          type: string
+          enum:
+            - mailbox
+            - external
+        via:
+          type: array
+          items:
+            type: string
+          description: The aliases on the way.
+    AuthGuardSettings:
+      type: object
+      required:
+        - limit
+        - window
+        - span
+      properties:
+        limit:
+          type: integer
+          description: Different wrong passwords of one account name from the box itself
+          example: 30
+        window:
+          type: integer
+          description: Within this many minutes
+          example: 30
+        span:
+          type: integer
+          description: Windows that a burst of more than `limit` at once counts against (a name is refused while the last k windows hold k times `limit`, k = 1 to `span`); 1 to 4
+          example: 4
+    AuthGuardUpdateRequest:
+      type: object
+      properties:
+        limit:
+          type: integer
+          minimum: 3
+          maximum: 1000
+        window:
+          type: integer
+          minimum: 1
+          maximum: 1440
+        span:
+          type: integer
+          minimum: 1
+          maximum: 4
+        reset:
+          type: integer
+          enum: [1]
+    AuthGuardResponse:
+      type: object
+      required:
+        - settings
+        - defaults
+        - ranges
+        - applied
+        - warnings
+        - names
+        - more
+      properties:
+        settings:
+          $ref: '#/components/schemas/AuthGuardSettings'
+        defaults:
+          $ref: '#/components/schemas/AuthGuardSettings'
+        applied:
+          $ref: '#/components/schemas/AuthGuardSettings'
+        ranges:
+          type: object
+          properties:
+            limit:
+              type: array
+              items:
+                type: integer
+            window:
+              type: array
+              items:
+                type: integer
+        warnings:
+          type: array
+          items:
+            type: string
+        names:
+          type: array
+          items:
+            type: object
+            properties:
+              key:
+                type: string
+              name:
+                type: string
+              failures:
+                type: integer
+                description: Different wrong passwords within the window
+              last:
+                type: integer
+                description: Time of the last one (Unix time)
+              refused:
+                type: boolean
+              account:
+                type: boolean
+                nullable: true
+        more:
+          type: integer
+    SendLimitSettings:
+      type: object
+      required:
+        - enabled
+        - rate
+        - per
+      properties:
+        enabled:
+          type: boolean
+          example: true
+        rate:
+          type: integer
+          description: Mails (recipients) that may go out within `per` seconds
+          example: 30
+        per:
+          type: integer
+          description: Seconds
+          example: 1
+        stop:
+          type: boolean
+          description: While the brake is on, send nothing until it is ended
+          example: false
+        brake_rate:
+          type: integer
+          description: While the brake is on, mails (recipients) that go out within `brake_per` seconds
+          example: 10
+        brake_per:
+          type: integer
+          example: 60
+        calm:
+          type: integer
+          description: Minutes without held mail and without more mail than the limit after which the brake ends by itself (not with `stop`)
+          example: 30
+        long_enabled:
+          type: boolean
+          description: The long limit is on (against a steady flood below the short one)
+          example: true
+        long_rate:
+          type: integer
+          description: Mails (recipients) that may go out within `long_per` seconds
+          example: 1000
+        long_per:
+          type: integer
+          description: Seconds of the long limit
+          example: 3600
+    SendLimitUpdateRequest:
+      type: object
+      properties:
+        enabled:
+          type: integer
+          enum: [0, 1]
+        rate:
+          type: integer
+          minimum: 1
+          maximum: 100000
+        per:
+          type: integer
+          minimum: 1
+          maximum: 3600
+        stop:
+          type: integer
+          enum: [0, 1]
+        brake_rate:
+          type: integer
+          minimum: 1
+          maximum: 100000
+        brake_per:
+          type: integer
+          minimum: 1
+          maximum: 86400
+        calm:
+          type: integer
+          minimum: 1
+          maximum: 1440
+        long_enabled:
+          type: integer
+          enum: [0, 1]
+        long_rate:
+          type: integer
+          minimum: 1
+          maximum: 100000
+        long_per:
+          type: integer
+          minimum: 60
+          maximum: 604800
+        reset:
+          type: integer
+          enum: [1]
+    SendLimitEvent:
+      type: object
+      properties:
+        time:
+          type: integer
+          description: End of the minute (Unix time)
+        rate:
+          type: integer
+        per:
+          type: integer
+        delayed:
+          type: integer
+          description: Mails that waited
+        deferred:
+          type: integer
+          description: Mails deferred with a temporary error (they would have waited longer than 60 s)
+        held:
+          type: integer
+          description: Mails put on hold
+        passed:
+          type: integer
+          description: Mails that went out at once in that minute
+        max_wait:
+          type: integer
+          description: Longest wait in seconds
+        others:
+          type: integer
+          description: Senders not listed (only the 10 with the most recipients are)
+        senders:
+          type: array
+          items:
+            $ref: '#/components/schemas/SendLimitSender'
+    SendLimitSender:
+      type: object
+      properties:
+        sender:
+          type: string
+          description: The account (SMTP with login), or "sendmail:" or "smtp:" and the envelope sender
+        mails:
+          type: integer
+        recipients:
+          type: integer
+    SendLimitResponse:
+      type: object
+      required:
+        - settings
+        - defaults
+        - ranges
+        - applied
+        - warnings
+        - running
+        - events
+        - more
+        - day
+      properties:
+        settings:
+          $ref: '#/components/schemas/SendLimitSettings'
+        defaults:
+          $ref: '#/components/schemas/SendLimitSettings'
+        applied:
+          $ref: '#/components/schemas/SendLimitSettings'
+        ranges:
+          type: object
+          properties:
+            rate:
+              type: array
+              items:
+                type: integer
+            per:
+              type: array
+              items:
+                type: integer
+        warnings:
+          type: array
+          items:
+            type: string
+        running:
+          type: boolean
+          nullable: true
+        release_running:
+          type: boolean
+          nullable: true
+        brake:
+          type: object
+          properties:
+            on:
+              type: boolean
+            since:
+              type: integer
+              nullable: true
+              description: When it went on (Unix time)
+            stop:
+              type: boolean
+        held:
+          type: object
+          properties:
+            mails:
+              type: integer
+            recipients:
+              type: integer
+            senders:
+              type: array
+              items:
+                type: object
+                properties:
+                  sender:
+                    type: string
+                  mails:
+                    type: integer
+                  recipients:
+                    type: integer
+                  oldest:
+                    type: integer
+                    description: Time the oldest of them was held (Unix time)
+        events:
+          type: array
+          items:
+            $ref: '#/components/schemas/SendLimitEvent'
+        more:
+          type: integer
+        day:
+          type: object
+          properties:
+            minutes:
+              type: integer
+            delayed:
+              type: integer
+            deferred:
+              type: integer
+            held:
+              type: integer
+            max_wait:
+              type: integer
+            senders:
+              type: array
+              items:
+                $ref: '#/components/schemas/SendLimitSender'
+    NotificationsResponse:
+      type: object
+      required:
+        - recipient
+        - address
+        - admin_address
+        - to
+        - targets
+        - warnings
+        - admin_alias
+        - mails
+        - deliveries
+      properties:
+        recipient:
+          $ref: '#/components/schemas/NotificationsRecipient'
+        address:
+          type: string
+          description: The custom address, empty unless `recipient` is `custom`.
+        admin_address:
+          $ref: '#/components/schemas/Email'
+        to:
+          $ref: '#/components/schemas/Email'
+        targets:
+          type: array
+          items:
+            $ref: '#/components/schemas/NotificationsTarget'
+        warnings:
+          type: array
+          items:
+            type: string
+        admin_alias:
+          type: object
+          properties:
+            forwards_to:
+              type: array
+              items:
+                type: string
+            is_mailbox:
+              type: boolean
+            targets:
+              type: array
+              items:
+                $ref: '#/components/schemas/NotificationsTarget'
+            warnings:
+              type: array
+              items:
+                type: string
+        mails:
+          type: array
+          items:
+            type: object
+            properties:
+              id:
+                type: string
+              title:
+                type: string
+              when:
+                type: string
+              to:
+                type: string
+                enum:
+                  - reports
+                  - munin
+                  - alias
+        munin:
+          type: object
+          nullable: true
+          properties:
+            recipient:
+              $ref: '#/components/schemas/MuninAlertsRecipient'
+            to:
+              type: string
+              nullable: true
+        deliveries:
+          type: array
+          items:
+            type: object
+            properties:
+              time:
+                type: string
+              to:
+                type: string
+              status:
+                type: string
+                example: sent
+              text:
+                type: string
+              queue_id:
+                type: string
+        status:
+          type: string
+          description: Only in the answer to a change.
+        changed:
+          type: boolean
+          description: Only in the answer to a change.
+    NotificationsUpdateRequest:
+      type: object
+      properties:
+        recipient:
+          $ref: '#/components/schemas/NotificationsRecipient'
+        address:
+          type: string
     MuninAlertsRecipient:
       type: string
       enum:
@@ -3888,8 +5221,9 @@ components:
         - custom
         - 'off'
       description: |
-        `admin`: administrator@ of the box's name (the default), `custom`: the
-        address in `address`, `off`: no alerts.
+        `admin`: the recipient of the box's reports (the default;
+        administrator@ of the box's name unless `/system/notifications` names
+        another address), `custom`: the address in `address`, `off`: no alerts.
     MuninAlertsLevel:
       type: string
       enum:

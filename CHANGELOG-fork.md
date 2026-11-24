@@ -14,154 +14,947 @@ PR #2603). For upstream's own history see CHANGELOG.md.
 ### Planned
 
 Seen in the work on rc7, v78-r2604.0, v78-r2604.1, v78-r2604.2,
-v78-r2604.3 and v78-r2604.4, not done (the certification runs add their open findings in TESTING-fork.md):
+v78-r2604.3, v78-r2604.4, v78-r2604.5 and this release, not done (the certification runs add their open findings in TESTING-fork.md):
 
-* `$STORAGE_ROOT/owncloud-backup` grows with every update of Nextcloud and,
-  since B176, with every new pin of one of its apps: each keeps a copy of
-  the database, `config.php` and the replaced code, and nothing removes old
-  copies (one box had 2.5 GB there; the directory is not in the box's
-  backup). Setup could keep the newest few copies and remove older ones
-  (seen in the review of v78-r2604.4).
-* tools/update-check.sh records 24 Postfix parameters, but not
-  `tls_eecdh_auto_curves` and `tls_ffdhe_auto_groups`, so the post-quantum
-  change of this release does not show in its list of changes (seen in T5b
-  of v78-r2604.3; the smoke check `tls-key-exchange` shows it).
-* The smoke check `mig-pop3-uidl-alice` fails on every run from the lab
-  snapshot of T5b: the lab preparation (spamlearn.py) moved a seeded INBOX
-  mail to Spam and back, which gave it a new UID and so a new POP3 UIDL
-  (UID 9 became 12). It fails the same way before any update. The lab
-  now has a corrected copy of the manifest for that VM and a new snapshot
-  of v78-r2604.2 as the start of T5b; the preparation still needs to
-  leave the seeded mails alone (T5b of v78-r2604.3).
+* **The in-place and migration tools trust a local tag of the release name**\
+  `tools/upgrade-in-place-to-2604.sh` (an existing checkout of the fork,
+  `update_fork_dir`) and `tools/migrate-to-2604.sh` (`resolve_miab_dir`)
+  still decide by the name that `git describe` prints whether to fetch the
+  release, as bootstrap.sh did before B202: a local tag of the release's
+  name on another commit keeps the old code. The same comparison with the
+  commit of the tag at the source (`git ls-remote`) would find it (seen in
+  the work on B202).
+* **Munin critical-only alerts never mail the return to normal**\
+  Critical only (Munin's alerts) never mails the return to normal. Not
+  possible with Munin's text template, which `contact.admin.text` sets:
+  munin-limits (Munin 2.0) gives it the values that are critical, warning
+  or unknown now and those back to normal in this run (`fofields`), not
+  the state a value had before, so a template cannot tell a value back
+  from critical from one back from warning, nor see one that drops from
+  critical to warning. README-fork.md (Munin alerts) says so. A fix would
+  need munin-notify to keep the critical values of the last run itself.
+* **The storage user can still replace $STORAGE_ROOT/mail and ssl/**\
+  The storage user owns `$STORAGE_ROOT` and can rename `mail/` and `ssl/`
+  in it and put directories of its own there: Dovecot, Postfix and the
+  management daemon open `users.sqlite` by path, and the services read the
+  private keys by path. Setup no longer makes such a `mail/` or database
+  root's (it stops), but the services would use them. A fix needs both in
+  a directory of root's outside `$STORAGE_ROOT` (or a bind mount), which
+  changes the paths of the backups and the tools; README-fork.md, "Known
+  issues" (seen in the review of B210 to B213).
+* **A local fail2ban file with ignoreip overrides the panel's allowlist**\
+  A `jail.local` or `jail.d/*.local` of the administrator that sets
+  `ignoreip` in `[DEFAULT]` is read after `jail.d/mailinabox_adaptive.conf`
+  and replaces the `ignoreip` that the allowlist of System > Intrusion
+  Protection writes there: the panel lists an address as allowlisted, and
+  no jail ignores it. The page does not warn about it (seen in the test
+  runs of this release).
+* **A package run started just before mail goes offline is not in the snapshot**\
+  The in-place tool takes the package lists and the system archive while
+  mail still runs, checks for running package updates, and then masks and
+  stops the units. A package run that starts after that check and before
+  the masks (`apt-daily-upgrade.service` has `KillMode=process`, so
+  stopping it leaves unattended-upgrade running) ends while `stop_mail`
+  waits for the dpkg lock (B190), but its changes are not in the package
+  lists and the archive that `--rollback` uses. Comparing
+  `/var/log/apt/history.log` or the mtime of `/var/lib/dpkg/status` with
+  the moment of the archive after that wait would find it (seen in the
+  review of this release, from the code; not seen in a test run).
+* **No log line for a successful webmail password change**\
+  `POST /me/password` (webmail's password change through the management
+  daemon, B210) logs failures (for fail2ban) but not a successful change
+  (seen in the test runs of this release).
+* **The journal may lose a whole file at a rotation**\
+  setup/system.sh sets journald's `MaxRetentionSec=10day` (upstream). On a
+  copy of a production box the system journal before a moment in an update
+  test was gone while syslog and mail.log were intact, which takes the
+  setup marks that the log audit needs; a likely cause, not confirmed, is
+  that journald removes a rotated file whole when its oldest entry is
+  older than the retention (seen in the test runs of this release).
+* **www-data is still in the group dovecot**\
+  Setup adds www-data to the group dovecot, as upstream did "so PHP can use
+  doveadm, for the password changing plugin". No version of this fork uses
+  that (its password plugin hashed in PHP, and since B210 the management
+  daemon changes the password). The group gives access to some of Dovecot's
+  sockets (for example its statistics); taking www-data out of it needs a
+  check of what else relies on it (seen in the work on B210).
+* **spampd checks at most three mails at a time**\
+  Postfix hands each mail for the box's users to spampd, which runs
+  Ubuntu's default of three processes (`max-servers 3` in
+  `/etc/spampd.cfg`; setup sets only its ports). At about 2 s per check,
+  a burst of incoming mail waits in Postfix's queue: in an update test
+  with client load and an extra mail every 2 s, local delivery took 10 to
+  22 s before any restart, and after setup's restarts four mails waited
+  about 100 s past setup's end. More processes would need more memory
+  (about 100 MB each); a setting for it would let a busy box choose (seen
+  in the test of B225).
 
-* bootstrap.sh decides whether to fetch by the name that `git describe`
-  prints for the checkout, so a local tag of the release's name on another
-  commit keeps the old code (see "Updating the fork" in README-fork.md).
-  Comparing the commit of the tag at the source (`git ls-remote`) with
-  `HEAD` would find it; not changed in the bug-fix release v78-r2604.1,
-  as every update goes through that code and that release had no test
-  run of it.
-* Setup restarts PHP-FPM once per run (B122), which ends ActiveSync long
-  polls; a reload with a `process_control_timeout` would keep them.
-* A failed ActiveSync or Autodiscover login takes 10 to 50 s (seen in the
-  test of B126): Z-Push tries the IMAP login three times, and Dovecot
-  delays failed logins, possibly more for an address with many failures,
-  which for Z-Push is 127.0.0.1 for all users. Whether an attack below the
-  `miab-zpush` threshold slows down the ActiveSync logins of other users
-  is not measured.
-* `miab-zpush` counts failures per address, like the other jails, and is
-  always on: behind the shared servers of a mail app that syncs through its
-  provider's cloud (Outlook for iOS and Android with an ActiveSync
-  account), one person with a wrong password, or anyone on purpose, can get
-  all users of that app banned, and repeated bans reach recidive's week on
-  all ports (B126). The README, the upgrade note and the allowlist help say
-  to put such networks on the allowlist; nothing finds them on its own.
-  Leaving `miab-zpush` out of recidive would let an attacker guess 20
-  passwords every few minutes for good, so it still counts there.
-* Nextcloud takes the client's address from `X-Forwarded-For` on every
-  connection from 127.0.0.1 (`trusted_proxies`, B121), not only on those
-  of nginx's `/caldav`, `/carddav` and `/webdav` proxy, which sets the
-  header itself. A local account or a compromised service can make
-  Nextcloud log a failed login under another address, which
-  `miab-owncloud` bans; before, such a login was logged as 127.0.0.1,
-  which fail2ban ignores. Local accounts could already write such lines
-  into the logs that fail2ban reads (logger(1); www-data owns Nextcloud's
-  log), so this is a second way to an existing one; clients on the
-  Internet cannot do it (the proxy replaces the header). A fix: the proxy
-  proves itself to the `/cloud` location with a secret header from a
-  root-only include, and nginx passes `X-Forwarded-For` to PHP only then.
-* Setup still restarts OpenDKIM and OpenDMARC (setup/dkim.sh), spampd,
-  postgrey, named, systemd-resolved, munin-node and the management daemon
-  on every run; while OpenDKIM restarts, Postfix lets mail pass unsigned
-  (`milter_default_action`). Candidates for a reload or a restart only on a
-  change.
-* A Dovecot reload (B122) still has two client-visible moments: a login
-  that the old login process hands to the new auth process at that moment
-  fails as an internal failure (Nextcloud's `user_external` counts it as a
-  failed login of the client; harmless for 127.0.0.1 after B121), and a
-  FolderSync or Ping that Z-Push answers during the reload gets a server
-  error if Z-Push cannot connect again (B137).
-* Roundcube's CardDAV plugin can log "duplicate column name: account_id",
-  "no such column: active" or "UNIQUE constraint failed:
-  carddav_migrations.filename" when two sessions log in at the same moment
-  for the first time after an upgrade of the plugin (a race in its schema
-  migration; one of the logins fails once). After an update from rc7 or
-  earlier, `update-check.sh after` accepts the last form.
-* nginx sets no HSTS header on `/admin/`: the headers of that location
-  replace the server's (upstream). Browsers that visited another page of
-  the box have the header already.
-* Nextcloud on SQLite answers a CardDAV write with HTTP 500 ("database is
-  locked") while its `cron.php` holds the database (seen once in T1); the
-  client writes again later.
-* Through some public resolvers (8.8.8.8 in the test of B136) Spamhaus
-  gives no answer at all, also for its own test entries, so setup's checks
-  can neither see a listing nor say that they could not check; the comment
-  in setup/network-checks.sh names 8.8.8.8 among the resolvers that get
-  127.255.255.254.
-* `upgrade-in-place-to-2604.sh --check` prints the start command with the
-  GitHub URL also when `SOURCE` and `TAG` name another source.
-* A Dovecot reload ends the open IMAP sessions (their clients log in
-  again); setup reloads Dovecot only when its configuration changed (B122).
-* Critical only (Munin's alerts) never mails the return to normal.
-* The admin panel asks for `/admin/assets/branding/favicon.ico`, which is
-  not installed (nginx 404).
-* `postconf` warns that `smtpd_tls_dh1024_param_file` will be removed.
-* Upstream code below `$STORAGE_ROOT`, which the user-data account owns:
-  `management/backup.py` and `management/dns_update.py` still write
-  `custom.yaml` as root with `open(..., "w")` (B87 covers only
-  `settings.yaml`), and the nightly backup reads its target and
-  `secret_key.txt` there by path. An account that can replace `backup/`
-  could point the backups (of `$STORAGE_ROOT`, its own data) to a server of
-  its own with a passphrase it knows. The fork's tools read them, and write
-  the paused `custom.yaml`, only through a checked `backup/` of root's own
-  (B117).
-* `$STORAGE_ROOT/mail` stays root:www-data with mode 775, as upstream has
-  it: Roundcube's password plugin writes `users.sqlite` as www-data, and
-  SQLite needs to create its journal in the same directory. So www-data
-  can rename, replace or remove anything in it: the mailboxes, the DKIM
-  keys, the user database, the postgrey and SpamAssassin data. Setup no
-  longer follows a link it finds there (B147), but code running as
-  www-data can still stop mail (remove `users.sqlite` or `mailboxes`), and
-  the management daemon, which runs as root, opens `users.sqlite` by path
-  (`open_database()` in management/mailconfig.py). A fix moves
-  `users.sqlite` into a directory of its own that only it and its journal
-  live in, and gives `$STORAGE_ROOT/mail` back to root (755); that changes
-  the paths in the Dovecot, Postfix, Roundcube and management
-  configuration and in the backups, so it needs its own release and test
-  runs.
-* The storage user owns `$STORAGE_ROOT/mailinabox.version` and its
-  directory, so it can write a lower number there, and the next setup run
-  runs the data migrations from there again as root. Each such run stops at
-  the first migration that cannot run twice, until the file is put right;
-  before that, depending on the number, migration 8 deletes the DKIM key,
-  11 moves the Let's Encrypt account away, 12 drops Roundcube's CardDAV
-  tables and all webmail sessions, and 5 chmods `backup/secret_key.txt`
-  (following a link) to 0600. It gives no root and needs code running as
-  the storage user, which no service of the box runs (B147).
-* The status checks' `query_dns()` catches neither dnspython's `YXDOMAIN`
-  nor `NameTooLong`: a mail domain whose name is too long with
-  `.dbl.spamhaus.org` appended raises out of its checks and ends the
-  status check run with a traceback (from reading the code). Its guard for
-  the `at` argument tests `'[Not set]'`, which no lookup returns (the value
-  is `'[Not Set]'`, and now `'[error]'` too); the callers exclude both
-  before, so the guard is dead code.
-* When the lookup of a domain's DS record fails, the status checks still
-  say "This domain's DNSSEC DS record is not set" (a failed lookup counts
-  as no DS record, as before B150); "could not check" would be right.
-* `tools/migrate-to-2604.sh` passes the old box's standard error (the
-  error messages of its remote scripts, through ssh) to the terminal
-  unfiltered; the other text of the old box gets "?" for control
-  characters (B154).
-* The in-place upgrade's messages after a `--redo-from` that fails: on an
-  upgrade that had finished, the exit message says that cron jobs, update
-  timers and backups "stay paused", although the redo does not pause them
-  again; and while a redo of setup is pending, `--status` counts "Mail
-  offline ... so far" from the start of the original downtime, not from
-  the redo. Cosmetic; found with B161.
-* The migration tool's directory `/root/migration` is root's only (0700),
-  but the files in it are 0644, among them the copies of the old box's
-  key `old-id_rsa_miab` and of its `passwd`; they could be 0600 (seen in
-  T2 of v78-r2604.2, nothing exposed).
+## v78-r2604.5 (2026-11-23)
+
+A larger release. New: a per-account limit of failed logins through the
+box's own services (the account lock, B126), a sending limit with an
+emergency brake against floods of outgoing mail (B221), banned addresses
+page by page (B220), a switch that turns fail2ban off for tests,
+System > Notifications, and setup restarts services only when
+their configuration changed. Fixed: the status pages and mails (B178 to
+B184), the in-place and migration tools (B154, B161, B186 to B190, B200 to
+B204), the reading of root's files from the storage user's directories
+(B183, B191, B210 to B213), and the restarts during an update (B122, B189,
+B222 to B225). Tested by the full set of scenarios T1 to T5b and T7, an
+in-place upgrade from 24.04 (T3) and updates of a copy of a production box
+from v78-r2604.4 under client load (T5b and three repeated runs), see
+TESTING-fork.md.
+
+### New
+
+* **fail2ban can be turned off for tests**\
+  System > Intrusion Detection and Prevention > Settings has a checkbox
+  "fail2ban (on by default)". Turned off, fail2ban is stopped and disabled
+  (`systemctl disable --now`), so that no address is banned after failed
+  logins and the current bans are lifted, for example while a test sends
+  wrong passwords on purpose; turned on again, it is enabled and started,
+  and the bans that have not run out come back from its database. The page
+  asks before turning it off and shows a warning while it is off, and the
+  status checks warn instead of reporting "fail2ban is not running"
+  (so the daily status mail mentions it). Setup keeps it off
+  (`fail2ban_admin.py --setup` exits with code 4, `setup/start.sh` then
+  stops and disables it instead of reloading it). Nextcloud's throttle and
+  the limit of failed logins through the box's own services do not depend
+  on it. API: the field `enabled` of `/system/fail2ban/settings` and of the
+  status. New offline test `tests/fork/fail2ban-switch.py`.
+
+* **Sending limit with an emergency brake: a flood of mail from the box is stopped (B221)**\
+  All mail that the users and the box itself send now passes a small
+  Postfix milter (`conf/send-limit/sendlimit-milter.py`, service
+  `miab-sendlimit`, package `python3-milter` from universe): mail programs
+  and webmail (SMTP with login on ports 465 and 587), ActiveSync,
+  Nextcloud, Sieve redirects, cron and other programs on the box
+  (sendmail), and SMTP from the box itself without a login (127.0.0.1 and
+  ::1 on port 25, which Postfix lets relay). Up to 30 mails go out at
+  once, then 30 a second; each recipient counts as one mail. The first
+  mail more sets off the brake: from then on all outgoing mail is accepted
+  and put on hold in Postfix's queue (no sender gets an error, nothing is
+  lost), the recipient of the box's reports is mailed at once, and the new
+  service `miab-sendlimit-release` lets held mail go out only at 10 mails a
+  minute, the senders in turn, or, if so set, nothing at all until the
+  administrator ends the brake. Without the stop the brake ends by itself
+  once nothing is held and no more than the limit came for 30 minutes. An
+  account that was taken over so gets a few dozen mails out instead of
+  thousands (in a test 6 to 7 of 120 at a limit of 5 a second), and its
+  held mail can be deleted before it goes out. System > Intrusion
+  Detection and Prevention (the page's new name) sets the limit and the
+  brake, shows the brake with "End the brake", lists the held mail by
+  sender with "Release now" and "Delete", and the minutes of the last 24
+  hours in which the limit acted; API `/system/send-limit` and
+  `/system/send-limit/held`, command line `management/send_limit.py
+  --status`, `--release`, `--delete`, `--end`. While the brake is on,
+  held mail goes out at the brake's rate on average; as a token bucket it
+  may let up to that many go at once, so a minute can see a few more.
+  Nothing is released in the brake's first period (`brake_per`), also no
+  mail with more recipients than `brake_rate` (the first version let such
+  mail out at once: 60 to 120 recipients in the first second in the lab).
+  A changed limit keeps counting the mails that went out, up to the new
+  limit (a first version treated the bucket as full after a change: with
+  30 a second restored after a test with 1 an hour, the next mail set off
+  the brake).
+  The box's own mail to administrator@ and to the report recipient is
+  never held. The release service releases only mail that is in the hold
+  queue and had arrived when the milter held it (up to 5 days before, as
+  sendmail's mail enters Postfix's queue when it is written to the
+  maildrop, which can be long before pickup hands it to the milter); mail
+  in the hold queue that is not on its list (held by hand, or a record it
+  could not verify) is counted, and the control panel and the
+  administrator's mail say how many and how to release or delete it. Mail from
+  other servers is not counted. The milter runs as a dynamic user without
+  privileges, and it fails closed: when it does not answer (stopped,
+  crashed or hung), Postfix refuses outgoing mail with a temporary error
+  (`454 4.3.0` on the submission ports, `451 4.7.1` on port 25;
+  `default_action=tempfail` for this milter only, OpenDKIM and OpenDMARC
+  keep `accept`) instead of letting it out without a limit; mail programs
+  send it again, webmail shows an error, the mail of ActiveSync and
+  sendmail waits in Postfix's maildrop
+  queue until the milter is back, and systemd restarts it after 2 seconds
+  without ever giving up. Mail from other servers does not depend on it:
+  on port 25 Postfix asks it only for mail from the box itself
+  (`smtpd_milter_maps`, `/etc/postfix/sendlimit-milters.cidr`). The box's
+  own reports (status checks, backup and TLS reports, the usage report, the
+  mails of the guard and of the sending limit, the test mail of System >
+  Notifications) go through a new listener of Postfix, `127.0.0.1:10587`
+  (`postfix/adminmail` in the log), which does not pass this milter: it
+  takes mail only from the box itself, only to administrator@ and the report
+  recipient (`/etc/postfix/sendlimit-admin-recipients`, written by
+  `send_limit.py --apply` and again when the report recipient changes) and
+  at most 20 mails a minute, so it cannot be used to send mail elsewhere.
+  So the administrator still gets mail while the milter is down: the cron
+  job of the sending limit asks the milter every 5 minutes (Postfix's first
+  question, so a stopped or hung milter is caught as well as a missing one)
+  and mails when it has not answered for 4 minutes, and again when it
+  answers; mail of cron jobs and Munin's alerts (sendmail) wait with the
+  rest. Turned off (the checkbox of the limit), the milter is taken out of
+  Postfix's way altogether (`smtpd_milter_maps` empty, `non_smtpd_milters`
+  and `$sendlimit_submission_milters` without it; `send_limit.py --apply`
+  sets this when the setting changes, setup reads the milter's settings
+  file), so that nothing then depends on it; held mail goes out, and the
+  cron job does not watch the milter. A downgrade to v78-r2604.4 keeps `smtpd_milter_maps` and the two services,
+  so mail from the box itself on port 25 still passes the limit (or, with the
+  services removed, is refused: remove the setting with `postconf -X
+  smtpd_milter_maps`). Without
+  the release service nothing is held (a mail then waits at most 20
+  seconds, sendmail 60, and is deferred with `451 4.7.1`; the minutes then
+  count each new try of such a mail as deferred again). Limits: the
+  recipients are counted as the sender gave them, before Postfix expands
+  aliases, so a mail to an alias that forwards to many addresses counts
+  once (only administrators add aliases), and mail from other servers that
+  aliases forward on is not counted either. A mail with more recipients
+  than the limit goes out at once when nothing waits and counts in full,
+  so the next mail within the following seconds sets off the brake; a box
+  whose users send to many recipients at once should raise the limit.
+  A second, long limit stops a steady flood below the first one: by
+  default at most 1000 mails (recipients) an hour, set and turned off on the
+  same page (`long_enabled`, `long_rate`, `long_per`); a mail must fit both,
+  and more than either sets off the same brake, whose mail and log line say
+  which limit it was. In the lab test of the first version, floods of 1000
+  mails by SMTP at 23 a second, and of 300 by webmail, ActiveSync and
+  sendmail at 2 to 7 a second, all went out without the brake. Before, an
+  account that was taken over or a program on the box could send any
+  amount of mail in the box's name before anyone noticed, and ruin the
+  reputation of its address with other mail providers. New offline test
+  `tests/fork/send-limit.py`, smoke checks `admin-send-limit` and the
+  `GET /system/send-limit` shape.
+
+* **New page System > Notifications: where reports and alerts go**\
+  The control panel has a new page System > Notifications. It sets the
+  recipient of the box's reports (status check changes, backup status, TLS
+  results, usage report): administrator@ of the box's name as before, or
+  a custom address, also of another provider, with a test mail. Munin's
+  alert settings moved there from the Munin page; their standard
+  recipient ("Same as the reports") follows the report recipient. The page
+  shows where the alias administrator@ leads, followed through the
+  aliases as Postfix does, warns about a loop or an address of the box
+  that does not exist, and says that the mail to abuse@, postmaster@,
+  hostmaster@, admin@ and of root and cron jobs still goes there (the alias
+  is an address of domain control validation and is not changed). It
+  lists what the box mails and the last deliveries from the mail log. API
+  `/system/notifications`, command line `management/admin_mail.py`; new
+  offline test `tests/fork/admin-mail.py` and smoke checks
+  `api-notifications`, `admin-notifications-unit`.
+* **System > Munin Monitoring opens Munin directly again**\
+  The menu entry opens Munin in a new tab without leaving the page shown
+  (the tab is opened in the click, so pop-up blockers let it through). The
+  old address `#munin` still works.
+* **Setup points to tools/update-check.sh at the end of a run**\
+  At the end of a setup run on an existing box, setup prints a short hint
+  at `tools/update-check.sh`, without stopping: when the newest record in
+  `/root/update-check/` has a state from before an update but none from
+  after it, the commands `after` and `mailcheck` with that record
+  (`--dir STAMP`); otherwise that `before` and `backup` can be run before
+  the next update and `after` and `mailcheck` after it (optional). Not on
+  a first install, and not when the in-place upgrade or the migration tool
+  runs setup (they have their own reports and now set `MIAB_SETUP_TOOL`
+  for their setup run). New offline test `tests/fork/update-check-hint.py`.
+* **Intrusion Detection and Prevention recognises banned Microsoft servers (B126)**\
+  System > Intrusion Detection and Prevention shows a hint at a banned address of the
+  servers through which Outlook for iOS and Android syncs Exchange
+  ActiveSync accounts: 20 wrong passwords there within two minutes get all
+  users of the app banned, and anyone can cause it on purpose (B126;
+  `miab-zpush` still counts for recidive). The hint offers a
+  button "Put <network> on the allowlist", which asks first and says what
+  it costs (guesses through these servers are no longer banned, and with
+  Dovecot's answer at once to the IMAP logins of Z-Push from 127.0.0.1,
+  B126, not slowed down either); nothing is
+  put on the allowlist on its own. The addresses are recognised by
+  Microsoft's published IP ranges of Exchange Online (Microsoft 365 IP
+  Address and URL web service, service area Exchange) and of its
+  AutoDetect service, which Microsoft names for an ActiveSync server that
+  Outlook for iOS and Android reaches, shipped as
+  `conf/fail2ban/microsoft-relays.txt` with its source, version, date and
+  SHA256 sums; `tools/update-microsoft-relays.py` refreshes it, the box
+  downloads nothing, and a list changed by hand is not used. Reverse DNS
+  decides nothing: the address's PTR name is shown only when it resolves
+  back to the address. API: `/system/fail2ban` has `relays` and
+  `relays_source`. New offline test `tests/fork/cloud-relays.py` and smoke
+  check `admin-cloud-relays-unit`.
+
+### Changed
+
+* **System > Intrusion Protection is now "Intrusion Detection and Prevention"**\
+  The page has a new name, in the menu, on the page and in the texts and
+  mails of the box that point to it: it detects attacks (fail2ban's jails,
+  the failed-login report, the limit of failed logins from the box itself)
+  and now also prevents a flood of mail from the box (the sending limit,
+  B221). Its link (`#fail2ban`) and the API paths stay the same. The
+  administrator's audit line for its settings now says "the intrusion
+  detection and prevention settings"; the log audit accepts both forms.
+
+* **Intrusion Detection and Prevention lists the banned addresses page by page (B220)**\
+  Under a larger attack System > Intrusion Detection and Prevention loaded for a long
+  time or not at all, and its table "Banned in, and why" was wider than
+  the page (B220). The page now shows the networks with the most banned
+  addresses (a click filters by one) and a compact table, one row per
+  address: address, jails, since, end, "Why?" and "Unban". "Why?" loads
+  the failures, log lines and rule of each ban into a row below, with
+  "in this jail only"; long text wraps. The filter (part of an address or
+  jail, or a network such as `192.0.2.0/24`) is applied on the server, in
+  pages of 50 with previous and next. API: `GET /system/fail2ban` is an
+  overview without the bans (counters, `banned_count` per jail,
+  `top_networks`, `client.banned_in`, relay hints); new
+  `GET /system/fail2ban/bans` (`filter`, `offset`, `limit` up to 200) and
+  `GET /system/fail2ban/ban-reason?ip=`. A script that read `jails[].banned`
+  or `reason` from the status uses these now. New offline test
+  `tests/fork/ban-list.py` (10,000 synthetic bans), smoke checks
+  `admin-fail2ban-bans` and `admin-ban-list-unit`.
+* **Tests: the lab preparation leaves the seeded mails alone**\
+  New `tests/fork/spam-move.py` for test boxes: it moves a marked test mail
+  of its own into Spam and back, so that IMAPSieve runs sa-learn as for a
+  user's client, deletes it and checks that the other mails keep their
+  UIDs. The preparation of the update test's start snapshot (T5b) moved a
+  seeded INBOX mail instead, which gave it a new UID and so a new POP3 UIDL,
+  and the smoke check `mig-pop3-uidl-alice` failed on every run from that
+  snapshot, also before any update (T5b of v78-r2604.3). A snapshot
+  prepared with the new script works with the original manifest
+  (TESTING-fork.md, "Test environment").
+* **Tests: log audit allowlists from the test runs of this release**\
+  `tests/fork/log-audit.sh` also names the local part of a mailbox path
+  under the box's own name `<user>` (the mailboxes of the box's name, such
+  as postmaster@, kept their local part and missed the rules of
+  fts-xapian's notes). New or wider rules, each with its reason: a report
+  recipient at another provider in System > Notifications; Roundcube's
+  CardDAV migration race of two first logins (README-fork.md names it for an
+  update from rc7); Z-Push's
+  "could not stat folder" at setup's Dovecot reload; fail2ban's note on the
+  first match of `miab-munin` after its start; the in-place and migration
+  tools' own notices of local Roundcube changes; the first start of the
+  slow-login jails on a box upgraded in place; dbus, systemd-tmpfiles,
+  AppArmor (named) and containerd notes of the release upgrades; and in
+  `log-audit-allow-old-box.txt` Dovecot 2.3's anvil note at the old box's
+  stop and `postqueue`'s note when `--check-old` reads the stopped old
+  box's queue. From the repeated runs: an IMAP process and an smtpd that
+  lose their service in the moment of setup's Dovecot and Postfix reloads.
+* **Checks that the control panel's icons and scripts are installed**\
+  The planned item "Control panel asks for a favicon.ico that is not
+  installed" (an nginx 404 for `/admin/assets/branding/favicon.ico`, noted
+  in rc7) is closed without a change of setup: setup/management.sh copies
+  the file since the fork's icons were added, and T1 of v78-r2604.0 found
+  the panel's icons served. A possible source of the 404 is an update of
+  rc7 or earlier, where setup emptied the assets directory before it
+  filled it again (B157, fixed in v78-r2604.2). New offline check
+  `tests/fork/panel-assets.py` (every file that a template names under
+  `/admin/assets/` is one that setup installs, and the icons that setup
+  copies are in the repository) and smoke check `admin-panel-assets`
+  (each of them is served, the icons are the files of `branding/`).
+* **Setup restarts OpenDKIM, spampd and others only on a change**\
+  Setup restarted OpenDKIM and OpenDMARC, spampd, postgrey, named,
+  systemd-resolved, munin-node and the management daemon on every run,
+  also when nothing had changed; while OpenDKIM restarts, Postfix passes
+  mail unsigned (`milter_default_action`), while spampd or postgrey
+  restart, deliveries wait or are deferred, and while named restarts, the
+  box's lookups fail. Each of them is now restarted only when what it
+  reads at its start changed since setup last restarted it (a checksum in
+  `/var/lib/mailinabox/<unit>-config.sha256`, as for Dovecot since B122:
+  its configuration files and drop-ins; for OpenDKIM also `TrustedHosts`
+  and the DKIM key file, not `KeyTable` and `SigningTable`, for which the
+  management daemon restarts it; Munin's plugin links; the management
+  daemon's code, start script, `/etc/mailinabox.conf` and the packages of
+  its virtualenv), or when it
+  does not run or runs the program of an older package (for spampd,
+  postgrey and munin-node also of the Perl modules they read, which no
+  "(deleted)" mapping shows: `spamassassin`, `libnet-server-perl`,
+  `munin-common`, so that a SpamAssassin update still restarts spampd as
+  the restart on every run did), or when it was started since setup
+  recorded the checksum, by anything else or at boot (the record names
+  the unit's systemd `InvocationID` too). The
+  last one covers a downgrade to v78-r2604.4, whose setup restarts them
+  with its own code and keeps no checksum, and the way back up, also with
+  a reboot in between (the services then start at boot from the old
+  checkout and files): the
+  checksum is the same as before the downgrade, and the management daemon
+  of v78-r2604.4 (without `POST /me/password` for webmail's password
+  change) would have kept running. A first version went by the start
+  time and trusted every start at boot, which missed the reboot (found in
+  the review). The price: the first setup run after a reboot, or after a
+  restart by an administrator or a package, restarts each of them once
+  more. Not after sa-update's restart of spampd for new rules (nearly
+  daily): a hook after the package's (`sa-update-hooks.d/spampd-record`)
+  records that run when spampd's files are those of the record, and a
+  drop-in lets `spamassassin-maintenance.service` write that one record
+  (found in the review). The management daemon's restart of OpenDKIM for
+  new DKIM tables and the postgrey whitelist update (every 28 days) still
+  cost one more restart at the next run. The same holds for
+  PHP-FPM (B122, a reload then). The first run of
+  this release restarts each of them once more. New offline test
+  `tests/fork/restart-on-change.py`. `tools/update-check.sh after` accepts
+  the new drop-in of `spamassassin-maintenance.service`
+  (`expected-changes/v78-r2604.5.txt`; without it, every update to this
+  release ended "RESULT: CHANGED", found in its test runs), and
+  `tests/fork/update-check-compare.py` checks that every drop-in that setup
+  writes is in a list of expected changes.
+* **Setup removes old Nextcloud backup copies, keeps the newest three**\
+  `$STORAGE_ROOT/owncloud-backup` grew with every update of Nextcloud and of
+  its pinned apps: each leaves a copy of the database, `config.php` and the
+  replaced code, nothing removed them (one box had 2.5 GB there), and the
+  directory is not in the box's backup. setup/nextcloud.sh now keeps the
+  three newest copies (named by setup's date and time, the one of the run
+  among them) and all of the last 14 days, and removes the older ones;
+  other names in the directory stay. The 14 days keep the copy from
+  before an upgrade that failed: every later run makes another copy, of
+  the half-upgraded state. It works through one descriptor of the directory, which must be
+  root's own and not writable by others (B177), and does not follow a
+  symbolic link (the storage user owns `$STORAGE_ROOT`); a problem is
+  reported and setup goes on. New tool `tools/owncloud_backup_prune.py`,
+  offline test `tests/fork/owncloud-backup-prune.py`.
+* **README: known issues (B122, B121, B137)**\
+  README-fork.md has a new section "Known issues / Bekannte
+  Einschränkungen" (English and German) with three issues from the list of
+  planned work: a Dovecot reload ends the open IMAP sessions (B122); it
+  still causes two client-visible failures, a login handed to the new auth
+  process at that moment and a Z-Push answer that cannot connect again
+  (B122, B121, B137); and a race in the migration of Roundcube's CardDAV
+  plugin when two sessions log in at once after its upgrade (to be
+  reported to the plugin project).
+* **Setup's comment on Spamhaus and public resolvers corrected (B136)**\
+  The comment in setup/network-checks.sh no longer names 8.8.8.8 among the
+  resolvers whose queries Spamhaus refuses with 127.255.255.254: through
+  8.8.8.8 Spamhaus answers NXDOMAIN, also for its own test entries, so
+  setup's checks can neither see a listing there nor say that they could
+  not check. This stays a known issue (README-fork.md, "Known issues").
+* **README: PHP 8.5 in universe, security updates with Ubuntu Pro**\
+  README-fork.md has a new section "Security updates and Ubuntu Pro /
+  Sicherheitsupdates und Ubuntu Pro" (English and German): `php8.5-fpm`
+  and some PHP modules of the box (and `nsd`, `opendkim`, `opendmarc`,
+  `spampd`, `postgrey`, `fail2ban`, `munin`, `certbot`) are in Ubuntu's
+  universe component, whose security updates Canonical guarantees only
+  with Ubuntu Pro (`esm-apps`); what that means for a box, and how to turn
+  it on (`pro attach`, a free personal subscription).
+* **Postfix's smtpd_tls_dh1024_param_file warning explained in the README (B59)**\
+  The planned item "postconf warns that smtpd_tls_dh1024_param_file will
+  be removed" is closed without a code change: a fresh install and an
+  updated box of the current branch print no such warning (`postconf`,
+  `postconf -d`, `postfix check`, the journal; the parameter is set in
+  neither `main.cf` nor `master.cf`). The warnings in the test runs came
+  from boxes on rc3 (before B59, which comments the parameter out) and
+  from the in-place upgrade, while the release upgrade installs Postfix
+  3.10 and `main.cf` of the old box still sets it, before setup runs.
+  README-fork.md lists the line under "Setup output".
+* **README: Nextcloud on SQLite and HTTP 500 during cron, a known issue**\
+  The planned item "Nextcloud on SQLite answers CardDAV writes with HTTP
+  500 during cron" moves to README-fork.md, "Known issues": Nextcloud's
+  SQLite database is in WAL mode already (Nextcloud's default
+  `sqlite.journal_mode`) and PHP waits up to 60 s for a lock (pdo_sqlite's
+  default), checked on a test box; the immediate "database is locked" of a
+  transaction that read first and then writes after another connection
+  wrote is not changed by any setting, so setup changes nothing.
+### Fixed
+
+* **The sending limit warns when its release service does not run (B226)**\
+  The control panel's page of the sending limit and `send_limit.py
+  --status` showed no warning when only `miab-sendlimit-release` had
+  stopped (then nothing is held or released); they now check both
+  services on their own.
+
+* **Mail that arrives during setup no longer waits 5 minutes (B225)**\
+  Mail to the box's users that arrived while setup restarted spampd or
+  Dovecot was deferred, and Postfix tried it again only after 5 minutes.
+  At its end, setup now retries those mails at once (only those: other
+  deferred mail keeps its schedule, held mail stays held). Found in the
+  update test with client load.
+* **Ports 465 and 587 no longer stop answering for a minute after a restart of Dovecot (B224)**\
+  A submission process of Postfix that started while Dovecot restarted
+  could not reach Dovecot's auth socket and exited, and Postfix then
+  started no new one for 60 s: mail programs got no answer. Postfix now
+  waits 10 s (`service_throttle_time`), and setup installs Dovecot's
+  packages so that their scripts do not restart Dovecot: an update
+  restarts it once, after setup wrote its configuration. Found in the
+  update test with client load.
+* **No failed logins when an update brings new passdbs (B223)**\
+  Setup reloads Dovecot when its configuration changed. A reload that
+  brings new passdbs (this release's account lock) could make Dovecot's
+  auth process die under load, and the logins in that moment failed.
+  Setup now restarts Dovecot when a passdb or userdb changed, and reloads
+  it for all other changes as before. Found in the update test with client
+  load.
+* **Mail no longer waits 5 to 10 minutes after a reboot (B222)**\
+  At boot Postfix started before spampd listened on port 10025; mail in
+  the queue found the port refused, and Postfix then held back all mail to
+  the box's users for 5 to 10 minutes, also mail that came in later. The
+  start of spampd now ends only when it listens, and Postfix starts after
+  it (systemd drop-ins written by `setup/spamassassin.sh`). Found in the
+  in-place test.
+* **No status change mail every night with nc's "succeeded!" line (B184)**\
+  The status checks test outbound port 25 with nc, and the nc of Ubuntu
+  26.04 prints "Connection to aspmx.l.google.com ... succeeded!" on
+  standard error. The nightly job mails everything that the status checks
+  print, so a "Status Checks Change Notice" with only that line went out
+  every night, also when nothing had changed (now also to a report
+  recipient at another provider). nc's output is now discarded. New cases
+  in `tests/fork/status-dns.py`.
+* **System Status "show more" and TLS result are shown again (B178)**\
+  System Status shows the extra lines of its checks again: the "show more"
+  link under a check was missing since rc4, so for example the DS records
+  that "This domain's DNSSEC DS record is not set ... See below for
+  instructions" refers to could not be seen. The TLS page shows the result
+  of a certificate request again ("The TLS certificate was provisioned and
+  installed." or the error). Both came from the update of the control
+  panel's jQuery to 3.x, which reads `<div/>` as an opening tag (B178). New
+  static check `tests/fork/panel-fragments.py`.
+* **Status change mail shows changed checks whole; DNSSEC messages say where (B179)**\
+  The daily "Status Checks Change Notice" shows a changed check with all of
+  its lines: a DNSSEC warning now comes with the DS records to set, also
+  when only the message changed (it said "See below for instructions."
+  with nothing below), and a changed line comes with its message. The
+  DNSSEC messages say that the DS records are listed below the message,
+  in the control panel under "show more", instead of "see below". New
+  offline test `tests/fork/status-changes.py`.
+* **The control panel sends the HSTS header of the box (B180)**\
+  nginx answers `/admin/` (the control panel, its API and Munin's pages)
+  with the same HSTS header (`Strict-Transport-Security`) as the other
+  pages of the box's name, or with none when HSTS is off for it in
+  `$STORAGE_ROOT/www/custom.yaml`: the location's own headers had replaced
+  the server's (B180, upstream). New offline test
+  `tests/fork/nginx-hsts.py` and smoke check `web-hsts-admin`.
+* **Status checks no longer crash on overlong domain names (B181)**\
+  The status checks end no longer with a traceback when a lookup cannot be
+  made: a mail domain whose name is too long with `.dbl.spamhaus.org`
+  appended (more than about 237 characters) gets the warning that it is
+  too long to be looked up in the Spamhaus DBL, and a lookup that a DNAME
+  makes too long (YXDOMAIN) counts as a failed lookup (B181, upstream).
+  New offline test `tests/fork/status-dns.py` and smoke check
+  `admin-status-dns-unit`.
+* **Failed DS lookup: "could not check", not "DS record is not set" (B182)**\
+  When the lookup of a zone's DS record times out or fails, System Status
+  and the daily status change notice say "Could not check this domain's
+  DNSSEC DS record: the DNS lookup timed out/failed" instead of "This
+  domain's DNSSEC DS record is not set" with the DS records to set (B182,
+  upstream; B150 had left the DS lookups as they were). A zone's checks
+  look its DS records up once instead of three times. New cases in
+  `tests/fork/status-dns.py`.
+* **In-place upgrade and migration name local Roundcube changes (B200)**\
+  The in-place upgrade (tools/upgrade-in-place-to-2604.sh) and the
+  migration (tools/migrate-to-2604.sh) no longer lose local changes to
+  Roundcube without a word. Setup installs the new Roundcube as a new tree
+  and writes its own `config/config.inc.php`, so plugins installed by hand
+  and changes to that file were gone afterwards, and neither the check nor
+  `etc-report.txt` named them. The preflight check (also `--check`) now
+  warns, without stopping the upgrade, and names the plugin directories
+  that setup does not install, plugins added to or left out of the plugin
+  list, and other settings that differ from what setup writes (a setting
+  that setup does not write by its name only, as its value may be a
+  password). Before setup the tools keep the old `config.inc.php` and
+  those plugin directories in `old-roundcube/` of their state directory
+  (the in-place upgrade's system archive now also holds the whole old
+  Roundcube). They are not copied back on their own, since a plugin for the
+  old Roundcube can break the new one. Phase verify lists what the new
+  Roundcube does not have, also in `etc-report.txt`, says how a hook in
+  `/etc/mailinabox/upgrade-2604.d/` brings it back, and writes the open
+  items into `local-changes.json` (root's only) in the state directory;
+  while that file exists, System Status shows a warning with the items
+  under "show more", and so the daily status change mail names it too. The
+  new option `--ack-local` of both tools, or removing the file, ends it.
+  New offline test `tests/fork/roundcube-local.py`. A first version of the
+  migration tool's report stopped its preflight check, and so `--check`
+  and the migration of every box with such changes, with "STORAGE_ROOT:
+  unbound variable" (B185, found in the test runs of this release; the
+  test now runs both tools' reports as bash with `set -u`). The kept
+  plugin copies keep their modes (`old-roundcube/` itself is root's only),
+  and phase verify names a local plugin that the web server cannot read:
+  a first version made the copies root's only, and a plugin brought back
+  with `cp -a` as proposed was not loaded by Roundcube, which logged an
+  error on every request (B186, found in the test runs of this release; a
+  first version of the check read the list of plugin directories, which
+  the tools pass as a pipe, twice and so never named a plugin, found in
+  the review of this release).
+* **update-check.sh records the two TLS key exchange parameters of Postfix (B201)**\
+  tools/update-check.sh now records `tls_eecdh_auto_curves` and
+  `tls_ffdhe_auto_groups` too, so a change of Postfix's key exchange (such
+  as the post-quantum one of v78-r2604.3) shows in its list of changes.
+  `after` judges only the settings that both records have: a setting that
+  only the record after the update has (recorded by a newer version of the
+  tool, so its value before is unknown) is listed in a section "Newly
+  recorded (not judged)" of `changes.txt` and counted in the RESULT line,
+  not as an unexpected change. New offline test
+  `tests/fork/update-check-compare.py`.
+* **update-check after an in-place upgrade uses the old box's allowlist (B187)**\
+  After an in-place upgrade, the log audit of `tools/update-check.sh after`
+  starts while the old release still ran. It now adds
+  `tests/fork/log-audit-allow-old-box.txt` by itself when the Ubuntu
+  release changed, so lines such as SpamAssassin's daily restart of spamd
+  on 24.04 before the upgrade are no longer new message classes ("RESULT:
+  look at the new log message classes", exit code 1). New cases in
+  `tests/fork/update-check-compare.py`.
+* **bootstrap.sh is no longer fooled by a local tag of the release name (B202)**\
+  bootstrap.sh fetched nothing when `git describe` printed the name of the
+  release to install, so a local tag of that name on another commit (an
+  old pre-release, a mirror's tag) kept the old code, and setup ran on it
+  and ended with exit code 0. It now also asks the source for the commit
+  of the tag (`git ls-remote`) and fetches the release when that is not the
+  checkout's commit; after the checkout, it stops if the commit is still
+  another one. When the source cannot be asked, it says so and uses the
+  checkout as before. README-fork.md ("Updating the fork") is updated.
+* **In-place upgrade --check proposes the start command with SOURCE and TAG (B203)**\
+  The start command that `upgrade-in-place-to-2604.sh --check` proposes
+  (and repeats when blockers stop a run) now begins with `SOURCE=...` and
+  `TAG=...` when they are set, quoted for the shell, and through
+  `curl | bash` names the script of that source instead of the GitHub URL.
+  Whoever copied the line before ran the release from GitHub instead of
+  the source and tag that were checked.
+* **TAG may be a full commit id, also for a fresh clone (B188)**\
+  The in-place upgrade and the migration through `curl | bash`, and a first
+  install with `setup/bootstrap.sh`, clone the fork with `git clone -b
+  $TAG`, which takes a tag or a branch only: `TAG=<commit id>` stopped
+  with "Remote branch ... not found", although `--check` proposes the start
+  command with it (B203). A full commit id (40 hex digits) is now fetched
+  by its id; a short one fails with a hint. When the download fails, the
+  in-place tool's advice names the given `SOURCE` instead of GitHub, and
+  `setup/bootstrap.sh` says so (with the same hint for a short commit id)
+  instead of ending without a message. New offline test
+  `tests/fork/clone-ref.py`.
+* **Migration tool filters the old box's error messages too (B154)**\
+  `tools/migrate-to-2604.sh` passes the standard error of every command
+  that talks to the old box (its scripts through ssh, the login checks, the
+  copies of `/etc` and of the zones, rsync's checks and copies) to the
+  terminal with control characters replaced by "?", as it does for the
+  other text of the old box since B154; before, an error message of the old
+  box could send escape sequences to the terminal. The progress filter of
+  the main copy does the same for rsync's output. The carriage return at
+  the end of ssh's own messages is dropped rather than shown as "?" (a
+  first version printed "... to the list of known hosts.?"). New offline
+  test `tests/fork/old-side-filter.py`.
+* **In-place upgrade: no package run while mail goes offline (B190)**\
+  When the in-place upgrade stopped mail, its mask of `apt-daily.timer`
+  reloaded systemd, and `apt-daily-upgrade.timer` started a missed run of
+  unattended-upgrade at once, which installed packages after the system
+  archive and the package lists had been taken (so `--rollback` would
+  restore another package state). The services of both timers are now
+  masked first, in one call, and stay masked as long as the timers; the
+  tool waits for the dpkg lock after stopping the units. New offline test
+  `tests/fork/quiesce-order.py`.
+* **Right in-place upgrade messages after a failed --redo-from (B161)**\
+  When a `--redo-from` of the in-place upgrade fails, the exit message
+  names the redo and when it started, and says that cron jobs, update
+  timers and backups run when the upgrade had finished before (the redo
+  does not pause them again; it said they "stay paused"), or stay paused
+  until it is finished. A failed redo of setup says that setup runs again
+  since then and mail may be offline until it has, instead of "Mail is
+  OFFLINE" since the start of the upgrade's downtime. `--status` shows the
+  downtime up to the end of the first setup and a line "Redo:" with the
+  time setup ran again (or so far), instead of counting "Mail offline ...
+  so far" from the start of the original downtime.
+* **Migration tool's files in /root/migration are root's only (B204)**\
+  The files and directories directly in `/root/migration` (the state of
+  `tools/migrate-to-2604.sh`) are 0600 and 0700, among them the copies of
+  the old box's backup key `old-id_rsa_miab`, of its `passwd` and `group`
+  and the archive of its `/etc`; they were 0644 in a directory of root's
+  only (0700), so nothing was exposed. The copies of the old box are
+  written with umask 077, and the tool takes group and other access away
+  from the entries directly in the directory at its start, after each
+  phase and at its end, also from those of a migration that an older
+  version of the tool started. The unpacked copy of the old `/etc`
+  (`old-etc/`) keeps the modes of the old box inside its 0700 directory.
+  The file with the exit code that the tmux window writes after the run
+  (`.multiplexer-exit-code`) is made 0600 as well; a first version left it
+  0644 until the next call of the tool.
+* **Setup waits for Nextcloud's database lock (B189)**\
+  Setup's update of the `user_external` rows in Nextcloud's SQLite database
+  gave up at once when a CalDAV or CardDAV client or Nextcloud's cron job
+  was writing ("Error: stepping, database is locked (5)" in setup's
+  output). It now waits up to 60 seconds for the lock.
+* **Setup leaves PHP-FPM alone when its configuration is unchanged (B122)**\
+  Setup restarted PHP-FPM once per run (B122), which ended every running
+  request: ActiveSync's Pings and Syncs, CalDAV and CardDAV, webmail and
+  Nextcloud got HTTP 502. Now setup does nothing when PHP-FPM runs the
+  current package and its configuration (`/etc/php/8.5/fpm` with the
+  pools and the modules of `conf.d`, `mods-available`) is the one it
+  loaded last (a checksum in `/var/lib/mailinabox/php-fpm-config.sha256`),
+  so an update that changes nothing there no longer disturbs the clients.
+  When it changed, setup reloads PHP-FPM instead of restarting it: the
+  reload reads php.ini, the pools and the modules anew as a restart does
+  (checked with a module turned off and `memory_limit` changed), keeps the
+  listening socket, and lets the running requests finish for up to 5 s
+  (`process_control_timeout`, new in `php-fpm.conf`). A request that runs
+  longer, such as a Ping, is still ended then (502, as before), and new
+  requests wait up to those 5 s; so the plan's idea that a reload would
+  keep the long polls does not hold. Setup checks the configuration
+  (`php-fpm8.5 -t`) first and restarts PHP-FPM when it does not run (after
+  an upgrade of Nextcloud), runs an older package or replaced module, or
+  has not logged "ready to handle connections" within 30 s of the reload.
+* **Failed ActiveSync logins no longer take 10 to 50 seconds (B126)**\
+  A wrong password over ActiveSync or Autodiscover took 13 to 26 s (seen
+  up to 50 s), and a few failed logins of one client, below the ban
+  threshold of `miab-zpush`, slowed the correct logins of all other users
+  down to 15 s (measured on a test box: one wrong password every 3 s).
+  Z-Push checks each password with up to three IMAP logins from
+  127.0.0.1, and Dovecot delayed each failed login by 2 s and raised a
+  penalty of 127.0.0.1 that delayed all later logins from there, of every
+  user, by up to 15 s; Roundcube's and Nextcloud's IMAP logins come from
+  127.0.0.1 too. Dovecot now answers failed logins from 127.0.0.1 and ::1
+  at once and raises no penalty for them, and limits them per account
+  instead (see "Security": "Failed logins from the box itself are limited
+  per account"). These logins all come from services that fail2ban
+  protects with the client's own address (`miab-zpush`, `miab-roundcube`,
+  `miab-owncloud` and Nextcloud's throttle); logins from other addresses
+  keep Dovecot's delay and penalty. Guesses through Microsoft's servers
+  once they are on the allowlist are in README-fork.md, "Known issues".
+
+### Security
+
+* **Failed logins from the box itself are limited per account (B126)**\
+  Without Dovecot's delay for 127.0.0.1 (B126 above), a process on the box
+  that runs as one of its services, for example code run as www-data
+  through a hole in PHP or in Roundcube, could try the passwords of every
+  account as fast as Dovecot checks them (about 1000 a second on a test
+  machine, against 5 to 30 a second with the delay); fail2ban does not ban
+  127.0.0.1. Dovecot now counts the failed logins from 127.0.0.1 and ::1
+  per account name, with two small Lua passdbs around the SQL one
+  (package `dovecot-auth-lua`, `conf/dovecot-auth-guard/`): an account
+  with 30 different wrong passwords from the box within 30 minutes (both
+  numbers can be changed under System > Intrusion Detection and Prevention, which also
+  lists the counted and refused accounts with a button to end a lock; the
+  API `/system/auth-guard`) is refused for logins from the box until it
+  has fewer, at once and before
+  its password is checked, so further guesses tell nothing, not even a
+  right one. A password sent again counts once, as with Dovecot's own
+  penalty: a phone that keeps sending an old password (Z-Push tries up to
+  three times per request) or a repeated typo cannot lock the account,
+  while each guess counts; only a 16-bit tag of a hash of the password
+  with a random salt is kept, never the password. Only the failures of
+  the account itself count, and only real accounts are counted (the
+  management daemon writes the list of accounts whenever they change; a
+  name not on it, such as an account added while the list could not be
+  written, is counted in a separate pool of 500 names):
+  made-up names do not lower the limit of a real account, crowd out its
+  count or fill the state. Only wrong passwords count; a login with the
+  right password never does. "From the box" means every address of
+  127.0.0.0/8, ::1, every address of the box's interfaces (link-local ones
+  included, written again every 10 minutes) and any connection from an
+  address to itself, as a process on the box can use any of them. Many
+  connections at the same moment can get more guesses checked before the
+  first failure is recorded, as the passwords are checked in parallel;
+  such a burst then counts against the next windows as well (refused
+  while the last k windows hold k times the limit, k = 1 to 4), so over
+  time only a little more than the limit per window gets through: a
+  burst that fills fewer than 4 windows can be repeated as soon as it
+  leaves them (in the lab, bursts of 100 every 30 seconds with a window
+  of 1 minute got 33 guesses a minute checked, not 30). A lock after a
+  normal attack ends one window after it; after a burst it can last up to
+  4 windows (2 hours by default). The number of windows can be set from 1
+  to 4 as well (1: a lock never lasts longer than one window, but bursts
+  get more through); and `auth_username_chars` is empty, so that a user name with "+"
+  or a space no longer fails before these checks with Dovecot's delay and
+  the penalty of 127.0.0.1. The other accounts
+  are not slowed down (no penalty of 127.0.0.1), and the account's own
+  mail programs that log in from outside are not refused. The price:
+  someone who tries the passwords of one account through ActiveSync,
+  webmail or Nextcloud from addresses fail2ban does not ban locks that
+  account's phones, webmail and Nextcloud out while they keep trying.
+  New locks are mailed to the report recipient (System > Notifications),
+  at most one mail an hour (`management/auth_guard.py`, every 10
+  minutes; the cron job does nothing when the program is missing, so a
+  downgrade to v78-r2604.4 does not mail an error every 10 minutes);
+  `sudo management/auth_guard.py --status` shows the counts and
+  `--unlock ADDRESS` ends a lock as well. Dovecot reads the setting on
+  every login from the box, so a change applies at once. If Dovecot cannot write its counts in
+  `/run/miab-auth-guard`, failed logins from the box get Dovecot's delay
+  again, never no limit. Setup now also reloads Dovecot when only these
+  Lua files change (they are part of the configuration's checksum).
+
+* **Webmail can no longer rewrite the user database (B210)**\
+  `users.sqlite`, the database of all mail accounts, their password hashes,
+  privileges and aliases, is root's only now (root:root 0600), and
+  `$STORAGE_ROOT/mail` is root:root 755. Up to v78-r2604.4 the database was
+  root:www-data 0664 in a directory that www-data could write, as upstream
+  has it, because Roundcube's password plugin wrote it with SQL. So any code
+  running as www-data could set the password of any account (also an
+  administrator's), give itself the admin privilege, or add an alias that
+  forwards a user's mail to the outside, and every local account could read
+  all password hashes. Code running as www-data takes a hole in PHP,
+  Roundcube, Nextcloud or Z-Push, but such holes are real and recent: the
+  PHP releases of October 2026 ("PHP2Shell", CVE-2026-109618 and
+  CVE-2026-109619, remote code execution, fixed in PHP 8.5.12, 8.4.27,
+  8.3.36 and 8.2.35) and of 19 November 2026 (PHP 8.5.13 and others,
+  several remote code execution issues), and Roundcube's post-authentication
+  remote code execution CVE-2025-49113 (fixed in 1.6.11 and 1.5.10,
+  exploited in the wild). Each gives code as www-data on a Mail-in-a-Box,
+  and before this release that code could take over every mail account.
+  Roundcube's Settings > Password now changes the password through the
+  management daemon: the fork's password driver
+  (`conf/roundcube-password-mailinabox.php`) calls the new endpoint
+  `POST /me/password` on 127.0.0.1 (nginx does not pass it on from the
+  Internet), which checks the current password (and
+  two-factor authentication) as the control panel's login does, applies the
+  same password rules and hash as the control panel, changes only the
+  caller's own password, logs failed attempts for fail2ban's
+  `miab-management` jail and refuses more after 5 failures for an account
+  (one that exists, so that made-up names cannot push a real account's
+  failures out of the limiter) or 10 for an address within 10 minutes. Roundcube's own messages (a wrong
+  current password, a short new one) are as before. Every other reader opens
+  the database as root (Dovecot's auth-worker, Postfix's daemons before they
+  drop their privileges, the management daemon, the backup, the tools); the
+  database stays in SQLite's rollback journal mode, in which readers need no
+  write access to the directory. New offline test
+  `tests/fork/self-password.py`, smoke check `api-self-password` (the
+  endpoint closed from outside, and Roundcube's settings page).
+
+* **Setup no longer reruns data migrations for a lowered version (B211)**\
+  The storage user owns `$STORAGE_ROOT/mailinabox.version` and could write a
+  lower number into it, and the next setup run ran the data migrations from
+  there again as root (depending on the number deleting the DKIM key, moving
+  the Let's Encrypt account away, dropping Roundcube's CardDAV tables and
+  all webmail sessions). Setup now also records the number of the last
+  migration that ran in `/var/lib/mailinabox/storage-migration` (root's own,
+  with the path of the `$STORAGE_ROOT` it belongs to) and stops before any
+  migration when the file says less, with what to do; a missing file is
+  taken from the record. A higher number counts as before, but only up to
+  the newest migration of the running version: above it setup stops too,
+  unless the record has the same number (a downgrade), so a wrong number
+  cannot skip the migrations of later releases. A first version took such
+  a number and recorded the newest migration, and the next release's
+  migrations were then skipped and recorded as run (found in the review). The
+  file itself stays where and as it was, so it
+  still goes into backups and to a new box. New offline test
+  `tests/fork/migration-record.py`.
+
+* **Backup and DNS settings only from directories of root's own (B212)**\
+  The nightly backup, the control panel and the DNS update read
+  `backup/custom.yaml`, `backup/secret_key.txt` and `dns/custom.yaml`
+  below `$STORAGE_ROOT`, and write the two `custom.yaml`, only through the
+  checked directory (a directory of root's own, not a symbolic link, not
+  writable by group or others, opened once), as the fork's tools do since
+  B117 and as `settings.yaml` is written since B87. Upstream read them by
+  path and wrote `custom.yaml` with `open(..., "w")` as root: the storage
+  user, which owns `$STORAGE_ROOT`, could replace `backup/` and have the
+  backups of `$STORAGE_ROOT` go to a server of its own with a passphrase it
+  knows, or put records of its own into the DNS zones. When such a
+  directory or file cannot be trusted, no backup is made and the DNS zones
+  are not rebuilt (the old ones stay), with the reason (for the backup in
+  the nightly mail, for both in the status checks); the web configuration
+  and the TLS certificates go on without the custom DNS records. `backup/custom.yaml` is
+  now written with mode 0600 (it can hold the target's credentials). New
+  offline test `tests/fork/storage-dirs.py`.
+
+* **Status checks read the DNSSEC key only through a checked dns/ (B183)**\
+  The DNSSEC check of the status checks read `dns/dnssec/<algorithm>.conf`
+  and the KSK's `.key` file by path for the public key that it shows with
+  the DS records to set. With a `dns/` of the storage user's own in place
+  of the box's (B212), System Status answered HTTP 500 and the status
+  checks ended with a traceback, also in the nightly status mail, and with
+  a `dnssec/` of its own the key shown came from its files. The key is now
+  read only through the checked `dns/` and `dnssec/` (root's own, not
+  writable by others, regular files of root's); when that fails, the DS
+  records to set are shown without the key, with the reason, and the other
+  checks go on. New cases in `tests/fork/storage-dirs.py` and
+  `tests/fork/status-dns.py`.
+
+* **Zone signing reads the DNSSEC keys only through a checked dns/ (B191)**\
+  The DNS update (and its daily run that signs the zones again) read the
+  `.conf` files in `dns/dnssec/` and the key files they name by path, as
+  root, and wrote the patched copies to its temporary directory under the
+  names from the `.conf` without checking them. The storage user could put
+  a `dns/` of its own in place of the box's (B212), even while the update
+  ran, whose `.conf` names a key with `../` in its name: root then copied
+  a file of the storage user's to a place of its choice outside the
+  temporary directory (for example a configuration directory that a root
+  job reads), and signed the zones with its keys. The `.conf` files and
+  the keys are now read only through the checked `dns/` and `dnssec/`
+  (root's own, not writable by others, regular files of root's), a key
+  name must be a plain file name (`K` and letters, digits, `._+-`), and
+  the copies are new files created in the temporary directory only. When
+  that fails the DNS update stops with the reason and the zones stay as
+  they are. The keys' hash in the zone files is unchanged, so no zone is
+  signed again for this update. New cases in `tests/fork/storage-dirs.py`.
+
+* **Nextcloud takes X-Forwarded-For only from nginx's own proxy (B213)**\
+  Nextcloud takes the client's address from `X-Forwarded-For` on every
+  connection from 127.0.0.1 (`trusted_proxies`, B121), so any local account
+  or service could make it log a failed login under another address, which
+  the `miab-owncloud` jail then banned. nginx's proxy of `/caldav`,
+  `/carddav` and `/webdav` now proves itself to `/cloud` with a secret
+  header (from `/etc/nginx/miab-nextcloud-proxy.conf`, root's only,
+  made once by setup and kept), and nginx passes `X-Forwarded-For` to
+  Nextcloud's PHP only with that secret; PHP never sees the secret. Until
+  setup has made the file (a setup run that stopped early), nginx's
+  configuration still loads, and the proxy's clients are seen as
+  127.0.0.1. Clients
+  on the Internet keep their own address through the proxy (throttle and
+  jail as before), Z-Push stays 127.0.0.1, and another local request is
+  logged as 127.0.0.1, which fail2ban ignores. A downgrade to
+  v78-r2604.4 leaves the file unused. New smoke check
+  `nextcloud-forwarded-for-local`.
+
+### Upgrade note
+
+* **User database root's only; webmail password changes via the daemon (B210)**\
+  Setup gives `$STORAGE_ROOT/mail` to root:root 755 and `users.sqlite` to
+  root:root 0600 (through descriptors, and only when root owns them
+  already: otherwise setup stops before it changes anything, naming
+  them with "not taken over"; check such a
+  directory and give it to root with `chown root:root`), and switches
+  Roundcube's password
+  plugin to the fork's driver. Mail is not interrupted: Dovecot and Postfix
+  keep their open database, and new lookups open it as root. Between
+  setup's Roundcube step and the restart of the management daemon a few
+  minutes later, a password change in webmail fails with "Could not save
+  new password. Connection error." (try again after the update). Webmail
+  cannot change the password of an account with two-factor authentication
+  (the daemon would need its code): an administrator changes it in the
+  control panel (Mail & Users > Users). A user who is not an administrator
+  and has turned on two-factor authentication can no longer change their
+  own password; the old SQL driver did not check it. Scripts of your own that read
+  `users.sqlite` as another account than root no longer can. A backup of
+  this version restored on an older version, or a downgrade to
+  v78-r2604.4, works: its setup gives the directory and the database back
+  to www-data and the plugin back to its SQL driver (the driver file
+  `plugins/password/drivers/mailinabox.php` stays, unused). An older backup
+  restored on this version gets the new owner and modes at the next setup
+  run.
+
+* **Backups stop if backup/ is not root's own (B212)**\
+  If `$STORAGE_ROOT/backup` or `$STORAGE_ROOT/dns` is not a directory of
+  root's own (owner root, mode 755 as setup makes them), or `custom.yaml`
+  or `secret_key.txt` in it is not a regular file of root's, backups (and
+  DNS updates) stop with the reason. Put them right with `chown root:root`
+  and `chmod 755` (and check the files in them).
+
+* **A proxy of your own to the box's /cloud is seen as 127.0.0.1 (B213)**\
+  A proxy that you set up in `www/custom.yaml` to the box's own `/cloud`
+  (`https://127.0.0.1/cloud/...`) no longer passes the client's address to
+  Nextcloud: Nextcloud sees 127.0.0.1, which is on its brute-force bypass
+  list, so its clients skip Nextcloud's throttle and the `miab-owncloud`
+  jail, and Dovecot answers the IMAP logins with which Nextcloud checks
+  their passwords at once (B126): nothing slows down password guesses
+  through such a proxy. Do not use one on a box reachable from the
+  Internet. The box's own paths (`/caldav`, `/carddav`, `/webdav`, `/cloud`)
+  are not affected.
+
+* **Restoring an older backup on the same box: remove the migration record (B211)**\
+  The first setup run of this version records the box's migration number
+  in `/var/lib/mailinabox/storage-migration`. If you later restore a backup
+  of `$STORAGE_ROOT` made before a migration of a newer release, setup stops
+  ("... says #N, but this box has run the data migrations up to #M"):
+  remove that file and run setup again, so that the backup's migrations
+  run. A restore on a new box is not affected (a new box has no record),
+  and `tools/migrate-to-2604.sh` removes the record before each of its
+  setup runs, as the copy of the old box decides there (also after its
+  rehearsal or a rollback on the same machine). A downgrade to
+  v78-r2604.4 ignores the record and leaves the number as it is, so the
+  way back up works too.
+
+* **The update removes all but the three newest Nextcloud backup copies**\
+  The first setup run of this release removes every copy in
+  `$STORAGE_ROOT/owncloud-backup` but the three newest and those of the
+  last 14 days. To keep an older
+  one, move it out of that directory before the update (to a name that is
+  not a date and time, or elsewhere).
+* **The update restarts Dovecot, reloads PHP-FPM once and restarts a few services**\
+  The first setup run of this release restarts Dovecot (its new passdbs
+  of the account lock, B126, B223: the open IMAP sessions end, and their
+  clients log in again; a login in the few seconds of the restart fails,
+  and Postfix's submission ports may not answer for up to 10 s, B224) and
+  reloads PHP-FPM (its new `process_control_timeout`, B122: a Ping
+  that is open then gets HTTP 502 after 5 s), and restarts OpenDKIM,
+  OpenDMARC, spampd, postgrey, named, systemd-resolved, munin-node and the
+  management daemon once more, as it has no checksums of them yet. Later
+  runs leave them alone unless their configuration changes or they were
+  started since by something else; the first run after a reboot restarts
+  them (PHP-FPM: reloads it) once more.
 
 ## v78-r2604.4 (2026-11-19)
 
@@ -178,7 +971,8 @@ copy of a production box from v78-r2604.3 (T5b), see TESTING-fork.md.
 
 ### New
 
-* Intrusion protection (System > Intrusion Protection) shows why an
+* **Intrusion Protection shows why an address is banned**\
+  Intrusion protection (System > Intrusion Protection) shows why an
   address is banned: for each ban the failures and the log lines that
   fail2ban kept for it (up to 10, from its database), the accounts of the
   box they name, and the jail's rule (what it watches, its thresholds, the
@@ -191,7 +985,8 @@ copy of a production box from v78-r2604.3 (T5b), see TESTING-fork.md.
   account, and one that is not valid JSON no more than its login message.
   `GET /admin/system/fail2ban` gives the same as `reason` of each ban and
   `jail_info`.
-* Nextcloud's own brute-force throttle in the control panel. Apart from
+* **Nextcloud's login throttle in the control panel**\
+  Nextcloud's own brute-force throttle in the control panel. Apart from
   fail2ban, Nextcloud counts failed logins per address (IPv4) or IPv6
   network (/56 by default): after failures within 12 hours it delays every
   login from there,
@@ -236,7 +1031,8 @@ copy of a production box from v78-r2604.3 (T5b), see TESTING-fork.md.
   --setup | --status | --reset <ip>`; setup/start.sh applies the settings
   after fail2ban's (never stopping setup). The status checks warn when
   Nextcloud's settings do not match.
-* The thresholds of Mail-in-a-Box's own jails can be changed (setting
+* **Thresholds of the box's fail2ban jails can be changed**\
+  The thresholds of Mail-in-a-Box's own jails can be changed (setting
   `jails`; the control panel shows a table with failures, window and ban
   time): `dovecot`, `miab-management`, `miab-munin`, `miab-owncloud`,
   `miab-postfix465`, `miab-postfix587`, `miab-roundcube`, `miab-zpush`,
@@ -244,16 +1040,19 @@ copy of a production box from v78-r2604.3 (T5b), see TESTING-fork.md.
   `conf/fail2ban/jails.conf` are stored and written into
   `mailinabox_adaptive.conf`; fail2ban is reloaded, and `fail2ban-client
   -t` checks the configuration first as for the other settings.
-* The failed-login report and its status check read Nextcloud's log too
+* **Failed-login report also reads Nextcloud's log**\
+  The failed-login report and its status check read Nextcloud's log too
   (one line per failed login of Nextcloud, CalDAV, CardDAV and WebDAV, with
   the address that the miab-owncloud jail takes), so accounts and addresses
   that fail only there show up.
-* New smoke checks (group admin): `admin-fail2ban-jail-values`,
+* **New smoke checks for jail values, ban reasons and Nextcloud throttle**\
+  New smoke checks (group admin): `admin-fail2ban-jail-values`,
   `admin-fail2ban-ban-reason`, `admin-nextcloud-throttle`,
   `admin-nextcloud-throttle-settings`; the opt-in group fail2ban checks the
   reason of its real ban. Every change of the settings writes a line to the
   management daemon's log, as an unban and a reset do.
-* Tests: `tests/fork/log-audit-allow.txt` accepts these audit lines of the
+* **Log audit allow list accepts new control panel audit lines**\
+  Tests: `tests/fork/log-audit-allow.txt` accepts these audit lines of the
   control panel (settings saved or reset, unbans, resets of Nextcloud's
   throttle), the failed Nextcloud logins of the new throttle checks, and
   two lines that bind and Postfix log once right after the management
@@ -262,7 +1061,8 @@ copy of a production box from v78-r2604.3 (T5b), see TESTING-fork.md.
 
 ### Fixed
 
-* A new version of the Nextcloud apps contacts, calendar or user_external
+* **New Nextcloud app pins reach existing boxes (B176)**\
+  A new version of the Nextcloud apps contacts, calendar or user_external
   that setup pins reaches an existing box now also when Nextcloud itself
   stays: setup compares the installed versions with the pins, downloads and
   checks every new release first (a failed download changes nothing),
@@ -273,7 +1073,8 @@ copy of a production box from v78-r2604.3 (T5b), see TESTING-fork.md.
   upgrade`. Before, a new pin took effect only with the next Nextcloud
   version, and a fresh install and an updated box differed (B176).
   Calendar 6.6.5 to 6.6.6. New smoke check `admin-nextcloud-app-versions`.
-* The copies that setup keeps in `$STORAGE_ROOT/owncloud-backup` before an
+* **Nextcloud backup copies are root-only now (B177)**\
+  The copies that setup keeps in `$STORAGE_ROOT/owncloud-backup` before an
   update of Nextcloud or of its apps (the database with every user's
   calendars and contacts, Nextcloud's code) were readable by every local
   account (directory 0755, database copies 0644). Setup now keeps the
@@ -284,7 +1085,8 @@ copy of a production box from v78-r2604.3 (T5b), see TESTING-fork.md.
 
 ### Security
 
-* nginx: Ubuntu's security update 1.28.3-2ubuntu1.13 fixes CVE-2026-123633
+* **nginx security update fixes two HTTP/2 CVEs**\
+  nginx: Ubuntu's security update 1.28.3-2ubuntu1.13 fixes CVE-2026-123633
   (use-after-free in HTTP/2 when proxying, with few free
   `worker_connections`) and CVE-2026-123007 (heap buffer overflow in the
   HTTP/2 flow control). The box serves HTTPS with HTTP/2 and proxies
@@ -294,12 +1096,15 @@ copy of a production box from v78-r2604.3 (T5b), see TESTING-fork.md.
 
 ### Upgrade note
 
-* Install the nginx update now, independent of this release:
+* **Install the nginx update now, independent of this release**\
+  Install the nginx update now, independent of this release:
   `sudo apt update && sudo apt upgrade` (nginx restarts for a second). The
   version must be 1.28.3-2ubuntu1.13 or later (`dpkg-query -W nginx`).
-* The update installs calendar 6.6.6 and runs `occ upgrade`: Nextcloud
+* **Update installs calendar 6.6.6; Nextcloud answers 503 briefly**\
+  The update installs calendar 6.6.6 and runs `occ upgrade`: Nextcloud
   answers 503 for a few seconds.
-* The new settings start with Nextcloud's and fail2ban's present values, so
+* **New settings start with present values; reset throttled addresses**\
+  The new settings start with Nextcloud's and fail2ban's present values, so
   nothing changes on its own. A device with an old password that keeps a
   network throttled shows up under System > Intrusion Protection, "Nextcloud
   throttle": fix its password, then reset the address.
@@ -316,7 +1121,8 @@ production box from v78-r2604.2 (T5b); see TESTING-fork.md,
 
 ### Changed
 
-* Post-quantum key exchange for mail: Postfix offers the hybrid group
+* **Postfix offers post-quantum key exchange**\
+  Post-quantum key exchange for mail: Postfix offers the hybrid group
   X25519MLKEM768 (ML-KEM-768 with X25519) on ports 25, 465 and 587, and its
   SMTP client offers it to other mail servers. setup/mail-postfix.sh sets
   `tls_eecdh_auto_curves` and `tls_ffdhe_auto_groups` empty, so Postfix
@@ -344,7 +1150,8 @@ production box from v78-r2604.2 (T5b); see TESTING-fork.md,
 
 ### Fixed
 
-* A user whose password has an umlaut or another character beyond ASCII
+* **Control panel login works with non-ASCII passwords (B175)**\
+  A user whose password has an umlaut or another character beyond ASCII
   can log in to the control panel again. The management daemon read the
   user name and password of the Authorization header as ASCII and
   answered "Login failed: 'ascii' codec can't decode byte ...", although
@@ -359,7 +1166,8 @@ production box from v78-r2604.2 (T5b); see TESTING-fork.md,
 
 ### Upgrade note
 
-* Boxes on v78-r2604.2 are updated with the bootstrap command of "Updating
+* **How to update boxes from v78-r2604.2**\
+  Boxes on v78-r2604.2 are updated with the bootstrap command of "Updating
   the fork" in README-fork.md,
   `sudo bash -c "$(curl -fsSL https://raw.githubusercontent.com/LM1337/Mail-in-a-box-26/main/setup/bootstrap.sh)"`,
   with `tools/update-check.sh before` and `backup` before it and `after`
@@ -370,7 +1178,8 @@ production box from v78-r2604.2 (T5b); see TESTING-fork.md,
   parameters are not in its record (see Planned), the smoke check
   `tls-key-exchange` shows them. Boxes on v78-r2604.1 or earlier take the
   steps of the upgrade notes in between first.
-* Setup restarts Postfix once for its new TLS groups. Mail clients and
+* **Update restarts Postfix and the management daemon**\
+  Setup restarts Postfix once for its new TLS groups. Mail clients and
   servers without X25519MLKEM768 connect as before. The update restarts
   the management daemon: control panel sessions end, log in again.
 
@@ -403,7 +1212,8 @@ TESTING-fork.md, "v78-r2604.2".
 
 ### Fixed
 
-* A fresh install with `PRIMARY_HOSTNAME` in the environment no longer
+* **Fresh install no longer stops silently at the network checks (B145)**\
+  A fresh install with `PRIMARY_HOSTNAME` in the environment no longer
   stops without a message at the network checks when Spamhaus answers that
   the hostname or the address is not listed, which is the normal answer:
   `host` exits 1 for it, and setup's strict mode ended the run there. A
@@ -411,12 +1221,14 @@ TESTING-fork.md, "v78-r2604.2".
   not check whether ... is listed ...", and setup goes on, as for
   Spamhaus' refusal of a public resolver; a listing still stops setup
   (B145).
-* A fresh install through the dialogs now runs the network checks too
+* **Interactive fresh install runs the network checks (B146)**\
+  A fresh install through the dialogs now runs the network checks too
   (the Spamhaus lists and outgoing port 25): the test that was meant to
   skip existing installs also skipped every interactive first install.
   Existing installs, the in-place upgrade and the migration still skip
   them (B146).
-* Setup no longer runs Nextcloud's config.php (a file of www-data's) as
+* **Setup no longer follows symbolic links planted by www-data (B147)**\
+  Setup no longer runs Nextcloud's config.php (a file of www-data's) as
   PHP as root to read the Nextcloud version, and no longer changes owner
   and mode, writes, creates or moves files by path where www-data or the
   storage user could have put a symbolic link: `$STORAGE_ROOT/mail`,
@@ -434,49 +1246,59 @@ TESTING-fork.md, "v78-r2604.2".
   running it and copies the backup without writing through a link. Setup
   checks these paths when it starts, before it changes anything, and stops
   there with a list of what to fix (B147).
-* Setup installs only the checked key file of deb.sury.org, not the
+* **Setup installs only the deb.sury.org key file (B158)**\
+  Setup installs only the checked key file of deb.sury.org, not the
   keyring package with its maintainer scripts; the package that earlier
   versions installed is removed, the key stays at the same path (B158).
-* A setup run that ends with an error after the Nextcloud upgrade had
+* **Failed setup run restarts PHP-FPM (B149)**\
+  A setup run that ends with an error after the Nextcloud upgrade had
   stopped PHP-FPM (a failed download, an `occ` step, the Z-Push download)
   starts PHP-FPM again, so webmail, Nextcloud and ActiveSync no longer
   answer 502 until a later run. A successful run still restarts PHP-FPM
   once (B149).
-* The nightly backup starts Postfix, Dovecot, PHP-FPM and postgrey again
+* **Nightly backup restarts mail services after a failure (B148)**\
+  The nightly backup starts Postfix, Dovecot, PHP-FPM and postgrey again
   also when the `before-backup` script fails or one of the services does
   not stop. Before, mail stayed down until someone started them, and the
   mail about it could not be sent (B148).
-* Setup runs no longer log out all webmail users: setup keeps Roundcube's
+* **Setup runs no longer log out webmail users (B172)**\
+  Setup runs no longer log out all webmail users: setup keeps Roundcube's
   `des_key`, with which Roundcube encrypts the password in each session
   and its "remember me" logins, instead of writing a new one each time
   (B172).
-* Moving a message into or out of Spam no longer creates a folder
+* **No more phantom "spamassassin" folder in mailboxes (B155)**\
+  Moving a message into or out of Spam no longer creates a folder
   "spamassassin" (sa-learn's state directory, which it made in the
   Maildir); the learning was not affected. Setup removes these folders,
   through Dovecot, when they hold no messages and nothing but Dovecot's
   own files and were not created as real folders; one with messages or
   other files is kept, with a note in setup's output (B155).
-* A Roundcube update no longer leaves webmail without its configuration
+* **Roundcube update keeps configuration when a download fails (B157)**\
+  A Roundcube update no longer leaves webmail without its configuration
   and plugins when a download fails: the new release is put together with
   its plugins and configuration next to the installed one and replaces it
   only then. The control panel's jQuery and Bootstrap are replaced the
   same way (B157).
-* Setup's output no longer has "Connection to ... succeeded!" lines from
+* **Setup output has no "Connection to ... succeeded!" lines (B174)**\
+  Setup's output no longer has "Connection to ... succeeded!" lines from
   `nc` (the port 25 check of a fresh install and the wait for the
   management daemon); only nc's exit code is used, as before (B174).
-* Setup stops with a clear message when the management daemon answers the
+* **Setup stops when the DNS or web update fails (B159)**\
+  Setup stops with a clear message when the management daemon answers the
   DNS or web update with an error (HTTP 500, 401) or cannot be reached.
   Before, setup printed the daemon's answer and went on to "Your
   Mail-in-a-Box is running" with the old DNS zones or nginx configuration
   (or, when the daemon could not be reached, stopped without a word).
   `tools/dns_update` and `tools/web_update` now exit with an error in that
   case, which the daily DNSSEC job's mail shows as well (B159).
-* The status checks look up the box's IPv6 address in Spamhaus ZEN under
+* **Spamhaus ZEN check uses the correct IPv6 name (B144)**\
+  The status checks look up the box's IPv6 address in Spamhaus ZEN under
   the right name, its 32 nibbles in reverse order as in ip6.arpa. Before,
   they reversed the eight 16-bit groups, a name that never exists, so the
   check said "IPv6 address is not blacklisted" for any address, also a
   listed one (B144; the fix of upstream #2617 by N9ZL).
-* The status checks no longer take a failed DNS lookup for an answer. When
+* **Status checks no longer treat a failed DNS lookup as an answer (B150)**\
+  The status checks no longer take a failed DNS lookup for an answer. When
   the resolver answers SERVFAIL or REFUSED (or no server can be reached),
   the Spamhaus ZEN and DBL checks now warn that they could not check,
   instead of "not blacklisted"; a timed-out or failed MX lookup is a "could
@@ -486,33 +1308,39 @@ TESTING-fork.md, "v78-r2604.2".
   record "not correct, it is '[timeout]'"; and a custom secondary
   nameserver is no longer reported as having a "consistent SOA record"
   when neither SOA lookup worked (B150).
-* The status checks with the version check on (privacy setting off) no
+* **Version check no longer aborts the status checks (B170)**\
+  The status checks with the version check on (privacy setting off) no
   longer end as a whole when the connection breaks while the latest version
   is read (a reset, a TLS error, a cut answer); the check says that the
   latest version could not be determined, and the API call
   `/system/latest-upstream-version` answers 503 instead of 500 (B170).
-* Messages in the control panel's dialogs are shown as text: a message
+* **Control panel dialog messages are shown as text (B171)**\
+  Messages in the control panel's dialogs are shown as text: a message
   given as a string was inserted as HTML because the function tested a
   name that it does not have. The random password of the Users page and
   the answer of a reboot still show as before. Short messages now appear
   in the small dialog, as upstream intended (B171).
-* `tools/update-check.sh after` no longer says "RESULT: OK" when
+* **update-check.sh after no longer says OK after a crash (B152)**\
+  `tools/update-check.sh after` no longer says "RESULT: OK" when
   `status_checks.py` crashed or hit its time limit: such a run adds the line
   "✖ status checks did not finish (exit code N)" to `status.txt`, which is
   always UNEXPECTED, and the checks missing after the crash are no longer
   counted as errors and warnings that are gone. The summary of the state
   names it (B152).
-* `tools/owncloud-unlockadmin.sh` runs Nextcloud's `occ` with PHP 8.5, the
+* **PHP 8.5 for Nextcloud tools (B173)**\
+  `tools/owncloud-unlockadmin.sh` runs Nextcloud's `occ` with PHP 8.5, the
   version Mail-in-a-Box installs, and `tools/update-check.sh` records
   Nextcloud's status with the PHP version of the box's checkout, not with
   whatever `php` points to (B173).
-* The in-place upgrade (`tools/upgrade-in-place-to-2604.sh`) recognises a
+* **In-place upgrade recognises a refused release upgrade (B151)**\
+  The in-place upgrade (`tools/upgrade-in-place-to-2604.sh`) recognises a
   release upgrade that do-release-upgrade refused before it changed
   anything. Before, it said that the machine "still runs Ubuntu 22.04 ...
   or restore from the backups", and `--rollback` refused with mail offline,
   because its check of the apt sources failed whenever one of the source
   file patterns matched no file (every 22.04 box has no `*.sources`) (B151).
-* The in-place upgrade keeps the options given in the environment across
+* **In-place upgrade keeps environment options across reboots (B153)**\
+  The in-place upgrade keeps the options given in the environment across
   its reboots. Before, the run after the first reboot, which is the one
   that runs setup on a box from 22.04 or 24.04, had only `TAG` and
   `SOURCE`: `FTS=off`, `NEXTCLOUD_SHARE_SCOPE=all` and `FAVICON=off` were
@@ -525,12 +1353,14 @@ TESTING-fork.md, "v78-r2604.2".
   `tools/migrate-to-2604.sh` passes these two to setup in its tmux session
   as well, which did not get them while another tmux session was open
   (B153).
-* The in-place upgrade no longer stops with "sshd -t fails ... Not
+* **In-place upgrade no longer stops at "sshd -t fails" (B156)**\
+  The in-place upgrade no longer stops with "sshd -t fails ... Not
   rebooting" in a boot in which nobody has logged in over SSH yet (sshd is
   socket activated on 24.04 and 26.04, and `/run/sshd` is missing until
   its first connection); it creates the directory first, as it already did
   for its fallback SSH server (B156).
-* The in-place upgrade's checks whether switching packages from
+* **In-place upgrade package checks now stop it correctly (B160)**\
+  The in-place upgrade's checks whether switching packages from
   ppa:ondrej back to Ubuntu's versions, or installing tmux for its own
   session, would remove other packages work: before, they never stopped
   it, because `grep -q` at the end of the pipe made apt-get fail. The same
@@ -538,20 +1368,24 @@ TESTING-fork.md, "v78-r2604.2".
   with a long rule list, and move `/etc/php/8.5` or `8.2` aside in the
   cleanup before setup although packages of that version were installed
   (B160).
-* After a `--redo-from` that fails, the in-place upgrade no longer says
+* **In-place upgrade --redo-from and --finish report states correctly (B161)**\
+  After a `--redo-from` that fails, the in-place upgrade no longer says
   that mail runs again while setup is pending, and `--finish` no longer
   accepts the final check from before the redo: it needs a check that has
   run since, and setup done (B161).
-* With sshd on another port than 22, the in-place upgrade's SSH watcher
+* **In-place upgrade handles sshd on a port other than 22 (B162)**\
+  With sshd on another port than 22, the in-place upgrade's SSH watcher
   and its "is SSH back?" check use sshd's ports (from `sshd -T`). Before,
   it reported SSH down for the whole release upgrade and left the fallback
   SSH server and its ufw rule running until the next reboot. The help and
   the plan of `--check` no longer say that SSH is on port 22 (B162).
-* The in-place upgrade's offsite copy of the system archive is compared by
+* **In-place upgrade offsite copy check ignores permissions (B168)**\
+  The in-place upgrade's offsite copy of the system archive is compared by
   content and times only, as it is copied. Before, a backup account whose
   umask gives new files other permissions (e.g. 077) made the snapshot
   phase stop with "The copy ... differs" for a correct copy (B168).
-* The in-place upgrade uses the branch main instead of the release tag
+* **In-place upgrade uses main only if the tag is unpublished (B169)**\
+  The in-place upgrade uses the branch main instead of the release tag
   only when the tag is not published in the repository (git ls-remote).
   Before, any failure to fetch the tag, such as a network error, made setup
   run from main with the note "The release tag ... is not published yet";
@@ -559,7 +1393,8 @@ TESTING-fork.md, "v78-r2604.2".
   again. `tools/migrate-to-2604.sh` does the same: before, a failure to
   download the tag, or to check it out in a clone with local changes, ran
   the migration and setup from main (B169).
-* `tools/migrate-to-2604.sh` no longer runs values that the old box reports
+* **Migration tool no longer runs values from the old box as code (B154)**\
+  `tools/migrate-to-2604.sh` no longer runs values that the old box reports
   as bash code on the new machine, and writes only plain values into the
   new `/etc/mailinabox.conf`. An old box that was broken into (often the
   reason for a move) could run commands as root on the new machine,
@@ -578,12 +1413,14 @@ TESTING-fork.md, "v78-r2604.2".
   old `/etc` and the saved Postfix queue listing with "?" for control
   characters, so that they cannot send escape sequences to the terminal
   (B154).
-* `tools/migrate-to-2604.sh` measures and watches a `$STORAGE_ROOT` that is
+* **Migration tool follows a symlinked $STORAGE_ROOT (B163)**\
+  `tools/migrate-to-2604.sh` measures and watches a `$STORAGE_ROOT` that is
   a symbolic link on the old box (for example to another volume) where it
   points. Before, it showed "Data to copy: 0" and checked no disk space
   (the copy failed hours later on a full disk), and before the final copy
   it did not wait for processes that still had files open there (B163).
-* `tools/migrate-to-2604.sh` copies folders named `.rsync-partial`, such as
+* **Migration tool copies folders named .rsync-partial (B164)**\
+  `tools/migrate-to-2604.sh` copies folders named `.rsync-partial`, such as
   an IMAP folder "rsync-partial" or such a folder in Nextcloud. rsync left
   them out without an error, because the tool used that name for
   interrupted files, and after a resumed copy the tool deleted every such
@@ -591,12 +1428,14 @@ TESTING-fork.md, "v78-r2604.2".
   `.migrate-to-2604-partial`, and the cleanup removes only root's
   directories of that name, without following a link put into the path
   (B164).
-* `tools/migrate-to-2604.sh` says "could not check" when it cannot reach
+* **Migration tool says "could not check" when Spamhaus is unreachable (B165)**\
+  `tools/migrate-to-2604.sh` says "could not check" when it cannot reach
   Spamhaus, instead of reporting the new IP address as not listed. It asks
   Spamhaus' test entries (127.0.0.2 and dbltest.com) first; only when they
   answer does no answer mean "not listed". The result for the hostname in
   Spamhaus' Domain Block List is shown as well (B165).
-* `tools/migrate-to-2604.sh` follows no link where root writes into trees
+* **Migration tool follows no links where root writes (B166)**\
+  `tools/migrate-to-2604.sh` follows no link where root writes into trees
   that another party shapes. It writes its marker in `$STORAGE_ROOT`
   through `tools/write_conf.py`; before, root wrote it by path, so an
   account that owns that directory during the migration could put a link
@@ -609,7 +1448,8 @@ TESTING-fork.md, "v78-r2604.2".
   `--from-backup`, `mailinabox.version`, `www/` and the dotfiles get their
   owner without following links, and the backup key goes only into a
   checked `backup/` directory of root's own (B166).
-* `tools/migrate-to-2604.sh --from` takes an IPv6 address, with or without
+* **Migration tool --from takes an IPv6 address (B167)**\
+  `tools/migrate-to-2604.sh --from` takes an IPv6 address, with or without
   brackets (`--from root@[2001:db8::1]`). Before, `--check` passed and the
   first copy failed, because rsync needs the address in brackets and ssh
   without them. `--check` now also runs rsync once (a listing of
@@ -619,7 +1459,8 @@ TESTING-fork.md, "v78-r2604.2".
 
 ### Changed
 
-* Roundcube 1.7.5 → 1.7.6 (security release of 2026-11-09), SHA256
+* **Roundcube 1.7.6 and CardDAV plugin 5.1.5**\
+  Roundcube 1.7.5 → 1.7.6 (security release of 2026-11-09), SHA256
   `0168085bf0bfeeb5d4eca3b9730effbe610dbdb380a68567d292fec51f09db36`; its
   Elastic skin has the same favicon.ico as 1.7.5. Roundcube's CardDAV
   plugin (rcmcarddav) 5.1.4 → 5.1.5 (security release: photos that a
@@ -627,7 +1468,8 @@ TESTING-fork.md, "v78-r2604.2".
   server; its admin setting `download_photos` would turn that on again,
   and setup does not set it), SHA256
   `aea05586822848d9b2f2cdac6b59bdd500d3f93b1b0eeba0295a4aaeb335ad18`.
-* Nextcloud 34.0.5 → 34.0.6, SHA256
+* **Nextcloud 34.0.6 with contacts 8.10.0 and calendar 6.6.5**\
+  Nextcloud 34.0.5 → 34.0.6, SHA256
   `ec74a0cf6de20e2a234c5bde55e370e4a7f12b46a266ae3d33c8f3edc17b153e`, with
   the contacts app 8.9.2 → 8.10.0
   (`035d943115f129d20fbaba19b2124a0d2f65a59c35cabe142495bb6ae650d549`;
@@ -641,7 +1483,8 @@ TESTING-fork.md, "v78-r2604.2".
   update: its `occ upgrade` also updates the two apps. The hashes were
   checked against the publishers' digests (GitHub's asset digest,
   Nextcloud's `.sha256`).
-* `tools/update-check.sh after` expects the new Nextcloud version in
+* **update-check.sh after expects new Nextcloud version and warnings (B150, B144)**\
+  `tools/update-check.sh after` expects the new Nextcloud version in
   `occ status` (`nextcloud.txt`: `version` and `versionstring`), and the
   status checks' new warnings where a DNS lookup of the box fails or times
   out ("Could not connect to zen.spamhaus.org" and "... dbl.spamhaus.org",
@@ -650,13 +1493,15 @@ TESTING-fork.md, "v78-r2604.2".
   listing of the box's IPv6 address, which the status checks see from this
   release on (B144), stays UNEXPECTED. The other component updates and
   fixes change nothing in the recorded state.
-* `tools/write_conf.py --own PATH USER GROUP MODE` changes the owner and
+* **write_conf.py --own, --own-tree and --check-own (B147)**\
+  `tools/write_conf.py --own PATH USER GROUP MODE` changes the owner and
   mode of one file or directory through a descriptor and refuses a
   symbolic link, a file with more than one hard link or anything else;
   `--own-tree` takes optional modes for files and directories, and
   `--check-own PATH...` changes nothing and names each path that `--own`
   would refuse (setup's check at its start) (B147).
-* Tests: the smoke test's new check `imapsieve-no-phantom-folder` (group
+* **New tests for phantom folder and setup network checks (B155, B145)**\
+  Tests: the smoke test's new check `imapsieve-no-phantom-folder` (group
   imapsieve) fails when alice, bob or carol has a folder "spamassassin"
   (B155). TESTING-fork.md has the scenario T1n: setup's network checks on
   the installed T1 box under setup's shell options, through its own
@@ -671,7 +1516,8 @@ TESTING-fork.md, "v78-r2604.2".
   profile during the release upgrade, ntpsec trying the global IPv6
   address before it is usable, and ssh's note in the migration log that
   it recorded the old box's host key.
-* Docs: README.md and README-fork.md name the new component versions.
+* **Docs: README names new versions and tool changes (B164, B167, B162)**\
+  Docs: README.md and README-fork.md name the new component versions.
   README-fork.md (English and German): the migration tool's partial
   directory is `.migrate-to-2604-partial` (B164), `--from` takes an IPv6
   address and `--check` tries the copy's rsync once (B167), the in-place
@@ -684,7 +1530,8 @@ TESTING-fork.md, "v78-r2604.2".
 
 ### Upgrade note
 
-* Boxes on v78-r2604.1 are updated with the bootstrap command of "Updating
+* **Updating from v78-r2604.1 to v78-r2604.2 (B152)**\
+  Boxes on v78-r2604.1 are updated with the bootstrap command of "Updating
   the fork" in README-fork.md,
   `sudo bash -c "$(curl -fsSL https://raw.githubusercontent.com/LM1337/Mail-in-a-box-26/main/setup/bootstrap.sh)"`,
   with `tools/update-check.sh before` and `backup` before it and `after`
@@ -698,16 +1545,19 @@ TESTING-fork.md, "v78-r2604.2".
   `after/status-full.txt` of the run's directory in `/root/update-check`
   (B152). Boxes on v78-r2604.0 or earlier take the steps of the upgrade
   notes in between first.
-* The update upgrades Nextcloud to 34.0.6 on every box. PHP-FPM is
+* **Nextcloud 34.0.6 upgrade restarts PHP-FPM briefly (B149)**\
+  The update upgrades Nextcloud to 34.0.6 on every box. PHP-FPM is
   stopped while Nextcloud upgrades, so webmail, Nextcloud and ActiveSync
   answer 502 for that time (as at every Nextcloud update); if setup ends
   with an error, PHP-FPM is started again now (B149).
-* Webmail users stay logged in across setup runs from now on, also across
+* **Webmail users stay logged in across setup runs (B172)**\
+  Webmail users stay logged in across setup runs from now on, also across
   this update: the new setup takes the `des_key` from the installed
   Roundcube configuration, which the last run of the old setup wrote, and
   writes a new one only when there is none (B172). Up to v78-r2604.1 every
   setup run, and so every update, logged them out.
-* Setup now stops at its start, before it changes anything ("Setup
+* **Setup refuses symbolic links and extra hard links in mail data (B147)**\
+  Setup now stops at its start, before it changes anything ("Setup
   stopped before it changed anything ..."), when `$STORAGE_ROOT/mail`,
   `users.sqlite` or `roundcube/roundcube.sqlite` in it, or its postgrey,
   DKIM or SpamAssassin directory is a symbolic link, when one of the two
@@ -719,34 +1569,41 @@ TESTING-fork.md, "v78-r2604.2".
   a database with a second hard link (`find / -xdev -samefile FILE` shows
   it); then run setup again. `$STORAGE_ROOT` itself may still be a link in
   a directory of root's own (such as `/home/user-data`) (B147).
-* Setup removes the folders "spamassassin" that sa-learn created. It
+* **Setup removes sa-learn's "spamassassin" mail folders (B155)**\
+  Setup removes the folders "spamassassin" that sa-learn created. It
   prints "Removed the state directory of sa-learn (the folder
   "spamassassin") from N mailboxes", and "Kept ..." with the reason for a
   folder that holds messages or other files: move the messages to another
   folder and run setup again (B155).
-* The package `debsuryorg-archive-keyring` is removed; the key file it
+* **Package `debsuryorg-archive-keyring` removed, key file kept (B158)**\
+  The package `debsuryorg-archive-keyring` is removed; the key file it
   installed stays at `/usr/share/keyrings/debsuryorg-archive-keyring.gpg`,
   now as a file of setup's (B158).
-* Contacts whose vCard links to a photo by URL show no photo in
+* **Roundcube shows no contact photos linked by URL**\
+  Contacts whose vCard links to a photo by URL show no photo in
   Roundcube any more (CardDAV plugin 5.1.5); photos stored in the vCard
   itself are not affected.
-* Setup now ends with exit code 1 and "Setup stopped: the management
+* **Setup fails when the management daemon cannot update DNS or web (B159)**\
+  Setup now ends with exit code 1 and "Setup stopped: the management
   daemon could not update ..." when the DNS or web update fails, after the
   daemon's answer. Mail and the web server keep running; fix the cause and
   run setup again (B159).
-* System Status may show new warnings: where the box's resolver fails or
+* **System Status may show new warnings for failed lookups (B150, B144)**\
+  System Status may show new warnings: where the box's resolver fails or
   times out for a lookup, the checks now say that they could not check
   (Spamhaus ZEN and DBL, the MX record, the DANE TLSA record) instead of
   OK or a wrong error, and show `[error]` where they showed `[Not Set]`
   (B150). The box's IPv6 address is now really looked up in Spamhaus ZEN,
   so a listing missed so far shows up as an error (B144), which `after`
   lists as UNEXPECTED.
-* The in-place upgrade and the migration tool now stop when they cannot
+* **In-place and migration tools stop when the release tag is unreachable (B169)**\
+  The in-place upgrade and the migration tool now stop when they cannot
   fetch their release tag (a network or GitHub error) instead of running
   setup from the branch main; run the command again when the source can be
   reached. They use main only when the repository answers that the tag is
   not published yet (B169).
-* A box upgraded in place from 22.04 or 24.04 by an earlier version of the
+* **Earlier in-place upgrades ignored settings given in the environment (B153)**\
+  A box upgraded in place from 22.04 or 24.04 by an earlier version of the
   tool, with `FTS=off`, `NEXTCLOUD_SHARE_SCOPE=all`, `FAVICON=off` or
   `PROBE_ADDRESS=...` given in the environment, got the defaults in
   `/etc/mailinabox.conf` (B153): put the values there and run `sudo
@@ -754,7 +1611,8 @@ TESTING-fork.md, "v78-r2604.2".
   enabled ufw: turn it off with `sudo ufw disable` if the box relies on
   another firewall (setup reads `DISABLE_FIREWALL` from its environment
   only).
-* A migration that is in progress can be continued with this release's
+* **Continuing a migration; unusual settings stop the migration tool (B154)**\
+  A migration that is in progress can be continued with this release's
   `tools/migrate-to-2604.sh`. Folders `.rsync-partial` that an interrupted
   copy of an earlier version left on the new machine are removed by the
   next copy. An old box whose `/etc/mailinabox.conf` has a `STORAGE_ROOT`,
@@ -780,7 +1638,8 @@ TESTING-fork.md, "v78-r2604.1").
 
 ### Fixed
 
-* The control panel no longer shows its menus and the last panel for saved
+* **Control panel shows no menus for ended sessions (B141)**\
+  The control panel no longer shows its menus and the last panel for saved
   credentials whose session has ended. A session ends after two days
   without use, at a logout, when the password or MFA changes, and whenever
   the management daemon restarts (at every update). Before, a reload showed
@@ -805,19 +1664,22 @@ TESTING-fork.md, "v78-r2604.1").
   loads, before its script has run, the menus no longer show for a moment
   either (on every load, also logged out): Bootstrap's style overrode the
   rule that hides them (B141).
-* "Remember me" on the control panel's login works: without it, the login
+* **Control panel's "Remember me" works (B142)**\
+  "Remember me" on the control panel's login works: without it, the login
   is kept for the browser tab only (sessionStorage) and ends with it.
   Before, every login was saved in the browser's localStorage and was still
   there after the browser was closed and opened again, also when "Remember
   me" was not ticked (B142).
-* `tools/update-check.sh after` no longer lists the new version line as
+* **`update-check.sh after` no longer flags the new version line (B143)**\
+  `tools/update-check.sh after` no longer lists the new version line as
   UNEXPECTED after an update to a release after v78-r2604.0: the rule of
   `tools/expected-changes/any.txt` for the version of `/root/mailinabox`
   named only v78-r2604.0 and its release candidates (B143).
 
 ### Changed
 
-* Tests: the log audit accepts nginx's 502 for a request to Roundcube,
+* **Tests: log audit accepts 502s while backup stops PHP-FPM**\
+  Tests: the log audit accepts nginx's 502 for a request to Roundcube,
   Nextcloud or Z-Push while `management/backup.py` has PHP-FPM stopped
   for a backup (the socket is missing, or the request in progress is
   cut), in every phase, as backup.py logs no marks that would limit it to
@@ -829,11 +1691,13 @@ TESTING-fork.md, "v78-r2604.1").
   virtual machine took long on a busy host. A production box's
   `update-check.sh after` named them in the update to v78-r2604.0 (the
   backup step and the nightly backup stop PHP-FPM the same way).
-* Management daemon: the function behind `GET /admin/me` is named
+* **Management daemon function `session_me` renamed**\
+  Management daemon: the function behind `GET /admin/me` is named
   `session_me`, so it no longer reuses the module's name `me`, which holds
   the daemon's own path (no change in behavior; a later use of that path
   would have failed).
-* Docs: README-fork.md, "Updating the fork": a checkout whose current
+* **README-fork.md: stale local release tag blocks the update**\
+  Docs: README-fork.md, "Updating the fork": a checkout whose current
   commit has a local tag with the name of the release being installed,
   but another commit than on GitHub (an old pre-release or a mirror's
   tag), is not updated: bootstrap.sh compares the name with `git
@@ -844,7 +1708,8 @@ TESTING-fork.md, "v78-r2604.1").
 
 ### Upgrade note
 
-* Boxes on v78-r2604.0 are updated with the bootstrap command of "Updating
+* **Updating from v78-r2604.0 to this release (B143)**\
+  Boxes on v78-r2604.0 are updated with the bootstrap command of "Updating
   the fork" in README-fork.md,
   `sudo bash -c "$(curl -fsSL https://raw.githubusercontent.com/LM1337/Mail-in-a-box-26/main/setup/bootstrap.sh)"`,
   with `tools/update-check.sh before` and `backup` before it and `after`
@@ -857,14 +1722,16 @@ TESTING-fork.md, "v78-r2604.1").
   `sudo git -C /root/mailinabox describe --always` should print
   `v78-r2604.1` afterwards (see README-fork.md for a local tag of that name
   on another commit).
-* The update restarts the management daemon, which ends every control panel
+* **The update ends control panel sessions**\
+  The update restarts the management daemon, which ends every control panel
   session: log in again. A page that is still open shows the login on its
   next reload ("Your session has ended") or at its next call to the box,
   not the admin menus. A login without "Remember me" is now kept for the
   browser tab only; tick it to stay logged in after the browser is closed
   (for at most two days without use, as before). API clients are not affected; the new
   `GET /admin/me` takes session keys only.
-* Boxes on rc7 or earlier are updated the same way, with the steps of the
+* **Updating from rc7 or earlier**\
+  Boxes on rc7 or earlier are updated the same way, with the steps of the
   upgrade note of v78-r2604.0 first (for rc1 to rc6 also those of rc7).
   Read the upgrade notes of every release in between; `after` uses the
   lists of all of them.
@@ -897,7 +1764,8 @@ no longer hang or fail as a whole when a backup target does not answer
 
 ### Fixed
 
-* ActiveSync and Autodiscover have brute-force protection now: the new
+* **ActiveSync and Autodiscover get brute-force protection (B126, B133)**\
+  ActiveSync and Autodiscover have brute-force protection now: the new
   jail `miab-zpush` bans an address after 20 failed logins within 120 s on
   HTTP and HTTPS. Before, nothing limited password guessing there: Z-Push
   checks passwords against Dovecot from 127.0.0.1, which fail2ban ignores,
@@ -927,7 +1795,8 @@ no longer hang or fail as a whole when a backup target does not answer
   client, can pass for a failed login. Setup removes a log file with more
   than one link (a hard link that www-data could have made to a file of
   another account) before it gives the log files to www-data (B126).
-* Logins no longer fail for a moment at the end of each setup run: setup
+* **Logins no longer fail briefly at the end of setup (B133)**\
+  Logins no longer fail for a moment at the end of each setup run: setup
   rewrote the automatic aliases in `users.sqlite` every time (since rc4,
   B60), and Dovecot, which reads that database for every login and waits
   at most one second for a lock, answered "Temporary authentication
@@ -935,7 +1804,8 @@ no longer hang or fail as a whole when a backup target does not answer
   AUTH and ActiveSync logins of that moment when the commit took longer on
   a busy disk. Setup and the control panel now write the table only when
   it changes (B133).
-* Nextcloud's brute-force protection no longer throttles the box's own
+* **Nextcloud's brute-force protection no longer throttles Z-Push (B121)**\
+  Nextcloud's brute-force protection no longer throttles the box's own
   services (seen on a production box at the update from rc6 to rc7):
   setup restarted Dovecot, Nextcloud's `user_external` could not reach IMAP
   for about two seconds, and the CalDAV/CardDAV logins that Z-Push makes
@@ -952,15 +1822,18 @@ no longer hang or fail as a whole when a backup target does not answer
   Nextcloud takes it from 127.0.0.1 only (`trusted_proxies`): these clients
   are throttled under their own address, and the miab-owncloud jail can ban
   them, which it never could on these paths (B121).
-* Nextcloud no longer fails a request (an ActiveSync login got HTTP 401)
+* **Nextcloud no longer fails requests while setup rewrites `config.php` (B124)**\
+  Nextcloud no longer fails a request (an ActiveSync login got HTTP 401)
   while setup rewrites its `config.php`: root replaced the file with one only
   root could read and gave it to www-data a moment later. The file is now
   written as www-data and replaced atomically (B124).
-* `/etc/dovecot` belongs to root now (group `mail` may read): it belonged
+* **`/etc/dovecot` belongs to root (B123)**\
+  `/etc/dovecot` belongs to root now (group `mail` may read): it belonged
   to the account `mail`, which all IMAP, POP3 and LMTP processes run as and
   which could therefore change Dovecot's configuration (read by its root
   processes) and the files that setup writes there as root (B123).
-* Dovecot no longer runs without a passdb for two seconds during setup:
+* **Dovecot no longer runs without a passdb during setup (B120)**\
+  Dovecot no longer runs without a passdb for two seconds during setup:
   setup restarted it before rewriting `auth-sql.conf.ext`, and a login in
   that moment made Dovecot's config process read the truncated file;
   logins then failed as wrong passwords. Dovecot's configuration is now
@@ -968,7 +1841,8 @@ no longer hang or fail as a whole when a backup target does not answer
   (and every file of `tools/editconf.py`) atomically and only when they
   change, following a symbolic link only in a directory of root's own
   (B120).
-* Setup disturbs the clients less: Dovecot, Postfix and fail2ban reload
+* **Setup disturbs clients less with reloads instead of restarts (B122)**\
+  Setup disturbs the clients less: Dovecot, Postfix and fail2ban reload
   instead of restarting (Dovecot not at all when its configuration did not
   change), PHP-FPM restarts once per run instead of four times, and
   fail2ban keeps its bans through setup (it lifted all of them for about
@@ -980,7 +1854,8 @@ no longer hang or fail as a whole when a backup target does not answer
   `doveconf -n` names), and is recorded only once Dovecot has loaded the
   configuration; if it has not within 10 s of the reload, setup restarts it
   (B122).
-* The backup page of the control panel and the backups no longer hang for
+* **Backup page and backups no longer hang on a slow rsync target (B125)**\
+  The backup page of the control panel and the backups no longer hang for
   a minute or more when the rsync target does not answer a connection
   request at once (seen on a production box with a remote rsync backup
   server: ssh waited 11 s for an answer over IPv6, and twice the page
@@ -990,7 +1865,8 @@ no longer hang or fail as a whole when a backup target does not answer
   retries; the list of the target's files (status page, and the nightly
   backup's choice between a full and an incremental backup) is tried three
   times (B125).
-* The control panel no longer writes the password hash of a user into the
+* **Password hashes no longer in the journal or command lines (B127)**\
+  The control panel no longer writes the password hash of a user into the
   journal at each login (`{SHA512-CRYPT}$6$... (verified)` or "reverse
   password verification check failed", the output of `doveadm pw`), and a
   password that the management daemon checks or sets is no longer in a
@@ -1004,7 +1880,8 @@ no longer hang or fail as a whole when a backup target does not answer
   doveadm's arguments either. A login with an unknown address takes as long as a wrong password. Setup
   no longer puts the first user's password, and tools/dns_update and
   tools/web_update no longer the API key, on a command line either (B127).
-* The backup page shows the status of the backups at once: the status
+* **Backup page shows the saved status at once (B125)**\
+  The backup page shows the status of the backups at once: the status
   saved after the last backup run or refresh that worked, with its time.
   It refreshes it in the background (on a visit when the saved status is
   older than five minutes, and with the new "Refresh now" button) and
@@ -1028,22 +1905,26 @@ no longer hang or fail as a whole when a backup target does not answer
   `in_progress` saying why (it would hold the control panel for as long).
   `tools/update-check.sh backup` no longer takes such a refresh for a
   running backup, and still stops for any other run of `backup.py` (B125).
-* The status checks no longer stop as a whole when the status of the
+* **Status checks survive an unreadable backup status (B132)**\
+  The status checks no longer stop as a whole when the status of the
   backups cannot be read (the target does not answer, or another duplicity
   runs on the same archive directory): the System Status page showed only
   "Something went wrong" and the nightly check mailed a traceback. The
   backup check now fails alone with duplicity's message, and while a backup
   run or a refresh of the backup page queries the target it uses the saved
   status, or warns that none has been saved yet (B132).
-* nginx waits for the control panel as long as gunicorn lets a request
+* **nginx waits for the control panel up to 630 s (B125)**\
+  nginx waits for the control panel as long as gunicorn lets a request
   run (630 s) instead of its default of 60 s, so that the status checks,
   the TLS provisioning and the backup page's live query are no longer cut
   off with a 504 after a minute (B125).
-* The control panel says what happened when its service does not answer:
+* **Control panel explains when its service does not answer (B125)**\
+  The control panel says what happened when its service does not answer:
   for nginx's 502 and 504, a timeout and a lost connection it shows a
   clear message and what to do, on every page, instead of only "Something
   went wrong, sorry." (B125).
-* ActiveSync syncs the contacts of users with a card whose name has no
+* **ActiveSync syncs contacts whose card name has no `.vcf` (B128)**\
+  ActiveSync syncs the contacts of users with a card whose name has no
   `.vcf`, such as Nextcloud's example contact `default`, which users whose
   first Nextcloud login was on rc3 to rc6 still have (B99 stopped new ones
   only), and the cards of clients that name them that way. Z-Push asked
@@ -1054,7 +1935,8 @@ no longer hang or fail as a whole when a backup target does not answer
   it asks once more without `.vcf`, skips a card the server
   does not return instead of failing, and changes or deletes such a card
   from the phone under its own name, keeping its UID (B128).
-* A phone's ActiveSync Ping (push) with a heartbeat of more than 630 s no
+* **ActiveSync Ping with a long heartbeat no longer ends in 504 (B129)**\
+  A phone's ActiveSync Ping (push) with a heartbeat of more than 630 s no
   longer ends with HTTP 504 after 10.5 minutes (seen on a production box:
   68 in a day, all Pings of one iPhone, spread over the whole day). nginx gave up on
   Z-Push, which waits as long as the phone asks; the PHP process went on
@@ -1066,7 +1948,8 @@ no longer hang or fail as a whole when a backup target does not answer
   A Ping without a heartbeat of its own now waits 3540 s instead of 600 s
   (Z-Push's default is the bound), and setup warns if Z-Push's config.php
   has no line for the bound (B129).
-* The proxy of `/caldav`, `/carddav` and `/webdav` to Nextcloud passes the
+* **`/caldav`, `/carddav` and `/webdav` proxy passes escaped path and query (B130)**\
+  The proxy of `/caldav`, `/carddav` and `/webdav` to Nextcloud passes the
   path escaped, as the client sent it, and the query string. It passed
   nginx's decoded path: a name with a space got HTTP 400, an escaped `?`
   began a query string (a DELETE of a card named `?x.vcf` deleted the whole
@@ -1076,19 +1959,22 @@ no longer hang or fail as a whole when a backup target does not answer
   and cards whose names begin with `.ht`, `.git`, `.svn`, `.hg` or `.bzr`
   pass through these paths as before (nginx's dotfile block does not apply
   to them; B130).
-* A path with `/mail/config/` in it no longer gets HTTP 403 unless it is
+* **nginx's `/mail/config/` deny no longer catches other paths (B134)**\
+  A path with `/mail/config/` in it no longer gets HTTP 403 unless it is
   Roundcube's config directory (`/mail/config/...` itself): nginx's deny of
   that directory was an unanchored regex (upstream), which also caught
   Nextcloud files and folders below a folder `mail/config` (through
   `/cloud/remote.php` and the `/webdav` proxy) and the pages of static
   sites under such a path. It is anchored now (`^/mail/config/`; B134).
-* The release tag is an annotated tag, as CONTRIBUTING.md asks. The tag
+* **Release tag is an annotated tag (B135)**\
+  The release tag is an annotated tag, as CONTRIBUTING.md asks. The tag
   first made for this release on the fork's internal server was a
   lightweight one, which `git describe` without `--tags` does not see:
   the test boxes installed from it showed their commit id as their version
   (status checks, control panel, setup) and bootstrap.sh fetched again on
   every run (B135; never published).
-* A fresh install no longer stops at once on a machine whose DNS resolver
+* **Fresh install no longer stops on public DNS resolvers (B136)**\
+  A fresh install no longer stops at once on a machine whose DNS resolver
   is a public one (1.1.1.1, and the default resolvers of many hosting
   providers), saying that the hostname is listed in the Spamhaus Domain
   Block List. Spamhaus refuses queries through such resolvers and answers
@@ -1097,7 +1983,8 @@ no longer hang or fail as a whole when a backup target does not answer
   127.0.0.11), shows any other answer as a check it could not make, and
   goes on; the status checks look again later through the box's own
   resolver (B136).
-* A FolderSync of a phone during an IMAP failure, such as setup's Dovecot
+* **ActiveSync FolderSync during an IMAP failure keeps mail folders (B137)**\
+  A FolderSync of a phone during an IMAP failure, such as setup's Dovecot
   reload, which ends every IMAP session, no longer answers without the
   mail folders. Z-Push's IMAP backend took a failed folder list for an
   empty one (upstream Z-Push): a new phone got only its calendars and
@@ -1108,21 +1995,24 @@ no longer hang or fail as a whole when a backup target does not answer
   is still no list it fails the request with a server error (FolderSync
   status 6, which the phone retries later). Another change in
   conf/zpush/z-push.patches, so the update installs Z-Push again (B137).
-* Setup keeps cron off for its whole run: needrestart, which apt runs,
+* **Setup keeps cron off for its whole run (B138)**\
+  Setup keeps cron off for its whole run: needrestart, which apt runs,
   started cron again in the middle of setup when setup's `apt-get upgrade`
   replaced a library that a cron job still running from before setup used
   (stopping cron leaves its running jobs alone). Setup now also masks cron
   in `/run` while it runs; a run that is killed leaves the mask until the
   next boot or the next setup run, which removes it (B138, a gap in the fix
   of B82 in rc6).
-* DNS is updated as soon as a certificate is installed (Let's Encrypt from
+* **DNS updates as soon as a certificate is installed (B139)**\
+  DNS is updated as soon as a certificate is installed (Let's Encrypt from
   the control panel or the nightly run, or a certificate of your own). The
   `_mta-sts` TXT record of a mail domain is published only when its policy
   host has a valid certificate, and after the first certificates of a box
   it was missing until the next DNS update (the daily one at the latest):
   the status checks reported the MTA-STS policy as missing, and other mail
   servers did not use it yet (upstream; B139).
-* The first Let's Encrypt provisioning of a fresh box certifies the box's
+* **First Let's Encrypt run certifies the box's own name too (B140)**\
+  The first Let's Encrypt provisioning of a fresh box certifies the box's
   own name too. When the box's name is below one of its mail domains (the
   usual layout), the request grouped by DNS zone lost the box's name and
   its `mta-sts.` name, and mail and the control panel kept the self-signed
@@ -1131,12 +2021,14 @@ no longer hang or fail as a whole when a backup target does not answer
 
 ### Changed
 
-* Docs: README-fork.md, "In-place upgrade to 26.04", has a table of the
+* **Docs: in-place upgrade timing table**\
+  Docs: README-fork.md, "In-place upgrade to 26.04", has a table of the
   times of the in-place test runs (each release upgrade, setup, mail
   offline, from 22.04 and from 24.04, with and without other load on the
   same storage), what makes an upgrade slower and when mail is offline
   (English and German).
-* Control panel (System > Intrusion Protection): `miab-zpush` is a web
+* **Intrusion Protection covers `miab-zpush` and Z-Push error logs (B126, B121)**\
+  Control panel (System > Intrusion Protection): `miab-zpush` is a web
   jail (its bans keep their fixed length with adaptive banning), the slow
   web jails get `miab-slow-zpush` (ActiveSync and Autodiscover), and the
   failed-login report and its status check read Z-Push's error logs as well
@@ -1145,7 +2037,8 @@ no longer hang or fail as a whole when a backup target does not answer
   `/carddav` and `/webdav` now count under the client's address; the
   allowlist help names the servers of mail apps that sync through their
   provider's cloud (B126, B121).
-* Tests: the smoke test's fail2ban status check wants `miab-zpush` (and
+* **Tests: fail2ban checks for the `miab-zpush` jail (B126)**\
+  Tests: the smoke test's fail2ban status check wants `miab-zpush` (and
   `miab-slow-zpush` with the slow web jails), `fail2ban-filters` has cases
   for the new filter (an e-mail address and user names with
   " from IP 198.51.100.7." in them, an escaped line break, a request without
@@ -1167,11 +2060,13 @@ no longer hang or fail as a whole when a backup target does not answer
   deliberate failures log (Z-Push's three IMAP tries, its exception and the
   new warning; for Autodiscover, which names no user in brackets, only with
   `--smoke`), and with `--internet` the same lines as password guessing.
-* `management/cli.py user add EMAIL -` and `user password EMAIL -` read the
+* **`management/cli.py` reads passwords from standard input (B127)**\
+  `management/cli.py user add EMAIL -` and `user password EMAIL -` read the
   password from standard input (its first line) instead of the command
   line, which every local account can read; without a password they still
   ask for it. Its usage text says so (B127).
-* Tests: the smoke test's new check `admin-journal-no-hash` (with `--ssh`)
+* **Tests: journal hash check and `password-hash.py` (B127)**\
+  Tests: the smoke test's new check `admin-journal-no-hash` (with `--ssh`)
   fails when a line of the journal of `mailinabox.service` since the start
   of the run looks like a password hash or the output of `doveadm pw`, and
   when journalctl fails or may not read the journal (B127).
@@ -1183,18 +2078,21 @@ no longer hang or fail as a whole when a backup target does not answer
   doveadm's own result.
   The log audit no longer accepts doveadm's "reverse password verification
   check failed" (smoke and Internet lists): the daemon no longer logs it.
-* Tests: the log audit's rule for Postfix's milter warnings while setup
+* **Tests: log audit accepts later milter resets**\
+  Tests: the log audit's rule for Postfix's milter warnings while setup
   restarts OpenDKIM or OpenDMARC also accepts a reset later in the milter
   session (`SMFIC_MAIL` and the other commands), not only in the handshake.
   The GitHub counter-test of rc7 (rc6 to rc7) logged it once.
-* Tests: the smoke test's new group `activesync` (also right after a setup
+* **Tests: new `activesync` smoke test group**\
+  Tests: the smoke test's new group `activesync` (also right after a setup
   run with `--only activesync`) checks Nextcloud's bypass list (127.0.0.1
   listed, no entry twice: `nextcloud-bruteforce-loopback`), that a failed
   login through the `/webdav` proxy is counted for the client's address and
   not for 127.0.0.1 (`nextcloud-forwarded-for`), and syncs a marked event
   and contact through ActiveSync (`zpush-sync`, with the new small client
   `tests/fork/eas.py`).
-* Tests: `tests/fork/client-load.py` keeps the clients of a few users busy
+* **Tests: `client-load.py` keeps clients busy during setup**\
+  Tests: `tests/fork/client-load.py` keeps the clients of a few users busy
   while setup runs, at the rate that reproduced the production incident:
   per user several ActiveSync devices (`--ping-devices`, `--sync-devices`;
   Sync of the inbox, the calendars and the contacts, Ping, recovery as a
@@ -1207,7 +2105,8 @@ no longer hang or fail as a whole when a backup target does not answer
   client and user. The update scenarios run one instance on the box and one
   on another host of the test network, which fail2ban and Nextcloud count
   under a real address (TESTING-fork.md, "Client load during updates").
-* Tests: the log audit no longer accepts "No passdbs specified" during
+* **Tests: log audit stops accepting "No passdbs specified" (B120, B125, B127)**\
+  Tests: the log audit no longer accepts "No passdbs specified" during
   setup (B120). It accepts what Dovecot logs when setup reloads it (also the
   SIGTERM of the IMAP, POP3, ManageSieve and login processes of the old
   configuration), what nginx logs for the ActiveSync and CalDAV/CardDAV
@@ -1217,9 +2116,11 @@ no longer hang or fail as a whole when a backup target does not answer
   log when a client comes in during setup's restart of OpenDKIM (also
   "Application error"), and fts-xapian's retries of its write lock when two
   processes index a new folder at once (BUGS-fork.md, known limitations).
-* Tests: the smoke test's `zpush-sync` also syncs a marked card whose name
+* **Tests: `zpush-sync` also syncs a card without `.vcf` (B128)**\
+  Tests: the smoke test's `zpush-sync` also syncs a marked card whose name
   has no `.vcf` (B128).
-* Tests: the smoke test's new check `zpush-ping` (group `activesync`): a
+* **Tests: `zpush-ping` check for long heartbeats (B129)**\
+  Tests: the smoke test's new check `zpush-ping` (group `activesync`): a
   Ping with a heartbeat of 3600 s gets status 5 with the box's bound at
   once, a Ping of 20 s completes, and with `--ssh` nginx's
   `fastcgi_read_timeout` of every `/Microsoft-Server-ActiveSync` location
@@ -1228,25 +2129,29 @@ no longer hang or fail as a whole when a backup target does not answer
   `tests/fork/eas.py` has `Client.ping_answer` (status, the server's
   heartbeat and the changed folders, also for status 5, with a timeout),
   and its `--ping` accepts status 5 and prints the bound.
-* Tests: the smoke test's new check `nextcloud-dav-proxy` (group `web`):
+* **Tests: `nextcloud-dav-proxy` smoke check (B130)**\
+  Tests: the smoke test's new check `nextcloud-dav-proxy` (group `web`):
   a card whose name has a space and a `?` is read, found in `?export` and
   deleted through `/carddav`, and the address book stays; a file named
   `.htmiab-smoke-...` put through Nextcloud's own path is read through
   `/webdav`, and a card `.gitmiab-smoke-...vcf` through `/carddav`, as
   nginx's dotfile block must not apply there; `/caldav` and `/webdav`
   answer PROPFIND (B130).
-* Tests: the smoke test's new check `nextcloud-mail-config-path` (group
+* **Tests: `nextcloud-mail-config-path` smoke check (B134)**\
+  Tests: the smoke test's new check `nextcloud-mail-config-path` (group
   `web`): `/mail/config/...` still answers 403, a missing static page
   under `/<name>/mail/config/` answers 404, and a file put into Nextcloud
   below a folder `mail/config` is read through `/cloud/remote.php` and
   through `/webdav` (B134). The log audit's smoke list accepts nginx's
   line for that missing page.
-* Tests: the smoke test's `zpush-ping` waits 90 s at most for the answer
+* **Tests: `zpush-ping` waits at most 90 s**\
+  Tests: the smoke test's `zpush-ping` waits 90 s at most for the answer
   to its Ping of 3600 s (on a box without the bound it waited for nginx's
   504 after 635 s, and left Z-Push waiting for up to an hour): no answer
   within 90 s fails the check, and a Ping of 60 s of the same device ends
   the long one in Z-Push (about 2.5 minutes in all, and no Ping is left).
-* Setup makes every change of the fork to Z-Push's code in one way: the
+* **Z-Push changes are patch blocks in `z-push.patches` (B126, B128)**\
+  Setup makes every change of the fork to Z-Push's code in one way: the
   changes of B126 (the escaped log lines and user names, the message and
   condition of a failed login, the 503 for a temporary login failure in
   the IMAP and combined backends), which it made with sed in the installed
@@ -1280,7 +2185,8 @@ no longer hang or fail as a whole when a backup target does not answer
   `/usr/local/lib` is removed then. `tools/patch_source.py` refuses a block
   with an empty new text, which it could never count as applied (setup
   would have stopped on every run).
-* Tests: the log audit accepts, in a setup run, what the update from rc7
+* **Tests: log audit accepts messages of the update from rc7 (B122, B126)**\
+  Tests: the log audit accepts, in a setup run, what the update from rc7
   logs once: the new jail `miab-zpush` skipping the older lines of Z-Push's
   error logs at its first start, and the login that setup's Dovecot reload
   cuts (B122, open finding) as the Z-Push of rc7 answers it (401) before
@@ -1299,11 +2205,13 @@ no longer hang or fail as a whole when a backup target does not answer
   <log file>": its reload at the end of setup removes a jail's log files
   while the jail may be reading a line just written there (fail2ban 1.1.0,
   seen once in the update test under client load).
-* Tests: the smoke test's new check `zpush-patches` (group `activesync`,
+* **Tests: `zpush-patches` smoke check (B126, B128)**\
+  Tests: the smoke test's new check `zpush-patches` (group `activesync`,
   with `--ssh`): `/usr/local/lib/z-push/version` carries the checksum of
   the blocks of the checkout's conf/zpush/z-push.patches, and the installed
   tree has every change of it (B126, B128).
-* `tools/update-check.sh after` also uses `tools/expected-changes/unreleased.txt`,
+* **`update-check.sh after` also uses the `unreleased.txt` list**\
+  `tools/update-check.sh after` also uses `tools/expected-changes/unreleased.txt`,
   the changes since the newest release, when the checkout after the update
   is not at a release tag (bootstrap.sh with `TAG=<branch or commit>`) or
   the new version has no list of its own; before, such an update matched no
@@ -1313,7 +2221,8 @@ no longer hang or fail as a whole when a backup target does not answer
   2.7.7+patches-<16 hex digits>`). Every update may also change the version
   named by the status checks, and an update to a branch or commit records
   its commit id as the version (`any.txt`).
-* Nextcloud's calendar app 6.6.3 → 6.6.4 (bug fixes; for the fresh install
+* **Nextcloud calendar app 6.6.3 to 6.6.4**\
+  Nextcloud's calendar app 6.6.3 → 6.6.4 (bug fixes; for the fresh install
   and the steps of the upgrade chain to 32, 33 and 34), SHA256
   `0557b6b5852a467cf3f746e59d56478d227f78bf7a66357b30dfc10cae4c7e3c`
   (computed from the download, the same as GitHub's digest of the release
@@ -1323,20 +2232,25 @@ no longer hang or fail as a whole when a backup target does not answer
   already runs Nextcloud 34.0.5 keeps its calendar app at the update. The
   other pinned components were checked against their upstream releases on
   2026-10-27 and are current.
-* `tools/update-check.sh` writes its empty local variables as `''`
+* **`update-check.sh` empty variables written as `''`**\
+  `tools/update-check.sh` writes its empty local variables as `''`
   (shellcheck SC1007); no change in what it does.
-* Tests: the client load (`tests/fork/client-load.py`) counts a
+* **Tests: client load counts FolderSync status 6 as unavailable (B137)**\
+  Tests: the client load (`tests/fork/client-load.py`) counts a
   FolderSync status 6 as "unavailable" (a server error that the phone
   retries, like HTTP 503; within `--max-outage`), and the log audit accepts
   Z-Push's warning that it connects again for a folder list in a setup run
   (B137).
-* Tests: the log audit accepts systemd's note of the left-over processes
+* **Tests: log audit accepts systemd's cron leftover note (B138)**\
+  Tests: the log audit accepts systemd's note of the left-over processes
   of a cron job when setup starts cron again at its end (B138).
-* Tests: the log audit accepts systemd's note of the left-over processes
+* **Tests: log audit accepts more cron and reverse DNS notes**\
+  Tests: the log audit accepts systemd's note of the left-over processes
   of any cron job when setup starts cron again (not only of Nextcloud's
   `cron.php`), and with `--internet` the reverse DNS warning of Postfix
   also for clients of the submission ports (scanners).
-* Tests: more classes of the repeated runs in the log audit's lists: git's
+* **Tests: log audit accepts more repeated-run messages (B135)**\
+  Tests: more classes of the repeated runs in the log audit's lists: git's
   warning that a release tag is a tag object when the in-place and
   migration tools clone it (`git clone -b <tag> --depth 1`; every release
   tag is annotated, B135), ntpd's skipped link-local addresses of Docker's
@@ -1345,10 +2259,12 @@ no longer hang or fail as a whole when a backup target does not answer
   the old box (upstream v74)
   Dovecot 2.3's notes at stop-old and cron's mail to root@, which has no
   alias there.
-* Tests: the log audit accepts the auth-worker processes' note of their
+* **Log audit accepts Dovecot auth-worker end note at setup reload (B122)**\
+  Tests: the log audit accepts the auth-worker processes' note of their
   end at setup's Dovecot reload (`Killed with signal 15` from the master,
   B122), seen in the repeated update test.
-* Tests: the log audit's lists, from the final runs of this release: the
+* **Log audit allowlists from the final runs of this release**\
+  Tests: the log audit's lists, from the final runs of this release: the
   first start of the jails that read mail.log in the setup run that adds
   them (a migration), Postfix's cleanup and systemd at setup's OpenDKIM
   restart, the smoke test's rejected mails from a client with reverse DNS
@@ -1356,7 +2272,8 @@ no longer hang or fail as a whole when a backup target does not answer
   not support (HTTP 400), the TLS error "unexpected message" of old
   clients and scanners (`--internet`), and Dovecot 2.3's note when the
   migration stops the old box during a delivery (old-box list).
-* Tests: `tests/fork/log-audit-allow-from-rc7.txt`, which `update-check.sh
+* **Log audit accepts Roundcube CardDAV migration race after update from rc7**\
+  Tests: `tests/fork/log-audit-allow-from-rc7.txt`, which `update-check.sh
   after` adds by itself after an update from rc7 or earlier, accepts
   Roundcube's CardDAV migration race ("UNIQUE constraint failed:
   carddav_migrations.filename") of two first logins in the same second on
@@ -1365,7 +2282,8 @@ no longer hang or fail as a whole when a backup target does not answer
 
 ### Upgrade note
 
-* Boxes on rc7 are updated with the bootstrap command of "Updating the
+* **Updating boxes on rc7: bootstrap command and preparations (B125, B129)**\
+  Boxes on rc7 are updated with the bootstrap command of "Updating the
   fork" in README-fork.md,
   `sudo bash -c "$(curl -fsSL https://raw.githubusercontent.com/LM1337/Mail-in-a-box-26/main/setup/bootstrap.sh)"`.
   Before it: put back the files changed by hand in `/root/mailinabox`
@@ -1379,26 +2297,30 @@ no longer hang or fail as a whole when a backup target does not answer
   `before` and `backup` before the update, `after` and `mailcheck` after
   it, all from `/root/mailinabox/tools/`; `after` judges the changes by
   `tools/expected-changes/v78-r2604.0.txt` (and `any.txt`).
-* Boxes on rc1 to rc6 are updated the same way, with the steps of rc7's
+* **Updating boxes on rc1 to rc6 follows the rc7 steps first**\
+  Boxes on rc1 to rc6 are updated the same way, with the steps of rc7's
   upgrade note first: `sudo git -C /root/mailinabox remote set-url origin
   https://github.com/LM1337/Mail-in-a-box-26` for rc1 to rc3, and
   `tools/update-check.sh before` and `backup` through `curl ... | sudo bash
   -s -- STEP`, as these releases have no copy of the tool. Read the upgrade
   notes of every release in between; `after` uses the lists of rc7 and of
   v78-r2604.0.
-* Z-Push's message for a failed ActiveSync login reads "Failed to
+* **Z-Push failed-login log message changed, log control characters escaped**\
+  Z-Push's message for a failed ActiveSync login reads "Failed to
   authenticate user '...' from IP ...." now (Z-Push: "IP: ... failed to
   authenticate user '...'"), and control characters in Z-Push's log lines
   are escaped (a multi-line message is one line with `\n`). A fail2ban
   filter or log tool of your own for Z-Push needs the new form. A request
   without a password no longer logs that message.
-* `/var/log/z-push` belongs to root, group www-data (0750), and Z-Push can
+* **`/var/log/z-push` is root-owned and setup creates the log files**\
+  `/var/log/z-push` belongs to root, group www-data (0750), and Z-Push can
   no longer create files there: setup creates `z-push.log`,
   `z-push-error.log`, `autodiscover.log` and `autodiscover-error.log`, and
   removes what is not a regular file there. Per-user logs of your own
   (`$specialLogUsers` in Z-Push's `config.php`) need their files created
   the same way (www-data, 0640).
-* Outlook for iOS and Android syncs an Exchange ActiveSync account through
+* **Outlook for iOS and Android can trigger fail2ban bans of Microsoft servers (B126)**\
+  Outlook for iOS and Android syncs an Exchange ActiveSync account through
   Microsoft's servers: if your users do that, put those networks on the
   fail2ban allowlist, or 20 wrong passwords entered there within two
   minutes ban these servers from the web ports for all of these users.
@@ -1406,27 +2328,32 @@ no longer hang or fail as a whole when a backup target does not answer
   with any account name and a wrong password in the app, and repeated bans
   of these addresses lead to recidive's ban of one week on all ports
   (B126).
-* Z-Push escapes "]" and "\" in the user names at the start of its log
+* **Z-Push log user-name escaping and HTTP 503 on temporary login failure (B126)**\
+  Z-Push escapes "]" and "\" in the user names at the start of its log
   lines (`[a\]b]`), and Autodiscover's lines start with `[#unknown]`. A
   filter of your own that reads the user names there needs to allow for
   that. A temporary login failure (Dovecot or Nextcloud cannot check the
   password at that moment) is answered with HTTP 503 now and logs
   `Exception: (ServiceUnavailableException)` instead of a failed login
   (B126).
-* The backup page shows "No status of this backup target has been saved
+* **Backup page shows no saved status until its first refresh**\
+  The backup page shows "No status of this backup target has been saved
   yet" on the first visit after the update, until its first refresh (or
   the next backup run) ends. The saved status is kept in
   `/var/lib/mailinabox/backup-status` (root only).
-* Setup sets Nextcloud's `trusted_proxies` (adds 127.0.0.1, keeps the
+* **Setup sets Nextcloud `trusted_proxies` and `forwarded_for_headers`**\
+  Setup sets Nextcloud's `trusted_proxies` (adds 127.0.0.1, keeps the
   others) and `forwarded_for_headers` (`HTTP_X_FORWARDED_FOR` only, the
   Nextcloud default; another value there is replaced). A reverse proxy of
   your own in front of the box keeps working when it sends
   `X-Forwarded-For`.
-* `/etc/dovecot` changes from `mail:dovecot` to `root:mail` (no write for
+* **`/etc/dovecot` ownership changes to root:mail**\
+  `/etc/dovecot` changes from `mail:dovecot` to `root:mail` (no write for
   the group, nothing for others). Your own files there stay readable by the
   mail processes; give a file that other processes must read other
   permissions in another place.
-* The first update with this release reloads Dovecot once (its open IMAP
+* **First update reloads Dovecot once; phones may show one password prompt (B126)**\
+  The first update with this release reloads Dovecot once (its open IMAP
   sessions log in again), as the checksum of its configuration is new. In
   that second, the Z-Push of rc7 or earlier, which runs until setup
   installs the new one later in the same run, can answer an ActiveSync
@@ -1434,7 +2361,8 @@ no longer hang or fail as a whole when a backup target does not answer
   is cut (seen once for one request in the update test under client load):
   a phone may show a password prompt once (the password is unchanged).
   The new Z-Push answers such a moment with 503 (B126).
-* The password hashes that the control panel's logins wrote before (B127)
+* **Old password hashes remain in the journal and syslog until rotated (B127)**\
+  The password hashes that the control panel's logins wrote before (B127)
   stay in the journal and in `/var/log/syslog` until these are rotated
   away. To remove them at once: `journalctl --rotate` and
   `journalctl --vacuum-time=1s` (this deletes the whole journal up to now),
@@ -1443,10 +2371,12 @@ no longer hang or fail as a whole when a backup target does not answer
   /var/log/syslog*` lists them all (plain `grep` does not look into the
   `.gz` files). Otherwise they stay until logrotate drops them. The nightly
   backups do not contain `/var/log`.
-* A new password with a null character or of more than 511 bytes is now
+* **Passwords with a null character or over 511 bytes are refused (B127)**\
+  A new password with a null character or of more than 511 bytes is now
   refused with a message (B127). Before, such a password gave a hash that no
   password matched. Existing passwords are not changed.
-* Setup changes a few functions of Z-Push 2.7.7 (conf/zpush/z-push.patches)
+* **Setup patches Z-Push 2.7.7 and downloads it once more (B128)**\
+  Setup changes a few functions of Z-Push 2.7.7 (conf/zpush/z-push.patches)
   in a fresh copy before it installs it in `/usr/local/lib/z-push`, and
   stops with a message if one of them does not apply. A tree in
   `/usr/local/lib/z-push` that no longer has every change (changes made
@@ -1465,17 +2395,21 @@ no longer hang or fail as a whole when a backup target does not answer
   contact now syncs to phones like any other contact; delete it in
   Nextcloud's Contacts if it is not wanted. A phone that got HTTP 500 needs
   no new setup: its next Sync continues (B128).
-* After the update, a reload of nginx keeps its old worker processes until
+* **nginx reload keeps old workers up to an hour for ActiveSync polls (B129)**\
+  After the update, a reload of nginx keeps its old worker processes until
   their running ActiveSync long polls end, up to an hour (before: 10.5
   minutes). Pings of up to 59 minutes hold a PHP-FPM worker each, as they
   already did past nginx's old timeout (B129).
-* `/caldav`, `/carddav` and `/webdav` are now prefix locations of nginx: a
+* **`/caldav`, `/carddav` and `/webdav` are prefix locations in nginx (B130)**\
+  `/caldav`, `/carddav` and `/webdav` are now prefix locations of nginx: a
   proxy of your own for one of these paths (`www/custom.yaml`) would now
   clash with them (B130).
-* A reverse proxy or firewall of your own in front of the box must keep an
+* **Reverse proxies must keep ActiveSync requests open for an hour (B129)**\
+  A reverse proxy or firewall of your own in front of the box must keep an
   ActiveSync request open for an hour (3660 s) too, or it ends the long Pings
   instead of nginx (B129).
-* Put back every file that you changed by hand in `/root/mailinabox`
+* **Hand-changed files in `/root/mailinabox` must be restored before the update (B125, B129)**\
+  Put back every file that you changed by hand in `/root/mailinabox`
   before the update, or bootstrap.sh stops with "Update failed. Did you
   modify something in /root/mailinabox?" (git refuses to check out over a
   changed file). `git -C /root/mailinabox status --short` lists them, and
@@ -1526,7 +2460,8 @@ the fallback SSH server (all fixed).
 
 ### New
 
-* Munin: an admin panel setting for Munin's alerts, under System > Munin
+* **Munin alert settings in the control panel with test notification**\
+  Munin: an admin panel setting for Munin's alerts, under System > Munin
   Monitoring: to the standard address administrator@PRIMARY_HOSTNAME, to a
   custom address, or off; warning and critical (the default) or critical
   only; a button that sends one test notification to the saved recipient
@@ -1547,7 +2482,8 @@ the fallback SSH server (all fixed).
   as a separate argument after `--`. The sender stays administrator@. API
   (admin only): `GET`/`POST /system/munin/alerts`,
   `POST /system/munin/alerts/test`. README-fork.md, "Munin alerts".
-* API documentation: `api/mailinabox.yml` documents every route of the
+* **API documentation covers every route of the management daemon**\
+  API documentation: `api/mailinabox.yml` documents every route of the
   management daemon: the quota endpoints (`/mail/users/quota`), the Munin
   session (`/munin/`), the intrusion protection (`/system/fail2ban`,
   `/settings`, `/unban`, `/unban-all`, `/report`) and Munin's alerts. The
@@ -1558,7 +2494,8 @@ the fallback SSH server (all fixed).
   text/html, `POST /system/backup/config` a JSON string (also for a refused
   configuration, with 200); `latest-upstream-version` can answer 500 and
   503; the login status can be `missing-totp-token`.
-* Tools: `tools/update-check.sh`, the checks around an update of a box of
+* **New `update-check.sh` tool checks a box around an update (B103, B104)**\
+  Tools: `tools/update-check.sh`, the checks around an update of a box of
   this fork, as root (also through `curl ... | sudo bash -s -- STEP`):
   * `before` records the state of the box in
     `/root/update-check/<stamp>/before/` (mode 0700; `UPDATE_CHECK_DIR`
@@ -1612,7 +2549,8 @@ the fallback SSH server (all fixed).
     (Sieve) and the storage. Without a probe address it says "skipped". The
     mail carries no secrets.
   README-fork.md ("Updating the fork") describes it.
-* Tools: during each release upgrade, `tools/upgrade-in-place-to-2604.sh`
+* **In-place tool runs a fallback SSH server on port 1022 (B100, B101)**\
+  Tools: during each release upgrade, `tools/upgrade-in-place-to-2604.sh`
   runs a fallback SSH server on port 1022 (`UPGRADE_SSH_FALLBACK_PORT=PORT`,
   or `off`). Cause of the SSH outage: the maintainer scripts of
   openssh-server stop `ssh.socket` and `ssh.service` when the new package
@@ -1641,10 +2579,12 @@ the fallback SSH server (all fixed).
   127.0.0.1). `--ssh-fallback-test` starts it for 10 minutes
   (`UPGRADE_SSH_FALLBACK_TEST_SECONDS`) before an upgrade, to try a login on
   its port.
-* Tools: `tools/upgrade-in-place-to-2604.sh` says in the run when the release
+* **In-place tool reports when port 22 is down and back**\
+  Tools: `tools/upgrade-in-place-to-2604.sh` says in the run when the release
   upgrade has stopped the SSH server on port 22 and when port 22 answers
   again (its SSH banner), with the minutes in between.
-* Setup marks its start and end in the journal ("Mail-in-a-Box setup
+* **Setup marks its start and end in the journal (B105)**\
+  Setup marks its start and end in the journal ("Mail-in-a-Box setup
   started", "Mail-in-a-Box setup ended (exit code N)", identifier
   `mailinabox-setup`). `tests/fork/log-audit.sh` prefixes what the box logs
   in between with `[setup]` (outside the phases of an in-place upgrade;
@@ -1653,7 +2593,8 @@ the fallback SSH server (all fixed).
   there: connections that setup's restarts of the services cut are normal
   during setup and a finding at any other time. The report names the setup
   runs (`setup_runs` in the JSON report).
-* Tests: `tests/fork/smoke.py` group `api` (in every scenario): `api-auth`
+* **Smoke test group `api` covers the management API**\
+  Tests: `tests/fork/smoke.py` group `api` (in every scenario): `api-auth`
   (401 without credentials, as text and JSON, 403 for an XMLHttpRequest,
   401 for a wrong password, the API key, a second session until its logout
   and 401 after it; two failed logins in all), `api-read-only` (29
@@ -1674,14 +2615,16 @@ the fallback SSH server (all fixed).
   describes it.
   Run it from the box itself or from a peer: through `--jump` its two
   failed logins come from the jump host.
-* Tests: `tests/fork/api-routes.py` (stdlib only, no box): every route of
+* **New `api-routes.py` test checks routes against the API documentation**\
+  Tests: `tests/fork/api-routes.py` (stdlib only, no box): every route of
   `management/daemon.py` (method and path, path parameters normalised) is
   documented in `api/mailinabox.yml` and every documented operation has a
   route; `smoke.py` calls or excludes each documented operation exactly
   once; the content types it expects are the documented ones. The control
   panel page and Munin's pages behind the session cookie are listed as not
   part of the API. Exit code 1 on drift.
-* Tests: `tests/fork/log-audit.sh --baseline BEFORE.json` compares with the
+* **Log audit gains `--baseline`, `--internet` and `--smoke` allowlists**\
+  Tests: `tests/fork/log-audit.sh --baseline BEFORE.json` compares with the
   `--json` report of an earlier run: a class that was in it is listed as
   KNOWN, with both counts, and does not count; only new classes are
   UNKNOWN (the prefixes `[in-place:PHASE]` and `[setup]` are ignored for
@@ -1699,7 +2642,8 @@ the fallback SSH server (all fixed).
   `tests/fork/log-audit-allow-smoke.txt`, the deliberate failures of the
   smoke test that look like a real attack (the failed logins of
   `api-auth`), for the test scenarios only.
-* `tests/fork/log-audit-allow.txt`: rules for `(sd-pam)`'s "Varlink call
+* **More log audit allowlist rules for reboot, Z-Push and setup noise**\
+  `tests/fork/log-audit-allow.txt`: rules for `(sd-pam)`'s "Varlink call
   io.systemd.Login.ReleaseSession failed: io.systemd.Login.NoSuchSession"
   at a reboot with an open SSH login; for Z-Push's first ActiveSync device
   of a box (`FileStateMachine->LinkUserDevice()` reads its users file
@@ -1712,14 +2656,16 @@ the fallback SSH server (all fixed).
 
 ### Fixed
 
-* Setup: an update no longer runs as root what another local user put into
+* **Setup no longer sources a settings file from `/tmp` as root (B89, B96)**\
+  Setup: an update no longer runs as root what another local user put into
   `/tmp`. Each run after the first wrote the settings of
   `/etc/mailinabox.conf` to `/tmp/mailinabox.prev.conf` and sourced that
   file as root; when a file of that name already existed (any local user,
   and www-data, can create one), the write failed and setup sourced the
   other user's file. It now reads the settings through a pipe, no file
   (B89; found twice, also as B96).
-* Setup: the downloads of Nextcloud and its apps, Roundcube and its
+* **Setup uses private temporary directories for downloads (B97)**\
+  Setup: the downloads of Nextcloud and its apps, Roundcube and its
   plugins, Z-Push and Bootstrap, the certificate request of the first
   self-signed certificate and the daily download of Postgrey's allowlist no
   longer use fixed or predictable names in `/tmp`, but a directory of
@@ -1727,20 +2673,24 @@ the fallback SSH server (all fixed).
   these names first and make setup fail; for Z-Push and the Roundcube
   plugins of git, a directory created in the right moment let them replace
   the unpacked code before setup moved it into place (B97).
-* DNS: the management daemon copies the DNSSEC keys for signing a zone
+* **DNSSEC keys are copied to a private directory for zone signing (B98)**\
+  DNS: the management daemon copies the DNSSEC keys for signing a zone
   into a directory of its own (mode 0700), not to `/tmp/K<domain>...`
   under the key's name. Another local user could create these names first
   (the key tags are public); the copy then failed and the zone was not
   signed again, so its signatures would expire after 30 days (B98).
-* Munin: setup no longer changes the owner of what a symbolic link in
+* **Setup no longer changes owners through symlinks in `/var/log/munin` (B86)**\
+  Munin: setup no longer changes the owner of what a symbolic link in
   `/var/log/munin` points to. It ran `chown munin` as root on the CGI logs
   there, in a directory that belongs to munin; now `chown -h` (B86).
-* Settings: the daemon and setup no longer write `settings.yaml` through a
+* **`settings.yaml` is no longer written through a symbolic link (B87)**\
+  Settings: the daemon and setup no longer write `settings.yaml` through a
   symbolic link. `$STORAGE_ROOT` belongs to the storage user; root now
   writes a new file under a random name and renames it (with at most the
   read bits of the old file's mode), and reads only a regular file there,
   with `O_NOFOLLOW` and without blocking on a FIFO (B87).
-* Tools: for backups on the machine itself (local, or a `file://` target
+* **In-place tool no longer copies the system archive into `$STORAGE_ROOT` (B90)**\
+  Tools: for backups on the machine itself (local, or a `file://` target
   below a directory that another account may change),
   `tools/upgrade-in-place-to-2604.sh` no longer copies the encrypted system
   archive as root into `$STORAGE_ROOT/backup/encrypted-system/`: that path
@@ -1749,7 +2699,8 @@ the fallback SSH server (all fixed).
   stays in `/root/upgrade-2604`, as the tool already said to copy it off the
   machine. A `file://` target whose path only root can change gets the copy
   as before (B90).
-* Tools: for an rsync backup target, `tools/upgrade-in-place-to-2604.sh`
+* **Backup host and path are validated before ssh and rsync run as root (B102)**\
+  Tools: for an rsync backup target, `tools/upgrade-in-place-to-2604.sh`
   (and the new `tools/update-check.sh backup`) no longer passes the host
   and path from `custom.yaml` unchecked to ssh and rsync as root: a host or
   path that starts with "-" (an option such as `-oProxyCommand=...`) or has
@@ -1757,12 +2708,14 @@ the fallback SSH server (all fixed).
   and host) stops the tool, which names `--no-offsite` (`--no-upload`).
   `custom.yaml` lies below `$STORAGE_ROOT`, which the user-data account can
   change; current OpenSSH refused the resulting command line anyway (B102).
-* Management: the daemon no longer runs out of file descriptors. Each API
+* **Management daemon no longer runs out of file descriptors (B91)**\
+  Management: the daemon no longer runs out of file descriptors. Each API
   call left `users.sqlite` open (1 to about 90 times per call); after a few
   hundred calls the daemon reached its limit of 1024 open files and
   answered every request with 500 ("unable to open database file") until
   it was restarted. Connections now close with their cursor (B91).
-* Nextcloud/Z-Push: ActiveSync syncs the address book of new users again.
+* **ActiveSync syncs the address book of new users again (B99)**\
+  Nextcloud/Z-Push: ActiveSync syncs the address book of new users again.
   Nextcloud 34 puts an example contact into each new address book under the
   name `default`, without the `.vcf` that Z-Push's CardDAV backend adds when
   it fetches a contact; the Sync of the contacts folder then failed with a
@@ -1770,7 +2723,8 @@ the fallback SSH server (all fixed).
   example contact off (`dav` `enableDefaultContact`). Users created before
   keep their example contact: delete it in Nextcloud's Contacts (it is
   marked "This is an example contact"), and the address book syncs (B99).
-* OpenDKIM: the `KeyTable` and `SigningTable` are written in a fixed
+* **OpenDKIM tables are written in a fixed order (B95)**\
+  OpenDKIM: the `KeyTable` and `SigningTable` are written in a fixed
   (sorted) order. The domains came from a Python set, whose order changes
   with every process, so with more than one mail domain each setup run (the
   management daemon, which writes them, starts anew in every run) and the
@@ -1778,52 +2732,64 @@ the fallback SSH server (all fixed).
   OpenDKIM once more, although nothing had changed. Mail sent in the moment
   of a restart goes out without a DKIM signature (Postfix has
   `milter_default_action=accept`) (B95).
-* API: `GET /mail/users/quota` for an address that is not a user answers
+* **Quota API answers 400 for invalid requests (B88)**\
+  API: `GET /mail/users/quota` for an address that is not a user answers
   400 with the message instead of 200 with the error inside the JSON, and
   `POST /mail/users/quota` without a quota answers 400 instead of 500
   (B88).
-* Tests: `admin-api-tmp-user-alias` removes the archived mailbox of its
+* **Smoke test and log audit fixes for temporary user and Munin alerts**\
+  Tests: `admin-api-tmp-user-alias` removes the archived mailbox of its
   temporary user again (with `--ssh`), which every run left behind as an
   inactive account. `munin-alert-contact` passes when the admin panel
   turned the alerts off. `log-audit.sh --smoke` accepts the two deliberate
   failed logins of `api-auth`; the default allowlist does not, so that real
   failed logins to the control panel stay visible on a production box.
-* Tools: `tools/update-check.sh mailcheck` reads the Received header of
+* **`update-check.sh mailcheck` reads Received headers of TLS answers (B107)**\
+  Tools: `tools/update-check.sh mailcheck` reads the Received header of
   an answer that came in over TLS. Postfix puts the TLS session and
   "(No client certificate requested)" between the client and "by", and
   the check said FAILED for a round trip that had worked (B107).
-* Tools: `tools/update-check.sh` finds the checkout of a box that has it in
+* **`update-check.sh` finds the checkout of an upstream box (B106)**\
+  Tools: `tools/update-check.sh` finds the checkout of a box that has it in
   `/mailinabox` (an upstream box before the in-place upgrade): from the
   directory that `/usr/local/bin/mailinabox` changes into, as long as it is
   root's own. `before` recorded no version and no status checks there and
   said "0 errors", and `backup` stopped (B106).
-* Tools: `tools/update-check.sh after` expects the new minute of the
+* **`update-check.sh after` expects the random minute of the nightly job (B108)**\
+  Tools: `tools/update-check.sh after` expects the new minute of the
   nightly job, which setup picks at random on every run; an update that
   changed nothing else ended with "RESULT: CHANGED" (B108).
-* Tools: the expected changes of rc7 include those of rc4 and rc5 that the
+* **Expected changes of rc7 include those of rc4 and rc5 (B109)**\
+  Tools: the expected changes of rc7 include those of rc4 and rc5 that the
   state record shows (`/etc/mailname` and `/etc/hosts`, B60; Dovecot and
   `mailinabox.service` enabled again, B67 and B69), for updates from rc1 to
   rc3 (B109).
-* Tools: `tools/update-check.sh after` no longer judges an in-place upgrade
+* **`update-check.sh after` does not judge in-place upgrades or migrations (B110)**\
+  Tools: `tools/update-check.sh after` no longer judges an in-place upgrade
   or a migration from upstream Mail-in-a-Box by the lists of the fork's
   updates: it lists the changes and says "RESULT: NOT JUDGED" (exit code
   3) when the Ubuntu release changed or the box came from upstream (B110).
-* Tools: `--ssh-fallback-test` of the in-place tool no longer leaves an
+* **Fallback SSH test no longer leaves an empty `/root/upgrade-2604` (B111)**\
+  Tools: `--ssh-fallback-test` of the in-place tool no longer leaves an
   empty `/root/upgrade-2604` behind (B111).
-* Tools: the in-place tool puts back `/run/sshd`, which the fallback SSH
+* **In-place tool restores `/run/sshd` within 2 seconds (B112)**\
+  Tools: the in-place tool puts back `/run/sshd`, which the fallback SSH
   server needs, within 2 s after the release upgrade stops ssh.service (it
   looked every 10 s, and new logins on port 1022 failed meanwhile). Its
   texts gave the outage times of the first rc7 run (B112); they now give
   those of all rc7 runs (see "Changed").
-* Tools: `tools/migrate-to-2604.sh --check` proposes the start command with
+* **Migration tool `--check` proposes the start command with all options (B113)**\
+  Tools: `tools/migrate-to-2604.sh --check` proposes the start command with
   all options of the check (`--public-ip`, `--public-ipv6`,
   `--private-ip`, `--hostname`, ...); it named only `--from`, the SSH options
   and `--skip-network-checks`, and `--from` with nothing after it for
   `--from-backup` (B113).
-* Tools: `tools/update-check.sh after` accepts both names under which
+* **`update-check.sh after` accepts both munin-node port names (B114)**\
+  Tools: `tools/update-check.sh after` accepts both names under which
   munin-node holds its port (`munin-node`, or its path cut to 15
   characters, `/usr/sbin/munin`) (B114).
-* Tools: the fallback SSH server of the in-place tool takes, with
+* **Fallback SSH server only takes key files that sshd accepts (B115)**\
+  Tools: the fallback SSH server of the in-place tool takes, with
   StrictModes (sshd's default), only the key files that sshd accepts on
   port 22: a file whose path up to the home directory another account can
   write (others, or a group with another member than the user; Ubuntu's
@@ -1831,11 +2797,13 @@ the fallback SSH server (all fixed).
   skipped with a warning, as sshd ignores it. It accepted such keys, so whoever could write an
   administrator's home could log in on port 1022 as that administrator.
   Its copy of the keys is `root:<the user's group>`, mode 0640 (B115).
-* Tools: `tools/update-check.sh` no longer uses a checkout it rejected (it
+* **`update-check.sh` rejects checkouts not owned by root (B116)**\
+  Tools: `tools/update-check.sh` no longer uses a checkout it rejected (it
   warned and, through curl, ran the status checks and `backup.py` from
   `/root/mailinabox` anyway), and a checkout counts only when every file in
   it is root's own and not writable by group or others (B116).
-* Tools: `tools/update-check.sh backup`, the in-place tool's system archive
+* **Backup tools use `$STORAGE_ROOT/backup` only when it is root's own (B117)**\
+  Tools: `tools/update-check.sh backup`, the in-place tool's system archive
   and the pause of the backups in the in-place and the migration tool use
   `$STORAGE_ROOT/backup` only when it is a directory of root's own, not
   writable by group or others, and then only through one open descriptor:
@@ -1846,10 +2814,12 @@ the fallback SSH server (all fixed).
   in-place preflight has a blocker, the archive stays unencrypted in
   `/root/upgrade-2604`, and pausing the backups is left to the operator
   (B117).
-* Tools: the fallback SSH server also refuses to start when a file included
+* **Fallback SSH server refuses `Match` blocks in nested includes (B118)**\
+  Tools: the fallback SSH server also refuses to start when a file included
   from an included file (for example from `sshd_config.d/*.conf`) has a
   `Match` block; it looked one level deep only (B118).
-* Tools: the fallback SSH server also starts for the release upgrade that
+* **Fallback SSH server starts for the upgrade after the reboot into 24.04 (B119)**\
+  Tools: the fallback SSH server also starts for the release upgrade that
   begins by itself after the reboot into 24.04: with socket activation
   `/run/sshd` is missing until the first SSH login, so `sshd -T` failed and
   there was no fallback (B119). The tool creates the directory first. A
@@ -1858,13 +2828,15 @@ the fallback SSH server (all fixed).
 
 ### Changed
 
-* Setup: an interactive update of an existing box (`/etc/mailinabox.conf`
+* **Interactive setup update skips the new-installation welcome dialog**\
+  Setup: an interactive update of an existing box (`/etc/mailinabox.conf`
   exists) no longer shows the welcome dialog of a new installation ("You
   should only install this on a brand new Ubuntu installation"). The
   questions that follow (hostname, and the IP addresses where they differ
   from what the box finds) come as before; non-interactive runs are
   unchanged.
-* nginx: setup reloads nginx (after `nginx -t`) instead of restarting it.
+* **Setup reloads nginx instead of restarting it**\
+  nginx: setup reloads nginx (after `nginx -t`) instead of restarting it.
   A restart gave the running requests only the unit's stop timeout (5 s on
   Ubuntu) and cut long-polling ActiveSync, CalDAV and CardDAV clients; a
   reload lets the old workers finish them. Setup still starts nginx when it
@@ -1873,7 +2845,8 @@ the fallback SSH server (all fixed).
   management daemon's web update already reloaded. Setup's restarts of
   PHP-FPM (four per run) still end an ActiveSync long poll, which the
   client then starts again.
-* Journal: checked, no change. Since rc6 Dovecot logs through syslog, so
+* **Journal size and rate limit checked, no change**\
+  Journal: checked, no change. Since rc6 Dovecot logs through syslog, so
   its lines are in the journal too. The journal stays bounded: setup keeps
   it for 10 days (`MaxRetentionSec=10day`, as upstream), and journald's
   defaults on 26.04 (systemd 259) cap it at 10% of the file system, at most
@@ -1883,17 +2856,20 @@ the fallback SSH server (all fixed).
   (test box: 100000 lines in a few seconds from one unit, 37500 in the
   journal, all 100000 in the syslog file). A comment in setup/system.sh
   says so.
-* Tools: the messages before a release upgrade (and in the motd) name the
+* **Pre-upgrade messages name the fallback SSH server and outage times**\
+  Tools: the messages before a release upgrade (and in the motd) name the
   fallback SSH server and how to reach it. The help of
   `tools/upgrade-in-place-to-2604.sh` describes it. The plan of `--check`
   says that new SSH logins on port 22 fail and sudo is missing for a while
   during the release upgrades; the tool gives the times of all rc7 runs
   (port 22: 19 to 42 minutes from 22.04, 6 to 19 minutes from 24.04; sudo:
   12 to 37 minutes), which were 20 to 40, 5 to 20 and 12 to 31.
-* Tests: `tests/fork/log-audit.sh --since` also takes the short forms `-90s`,
+* **Log audit `--since` accepts short forms like `-24h`**\
+  Tests: `tests/fork/log-audit.sh --since` also takes the short forms `-90s`,
   `-30m`, `-24h`, `-2d` and `-1w`; `date -d` fails on them ("-24h" reads the
   "h" as a time zone).
-* Docs: README-fork.md, "Updating the fork", gives the commands of
+* **Docs: updating the fork and in-place upgrade outage times**\
+  Docs: README-fork.md, "Updating the fork", gives the commands of
   `tools/update-check.sh` for a box on rc6 or earlier (through curl, with
   the Docker options) and what the results and exit codes of `after` mean;
   "In-place upgrade to 26.04" has the outage times of the rc7 tests, what
@@ -1903,7 +2879,8 @@ the fallback SSH server (all fixed).
 
 ### Upgrade note
 
-* Boxes on rc1 to rc6 are updated with the two commands of "Updating the
+* **Update from rc1 to rc6 takes two commands**\
+  Boxes on rc1 to rc6 are updated with the two commands of "Updating the
   fork" in README-fork.md:
   `sudo git -C /root/mailinabox remote set-url origin https://github.com/LM1337/Mail-in-a-box-26`
   and
@@ -1912,24 +2889,29 @@ the fallback SSH server (all fixed).
   Setup no longer shows the welcome dialog of a new installation; the other
   dialog boxes (host name, public IP address) are shown as before, and
   Enter keeps the current values.
-* Munin's alerts: nothing to do. Without a setting `munin.conf` stays as in
+* **Munin alerts need no action on update**\
+  Munin's alerts: nothing to do. Without a setting `munin.conf` stays as in
   rc6 (alerts of warnings and critical values to administrator@). To change
   the address or turn them off: System > Munin Monitoring. Changes to
   `/etc/munin/munin.conf` by hand are overwritten (as before by setup, now
   also when the setting is saved); own Munin settings belong into
   `/etc/munin/munin-conf.d/`.
-* The first setup run of this release writes the OpenDKIM tables once more,
+* **First setup run rewrites OpenDKIM tables once (B95)**\
+  The first setup run of this release writes the OpenDKIM tables once more,
   in sorted order, and restarts OpenDKIM (B95); later runs leave them alone.
-* Users created before this release keep Nextcloud's example contact, and
+* **Users created earlier keep Nextcloud's example contact (B99)**\
+  Users created before this release keep Nextcloud's example contact, and
   their ActiveSync contact sync fails until it is deleted in Nextcloud's
   Contacts (B99). Setup deletes no user data.
-* The fallback SSH server of the in-place tool listens on port 1022 during
+* **Fallback SSH port 1022 may need a provider firewall rule**\
+  The fallback SSH server of the in-place tool listens on port 1022 during
   each release upgrade. If a firewall of the provider must let it through,
   open it there before the upgrade and try it with
   `curl -s https://raw.githubusercontent.com/LM1337/Mail-in-a-box-26/main/tools/upgrade-in-place-to-2604.sh | sudo bash -s -- --ssh-fallback-test`
   (README-fork.md, "In-place upgrade to 26.04").
   `UPGRADE_SSH_FALLBACK_PORT=off` turns it off.
-* Before and after the update, `tools/update-check.sh before`, `backup`,
+* **Run `update-check.sh` steps around the update**\
+  Before and after the update, `tools/update-check.sh before`, `backup`,
   `after` and `mailcheck` (see "Updating the fork" in README-fork.md) record
   and compare the state of the box. A box on rc6 or earlier has no copy of
   the tool yet: run `before` and `backup` through
@@ -1975,7 +2957,8 @@ test tool: `tests/fork/log-audit.sh`.
 
 ### New
 
-* Roundcube and Nextcloud show the fork's favicon (`branding/favicon.ico`).
+* **Roundcube and Nextcloud show the fork's favicon**\
+  Roundcube and Nextcloud show the fork's favicon (`branding/favicon.ico`).
   Roundcube: setup sets `skin_logo` (`elastic:[favicon]`) and puts the file
   into Roundcube's directory; a replaced `favicon.ico` of the Elastic skin
   and other skins are left alone. Nextcloud: setup sets only the favicon of
@@ -1986,7 +2969,8 @@ test tool: `tests/fork/log-audit.sh`.
   Nextcloud again. For `occ`, which runs as www-data, setup copies the file
   into a new directory of root's own (mode 0711), not under a file name in
   `/tmp`. See README-fork.md, "Favicons".
-* Tests: `tests/fork/log-audit.sh` (as root on the box, read-only) collects
+* **New `log-audit.sh` collects log warnings and errors (B80–B84)**\
+  Tests: `tests/fork/log-audit.sh` (as root on the box, read-only) collects
   the warnings and errors since a point in time (`--since`, default the last
   boot) from the journal, `systemctl --failed` and the logs of the services
   (mail.log, nginx, PHP-FPM, fail2ban, Nextcloud, Roundcube, Z-Push, Munin,
@@ -2013,13 +2997,15 @@ test tool: `tests/fork/log-audit.sh`.
 
 ### Fixed
 
-* Tools: phase verify of `tools/upgrade-in-place-to-2604.sh` no longer
+* **In-place tool no longer warns about disabled `ssh.service` (B70)**\
+  Tools: phase verify of `tools/upgrade-in-place-to-2604.sh` no longer
   warns that `ssh.service` was enabled before the upgrade and is disabled
   now, and `etc-report.txt` no longer advises to enable it. Since 24.04
   `ssh.socket` starts it. Units that are started another way (an enabled
   socket, path or timer, a new name, a running unit that pulls them in)
   are left out of the check (B70).
-* Tools: the terminal that the tools attach to their tmux session shows
+* **Tool terminals attach to the tmux session and show the run (B71)**\
+  Tools: the terminal that the tools attach to their tmux session shows
   the run. It stayed blank in rc4 and rc5 (the terminal was opened only for
   reading), and through `curl ... | sudo bash` the tools did not attach it
   at all ("Could not attach this terminal"). Now they attach it in all
@@ -2028,42 +3014,51 @@ test tool: `tests/fork/log-audit.sh`.
   runs the session; a test version ran that binary with `--version` as root.
   `--check` no longer advises to start the command inside tmux, except for a
   `TAG` of rc1 to rc3 (B71).
-* Tools: after the last reboot of `tools/upgrade-in-place-to-2604.sh`
+* **tmux window closes 60 seconds after a successful last run (B72)**\
+  Tools: after the last reboot of `tools/upgrade-in-place-to-2604.sh`
   the tmux window closes by itself 60 seconds after a successful run,
   instead of waiting for Enter forever; after a failure it stays open (B72).
-* Tools: `tools/upgrade-in-place-to-2604.sh` says that from a few minutes
+* **In-place tool advises `tail -f` when tmux attach is impossible (B73)**\
+  Tools: `tools/upgrade-in-place-to-2604.sh` says that from a few minutes
   into the release upgrade to 26.04 until the reboot a new `tmux attach`
   cannot reach the run ("open terminal failed: not a terminal": tmux 3.6
   replaces tmux 3.4), and to follow the log with `sudo tail -f
   /root/upgrade-2604/upgrade.log` instead. Before, it advised to wait and
   attach again. The log hints say `sudo tail -f` (B73).
-* Dovecot: setup no longer adds another commented copy of each SSL setting
+* **Setup no longer duplicates Dovecot SSL settings in `10-ssl.conf` (B74)**\
+  Dovecot: setup no longer adds another commented copy of each SSL setting
   to `/etc/dovecot/conf.d/10-ssl.conf` on every run. The settings were
   passed to `editconf.py` with spaces around "=" (B74).
-* System: on boxes upgraded in place to 26.04, `logrotate.service` no
+* **`logrotate.service` no longer fails on in-place upgraded boxes (B75)**\
+  System: on boxes upgraded in place to 26.04, `logrotate.service` no
   longer fails every day. The release upgrade leaves cloud-init's old
   `/etc/logrotate.d/cloud-init` next to the new `cloud-init-base`. Setup
   removes unchanged logrotate files that their package no longer ships
   (B75).
-* Tools: the Spamhaus checks of `tools/migrate-to-2604.sh` no longer
+* **Migration tool Spamhaus checks ignore the resolver search domain (B76)**\
+  Tools: the Spamhaus checks of `tools/migrate-to-2604.sh` no longer
   append the resolver's search domain to the names they look up. With a
   wildcard record in that domain they reported "unexpected answer" with
   the wildcard's address (B76).
-* Tools: `tools/migrate-to-2604.sh --check --skip-network-checks` lists
+* **Migration tool `--check` lists skipped network checks as ignored (B77)**\
+  Tools: `tools/migrate-to-2604.sh --check --skip-network-checks` lists
   the skipped network checks (port 25, Spamhaus) as ignored, not as
   blockers, and no longer exits with code 1 because of them. The run with
   the same options never stopped on them (B77).
-* Postfix: the first connections to port 25 after a start of Postfix no
+* **Postfix no longer delays the first port 25 connections (B78)**\
+  Postfix: the first connections to port 25 after a start of Postfix no
   longer wait 100 seconds for the greeting. A restart at the wrong moment
   left Berkeley DB's temporary file of tlsmgr's TLS session cache
   (`/var/lib/postfix/__db.smtp_scache.db`), and every later start stumbled
   over it. A systemd drop-in of setup removes such files before each start
   (B78).
-* Setup: setup no longer stops with "Could not get lock" when apt-daily
+* **Setup waits for apt and dpkg locks (B79)**\
+  Setup: setup no longer stops with "Could not get lock" when apt-daily
   or unattended-upgrades runs at the same time (for example some minutes
   after a boot). It waits up to 10 minutes for the dpkg and apt locks
   before each apt-get call (B79).
-* Munin: alerts reach the administrator. munin.conf defines the contact
+* **Munin alerts reach the administrator (B80)**\
+  Munin: alerts reach the administrator. munin.conf defines the contact
   before the host tree (after the `[host]` line munin-limits did not find
   it and logged "Missing configuration options for contact admin" every 5
   minutes), and its command `/usr/local/lib/mailinabox/munin-notify`
@@ -2075,7 +3070,8 @@ test tool: `tests/fork/log-audit.sh`.
   interfaces of containers (Docker), whose names change at each start of
   the container and whose old plugins would report "unknown" for ever
   (B80).
-* Spam: systemd removes spampd's PID file after each stop, as root
+* **systemd removes spampd's stale PID file after each stop (B81)**\
+  Spam: systemd removes spampd's PID file after each stop, as root
   (drop-in `/etc/systemd/system/spampd.service.d/mailinabox-stale-pid.conf`
   with `ExecStopPost`); spampd itself cannot (it logs "Couldn't unlink
   /run/spampd.pid"), and the stale file stayed behind. The PID file stays
@@ -2084,20 +3080,24 @@ test tool: `tests/fork/log-audit.sh`.
   let a compromised spampd redirect root's write of the file with a
   symlink; setup removes that version's drop-in and `/run/spampd` from
   boxes that ran it (B81).
-* Setup: cron is stopped while setup runs and started again at its end,
+* **Cron is paused while setup runs (B82)**\
+  Setup: cron is stopped while setup runs and started again at its end,
   also when setup fails. Cron jobs no longer run against half-configured
   services, and their mail to root no longer bounces on a new box before
   setup has written the root@ alias. A cron that the tools stopped stays
   stopped (B82).
-* DNS: setup restarts nsd when it changed nsd.conf, so that a new address
+* **Setup restarts nsd after changing nsd.conf (B83)**\
+  DNS: setup restarts nsd when it changed nsd.conf, so that a new address
   of the box and the logging to syslog take effect without a reboot (B83).
-* Tools: the tmux scopes of both tools, and the scope in which the in-place
+* **Tmux scopes of the tools have a description (B84)**\
+  Tools: the tmux scopes of both tools, and the scope in which the in-place
   tool continues after a reboot, have a description; on 22.04 systemd
   complained about the old one (the multi-line command) at every
   daemon-reload. The resume script quotes the scope command with
   `printf %q`, so the description with its spaces reaches systemd-run as
   one argument (B84).
-* Dovecot: after a rotation of `/var/log/mail.log` Dovecot's lines go to
+* **Dovecot logs through syslog so rotation no longer blinds fail2ban (B85)**\
+  Dovecot: after a rotation of `/var/log/mail.log` Dovecot's lines go to
   the new file. Dovecot wrote the file itself (`log_path`) and went on
   writing into `mail.log.1` until its next restart (usually the nightly
   backup); in that time the fail2ban jails `dovecot` and
@@ -2121,7 +3121,8 @@ test tool: `tests/fork/log-audit.sh`.
 
 ### Changed
 
-* Tools: before each release upgrade `tools/upgrade-in-place-to-2604.sh`
+* **In-place tool warns about SSH and sudo outages during release upgrades**\
+  Tools: before each release upgrade `tools/upgrade-in-place-to-2604.sh`
   says that new SSH logins fail for a while and, from 24.04 to 26.04, that
   `sudo` is missing for a while because sudo-rs replaces it: attach before
   and keep the connection open; if a login fails, wait, do not reboot. It
@@ -2133,7 +3134,8 @@ test tool: `tests/fork/log-audit.sh`.
   takes 20 to 90 minutes. The measured SSH times were 19 to 36 and 7 to 14
   minutes; README-fork.md ("Logging in during the release upgrades") gives
   them, README.md describes it.
-* Tests: `tests/fork/smoke.py` marks every mail it sends with the header
+* **Smoke test ignores its own marked test mails in manifest comparison**\
+  Tests: `tests/fork/smoke.py` marks every mail it sends with the header
   `X-Miab-Test: 1`. The manifest comparison (`mig-folders-<user>`,
   `mig-pop3-uidl-<user>`) ignores marked mails and the automatic replies
   and bounces to them, and says how many it ignored; any other missing or
@@ -2143,13 +3145,15 @@ test tool: `tests/fork/log-audit.sh`.
   for the testers' own checks. `seed-legacy.sh` leaves the same mails out of
   the manifest. Manifests of earlier `seed-legacy.sh` runs still work.
   TESTING-fork.md describes it.
-* Tests: `tests/fork/smoke.py --fail2ban` rotates `mail.log` once before
+* **Smoke test checks fail2ban after a mail.log rotation (B85)**\
+  Tests: `tests/fork/smoke.py --fail2ban` rotates `mail.log` once before
   the attacks (`fail2ban-log-rotation`) and checks that rsyslog writes the
   new file and that no Dovecot process holds a file in `/var/log`
   (`log_path=syslog`; with Dovecot's own `log_path`, up to rc5, it must
   hold the new `mail.log`), so a jail that a rotation made blind fails
   (B85). `fail2ban-filters` has a Dovecot line in the syslog form.
-* Tests: `tests/fork/smoke.py` checks Munin's alert contact
+* **Smoke test checks Munin alert contact and enabled services**\
+  Tests: `tests/fork/smoke.py` checks Munin's alert contact
   (`munin-alert-contact`), and `services-enabled` no longer reports a SysV
   service of 22.04 (postgrey) as not enabled. `prepare-testenv.sh` writes
   its SpamAssassin file with mode 644 also under a umask of 077 (the IMAP
@@ -2157,20 +3161,23 @@ test tool: `tests/fork/log-audit.sh`.
 
 ### Upgrade note
 
-* Boxes on rc1 to rc5 are updated with the two commands of "Updating the
+* **Updating boxes on rc1 to rc5**\
+  Boxes on rc1 to rc5 are updated with the two commands of "Updating the
   fork" in README-fork.md:
   `sudo git -C /root/mailinabox remote set-url origin https://github.com/LM1337/Mail-in-a-box-26`
   and
   `sudo bash -c "$(curl -fsSL https://raw.githubusercontent.com/LM1337/Mail-in-a-box-26/main/setup/bootstrap.sh)"`.
   The first one is needed for rc1 to rc3 and changes nothing on rc4 and rc5.
-* Munin mails administrator@PRIMARY_HOSTNAME (from and to that address) on
+* **Munin mails administrator on each change of state**\
+  Munin mails administrator@PRIMARY_HOSTNAME (from and to that address) on
   each change of state of a watched value: one mail when a value reaches
   warning or critical, one when it is back to ok. A value that is in
   warning or critical already is not mailed until its state changes;
   `/var/lib/munin/limits` lists the states. Make sure that address reaches
   someone (it is an alias of the first administrator by default). A
   setting to change the address or turn the alerts off is planned for rc7.
-* Dovecot logs through syslog (B85); setup sets `log_path=syslog` and
+* **Dovecot lines in mail.log now use rsyslog's format (B85)**\
+  Dovecot logs through syslog (B85); setup sets `log_path=syslog` and
   restarts Dovecot. Nothing to do by hand. Its lines in `mail.log` now have
   rsyslog's form, as Postfix's: `2026-10-25T13:00:00.123456+00:00 box
   dovecot: imap-login: Logged in: user=<...>, ...` (time stamp, host,
@@ -2181,47 +3188,58 @@ test tool: `tests/fork/log-audit.sh`.
   whose `mail.log` was rotated since Dovecot's last restart, the Dovecot
   lines of that time are in `mail.log.1`. Check after the update:
   `doveconf -h log_path` says `syslog`.
-* Setup adds the systemd drop-in
+* **Setup adds the spampd PID drop-in (B81)**\
+  Setup adds the systemd drop-in
   `/etc/systemd/system/spampd.service.d/mailinabox-stale-pid.conf` (B81)
   and sets `pid /run/spampd.pid` in `/etc/spampd.cfg`. The in-place tool
   does not count this drop-in (nor Postfix's `mailinabox-stale-db.conf`)
   as a local extension.
-* Cron is paused while setup runs (B82): cron jobs that would fall into
+* **Cron jobs during an update run are skipped**\
+  Cron is paused while setup runs (B82): cron jobs that would fall into
   the minutes of an update run are skipped, not run later. The nightly job
   between 01:00 and 01:59 is not affected unless you update at that time.
-* After the update Roundcube and Nextcloud show the fork's favicon. A
+* **Roundcube and Nextcloud show the fork's favicon**\
+  After the update Roundcube and Nextcloud show the fork's favicon. A
   favicon that an administrator uploaded in Nextcloud and a replaced
   favicon of Roundcube's Elastic skin are kept. To keep the old favicons,
   put `FAVICON=off` into `/etc/mailinabox.conf` before the update.
-* The first setup run of this release writes the SSL settings of
+* **First setup run rewrites Dovecot SSL settings once more (B74)**\
+  The first setup run of this release writes the SSL settings of
   `/etc/dovecot/conf.d/10-ssl.conf` once more (B74). The commented copies
   that earlier runs added stay; they are only comments.
-* On boxes upgraded in place to 26.04 with rc1 to rc5, setup removes
+* **Setup removes cloud-init's old logrotate file (B75)**\
+  On boxes upgraded in place to 26.04 with rc1 to rc5, setup removes
   cloud-init's old `/etc/logrotate.d/cloud-init` if it is unchanged, and
   logrotate works again (B75). A changed file is kept; then remove the
   duplicate entry by hand.
-* For an in-place upgrade, read "Logging in during the release upgrades" in
+* **Read the SSH login notes before an in-place upgrade**\
+  For an in-place upgrade, read "Logging in during the release upgrades" in
   README-fork.md ("In-place upgrade to 26.04") first: attach to the run
   before each release upgrade and keep the connection; if a new login
   fails, wait, do not reboot.
 
 ### Planned for rc7
 
-* An admin panel setting for Munin's alerts: to administrator@PRIMARY_HOSTNAME
+* **Admin panel setting for Munin alerts**\
+  An admin panel setting for Munin's alerts: to administrator@PRIMARY_HOSTNAME
   (the default), to another address, or off; warning and critical or only
   critical; a button that sends a test mail.
-* A shorter SSH outage during the release upgrades, or at least a live
+* **Shorter SSH outage during release upgrades**\
+  A shorter SSH outage during the release upgrades, or at least a live
   note: for example a fallback sshd on another port while the SSH server is
   replaced (as do-release-upgrade offers when it runs interactively), and a
   message in the run when SSH logins work again.
-* A deterministic order of the OpenDKIM tables (`KeyTable`,
+* **Deterministic order of the OpenDKIM tables**\
+  A deterministic order of the OpenDKIM tables (`KeyTable`,
   `SigningTable`), so that a setup run without changes leaves them alone.
-* A rule in `tests/fork/log-audit-allow.txt` for `(sd-pam)`'s
+* **Test log audit rule for a pam_systemd message at reboot**\
+  A rule in `tests/fork/log-audit-allow.txt` for `(sd-pam)`'s
   "pam_systemd(systemd-user:session): Varlink call
   io.systemd.Login.ReleaseSession failed: io.systemd.Login.NoSuchSession"
   at a reboot, seen in one T5b run of rc6 (the test lab's own list
   accepted it there).
-* The full test matrix T1 to T5b again on the release head, and T6 (on the
+* **Full test matrix T1 to T5b and T6 before final release**\
+  The full test matrix T1 to T5b again on the release head, and T6 (on the
   Internet: Let's Encrypt, delivery to other providers) before a final
   release.
 
@@ -2234,7 +3252,8 @@ and the mailinabox and munin units are enabled by name (B69).
 
 ### Fixed
 
-* Dovecot: vacation replies and Sieve redirects no longer create the
+* **Sieve vacation replies no longer create Dovecot duplicate-database folders (B66)**\
+  Dovecot: vacation replies and Sieve redirects no longer create the
   folders `dovecot`, `dovecot.lda-dupes` and `dovecot.lda-dupes.locks`.
   Dovecot 2.4 put the lock files of its duplicate database into a
   directory in the Maildir, which Maildir++ showed as a folder; setup sets
@@ -2246,7 +3265,8 @@ and the mailinabox and munin units are enabled by name (B69).
   full-text index, after the user database is set up) unless one holds
   messages; a real folder named `dovecot` keeps its subscription, and a
   user that doveadm cannot handle is retried on the next setup run (B66).
-* Tools: `tools/upgrade-in-place-to-2604.sh` left Dovecot disabled: it
+* **In-place tool no longer leaves Dovecot disabled (B67)**\
+  Tools: `tools/upgrade-in-place-to-2604.sh` left Dovecot disabled: it
   installs Dovecot 2.4 while the unit is masked, which the package cannot
   enable, and after the next reboot there was no IMAP, POP3 or delivery to
   the mailboxes. The tool now records which units are enabled before it
@@ -2256,7 +3276,8 @@ and the mailinabox and munin units are enabled by name (B69).
   were enabled before the upgrade and are disabled now (warning and
   `etc-report.txt`). Setup enables a disabled service before it restarts it
   (and nsd), so the next setup run heals a box upgraded with rc3 (B67).
-* System: on machines where cloud-init writes `/etc/hosts` on every boot
+* **cloud-init no longer restores the foreign 127.0.1.1 hosts line (B68)**\
+  System: on machines where cloud-init writes `/etc/hosts` on every boot
   (`manage_etc_hosts`, e.g. hypervisors and the images of hosting providers),
   the 127.0.1.1 line with another machine's name that setup comments out
   came back after each reboot. Setup now also puts the box's name on the
@@ -2264,7 +3285,8 @@ and the mailinabox and munin units are enabled by name (B69).
   (`/etc/cloud/templates/hosts.debian.tmpl`) and the same line into
   `/etc/hosts`. When an update of cloud-init changes the template, dpkg
   asks about it: keep the local version (B68).
-* Setup: `systemctl is-enabled mailinabox` and `munin` no longer fail
+* **`systemctl is-enabled` works for mailinabox and munin units (B69)**\
+  Setup: `systemctl is-enabled mailinabox` and `munin` no longer fail
   with "Too many levels of symbolic links". Setup enabled the units by
   their path under `/lib`, which left a link in `/etc/systemd/system` to the
   same file; it now removes such a link and enables the units by name
@@ -2272,10 +3294,12 @@ and the mailinabox and munin units are enabled by name (B69).
 
 ### Changed
 
-* Tests: smoke checks `services-enabled` (the services of Mail-in-a-Box are
+* **Smoke checks for enabled services and Sieve vacation folders**\
+  Tests: smoke checks `services-enabled` (the services of Mail-in-a-Box are
   enabled, over `--ssh`) and `sieve-vacation-no-phantom-folders` (after the
   vacation reply, IMAP lists no folder of Dovecot's duplicate database).
-* Docs: README-fork.md has a new section "Setup output" with the lines of
+* **README-fork.md documents harmless setup output and update steps**\
+  Docs: README-fork.md has a new section "Setup output" with the lines of
   setup's output that look like errors but are harmless on 26.04
   (pollinate "Permission denied", Nextcloud's "No upgrade required", the
   SysV note of systemctl). "Updating the fork" says what to do right after
@@ -2284,21 +3308,25 @@ and the mailinabox and munin units are enabled by name (B69).
 
 ### Upgrade note
 
-* Boxes upgraded in place with rc3 have Dovecot disabled (B67): it runs,
+* **Boxes upgraded in place with rc3 have Dovecot disabled (B67)**\
+  Boxes upgraded in place with rc3 have Dovecot disabled (B67): it runs,
   but does not start after a reboot. Check with `systemctl is-enabled
   dovecot`; until this release is installed, `sudo systemctl enable
   dovecot` fixes it. Setup of this release enables it by itself.
-* Adaptive banning and the slow mail jails are on as soon as setup of rc4
+* **Adaptive banning and slow mail jails are on after the update**\
+  Adaptive banning and the slow mail jails are on as soon as setup of rc4
   or later has finished; there is nothing to turn on. Put your own
   networks on the allowlist right after the update (System > Intrusion
   Protection, or `sudo /root/mailinabox/management/fail2ban_admin.py
   --allow 192.0.2.0/24`), see the upgrade note of rc4.
-* Every setup run picks a new random minute between 01:00 and 01:59 for
+* **Setup picks a new random minute for the nightly job**\
+  Every setup run picks a new random minute between 01:00 and 01:59 for
   the nightly backup and status checks (`/etc/cron.d/mailinabox-nightly`),
   as upstream does. Look it up before the next update or in-place upgrade:
   the in-place tool waits for a running backup before it stops mail, at
   most 2 hours.
-* Checkouts of rc1 to rc3 keep the release tags of the fork's previous
+* **Old release tags of rc1 to rc3 checkouts**\
+  Checkouts of rc1 to rc3 keep the release tags of the fork's previous
   home, which have other commit ids than on GitHub. They do no harm;
   `sudo git -C /root/mailinabox tag -d v78-r2604.0-rc1 v78-r2604.0-rc2
   v78-r2604.0-rc3` removes them. Not `git fetch --tags`: the checkout is
@@ -2313,7 +3341,8 @@ tools, and the fixes from the in-place upgrade of a production box with rc3
 
 ### New
 
-* Logo and favicon for the fork: the source files are in `branding/` (CC0,
+* **Logo and favicon for the fork**\
+  Logo and favicon for the fork: the source files are in `branding/` (CC0,
   with `branding/README.md` on colours and use). The control panel has a
   favicon and shows the icon next to the box name; setup copies the files to
   `/usr/local/lib/mailinabox/vendor/assets/branding/` (served as
@@ -2322,7 +3351,8 @@ tools, and the fixes from the in-place upgrade of a production box with rc3
   own. The default page for new boxes (`conf/www_default.html`) shows the
   icon; an existing `index.html` stays as it is. The README header shows the
   wordmark.
-* Tools: `tools/upgrade-in-place-to-2604.sh` has two more hook stages for
+* **In-place tool gets before and after hooks for operator services**\
+  Tools: `tools/upgrade-in-place-to-2604.sh` has two more hook stages for
   services of the operator that use the mail (e.g. a docker compose stack
   with IMAP logins): `/etc/mailinabox/upgrade-2604.d/before/*.sh` run right
   before mail goes offline (a failure stops the upgrade before anything is
@@ -2333,7 +3363,8 @@ tools, and the fixes from the in-place upgrade of a production box with rc3
   by a before hook do not wait for `--finish`. All hooks get `HOOK_STAGE`; the hooks in the
   directory itself still run only in phase local-ext. `--check` lists all
   three stages.
-* Postfix: senders listed in `/etc/postfix/greylist_bypass_senders` (an
+* **Postfix greylisting bypass list for chosen senders**\
+  Postfix: senders listed in `/etc/postfix/greylist_bypass_senders` (an
   access(5) file of the administrator, e.g. `newsletter@example.com OK`)
   skip greylisting. If the file exists, setup runs postmap on it and puts
   `check_sender_access hash:/etc/postfix/greylist_bypass_senders` right before
@@ -2342,7 +3373,8 @@ tools, and the fixes from the in-place upgrade of a production box with rc3
   hand on every run. To turn it off, delete the file and run setup (keep the
   `.db` until then). `tools/migrate-to-2604.sh` takes the file over from the
   old box before setup (not from a backup, which does not contain it).
-* Nextcloud: users only see and share with the accounts of their own mail
+* **Nextcloud sharing limited to the user's own mail domain**\
+  Nextcloud: users only see and share with the accounts of their own mail
   domain (share dialog, contacts menu, system address book, calendar and team
   member search); members of the Nextcloud group `admin` with everyone.
   Each mail domain becomes a Nextcloud group (user_external `groupDomain`),
@@ -2351,9 +3383,11 @@ tools, and the fixes from the in-place upgrade of a production box with rc3
   every 5 minutes. `NEXTCLOUD_SHARE_SCOPE=all` in `/etc/mailinabox.conf` keeps
   upstream's behaviour and puts back the sharing options from before. See
   README-fork.md for the limits.
-* Tests: smoke check `nextcloud-share-scope` (sharee search across domains,
+* **Smoke check for Nextcloud share scope**\
+  Tests: smoke check `nextcloud-share-scope` (sharee search across domains,
   system address book, admin view).
-* fail2ban: adaptive intrusion protection, on by default (README-fork.md,
+* **fail2ban adaptive intrusion protection and slow mail jails**\
+  fail2ban: adaptive intrusion protection, on by default (README-fork.md,
   "Intrusion protection"; control panel: System > Intrusion Protection).
   Each new ban of an address in a jail lasts twice as long as its previous
   ban in that jail, up to one week (no `bantime.overalljails`; recidive
@@ -2371,25 +3405,29 @@ tools, and the fixes from the in-place upgrade of a production box with rc3
   reloads fail2ban only on a change. All off with an empty allowlist is
   upstream's configuration. Before, a production box had 19,586 failed SMTP
   logins from 4,627 addresses in a week and no ban.
-* Status checks: a report of failed logins in the mail log of the last
+* **Status checks report failed-login patterns from the mail log**\
+  Status checks: a report of failed logins in the mail log of the last
   48 hours: accounts that failed from 20 or more addresses within 24 hours
   (password spraying), addresses that keep failing for 12 hours or more
   without a single ban in that time (expired bans are read from fail2ban's
   database), and banned addresses that failed only as one or two existing
   accounts (probably an own device with an old password: allowlist it). Only
   existing accounts are named.
-* Management API (admin): `GET /system/fail2ban` (jails, bans with time
+* **Management API calls for fail2ban**\
+  Management API (admin): `GET /system/fail2ban` (jails, bans with time
   left), `GET`/`POST /system/fail2ban/settings`, `POST /system/fail2ban/unban`
   (one jail, or all jails including the ban history), `POST
   /system/fail2ban/unban-all` (one jail), `GET /system/fail2ban/report`.
-* Control panel: new page System > Intrusion Protection. It lists the banned
+* **Control panel page System > Intrusion Protection**\
+  Control panel: new page System > Intrusion Protection. It lists the banned
   addresses (jails, time left; filter) and the jails with their counters,
   unbans an address in all jails or in one jail and empties a jail (with a
   confirmation), shows the failed-login report and edits the settings
   (adaptive banning and slow jails on/off with a confirmation before turning
   off, thresholds, allowlist, restore defaults). It shows the admin's own
   address (for IPv6 its /64) and offers to allowlist or unban it.
-* Tests: smoke checks `admin-fail2ban-status`, `admin-fail2ban-settings`,
+* **Smoke checks for the fail2ban admin pages and adaptive banning**\
+  Tests: smoke checks `admin-fail2ban-status`, `admin-fail2ban-settings`,
   `admin-fail2ban-report`, `admin-fail2ban-filters` (fail2ban-regex with
   injected user names) and `admin-fail2ban-panel`, and in the opt-in fail2ban
   group `fail2ban-adaptive-toggle` (turning adaptive banning off reaches the
@@ -2397,24 +3435,28 @@ tools, and the fixes from the in-place upgrade of a production box with rc3
   The ban checks of that group also accept a ban by the slow jails, which
   count the failures of all Dovecot (SMTP) protocols together and can ban
   the source before the fast jail does.
-* Docs: new public README.md (unofficial-fork notice, status, supported paths,
+* **New public README, SECURITY.md and fork notes**\
+  Docs: new public README.md (unofficial-fork notice, status, supported paths,
   credits, license); upstream's README is kept as README-upstream.md. New
   `.github/SECURITY.md` (GitHub private vulnerability reporting); fork notes
   in security.md, CODE_OF_CONDUCT.md and CONTRIBUTING.md.
 
 ### Changed
 
-* Project home: the fork is now published at
+* **The fork is published on GitHub**\
+  Project home: the fork is now published at
   https://github.com/LM1337/Mail-in-a-box-26. `setup/bootstrap.sh`,
   `tools/migrate-to-2604.sh` and `tools/upgrade-in-place-to-2604.sh` clone
   from there by default, and the
   curl commands in the documentation use
   `https://raw.githubusercontent.com/LM1337/Mail-in-a-box-26/main/...`.
-* Status checks: the version check reads the latest release tag from the
+* **Version check reads the fork's release tag from GitHub**\
+  Status checks: the version check reads the latest release tag from the
   fork's `setup/bootstrap.sh` on GitHub, and the upgrade hint names this
   fork and its URL. A bootstrap.sh without a `TAG=` line now gives "could not
   be determined" instead of an error.
-* Setup: `setup/bootstrap.sh` compares the checkout's origin with `SOURCE`
+* **bootstrap.sh compares the checkout's origin case-insensitively**\
+  Setup: `setup/bootstrap.sh` compares the checkout's origin with `SOURCE`
   case-insensitively. A checkout of this fork cloned from its previous
   location (rc1 to rc3) stops with "is a checkout of ..., not of ..." and
   only the command that points it to GitHub
@@ -2425,7 +3467,8 @@ tools, and the fixes from the in-place upgrade of a production box with rc3
   branch instead of failing with "Update failed" or keeping an old local
   branch, and a fresh install with a branch no longer prints "couldn't find
   remote ref".
-* Tools: `tools/upgrade-in-place-to-2604.sh` on a 26.04 box that already
+* **In-place tool checks out the release tag before setup**\
+  Tools: `tools/upgrade-in-place-to-2604.sh` on a 26.04 box that already
   runs the fork brings `/root/mailinabox` to the release tag (without `TAG=`
   the tool's own one) before setup runs again, instead of running setup of
   the old release; the checkout the tool runs from stays as it is unless
@@ -2436,31 +3479,37 @@ tools, and the fixes from the in-place upgrade of a production box with rc3
   copy. A checkout of the fork from another repository stops with the
   `git remote set-url` command, as in bootstrap.sh. `TAG=` also takes a
   branch such as `main` for an existing checkout.
-* Tools: `tools/migrate-to-2604.sh` keeps the other settings of an existing
+* **Migration tool keeps other settings of /etc/mailinabox.conf**\
+  Tools: `tools/migrate-to-2604.sh` keeps the other settings of an existing
   `/etc/mailinabox.conf` on the new machine (e.g. `FTS=off` or
   `NEXTCLOUD_SHARE_SCOPE=all`, set there after a rehearsal) when it writes
   the file again; before, the real run dropped them. Both tools pass `FTS`
   and `NEXTCLOUD_SHARE_SCOPE` from the environment into their tmux session.
-* Tools: `tools/upgrade-in-place-to-2604.sh` is executable in git, as its
+* **Tools are executable and hint at `sudo tmux attach`**\
+  Tools: `tools/upgrade-in-place-to-2604.sh` is executable in git, as its
   own hints assume. The help texts, the reboot hints and the migration's
   quick start say `sudo tmux attach -t ...`: the session belongs to root.
-* Branding: the installed box points to the fork instead of only to
+* **Installed box points to the fork instead of only upstream**\
+  Branding: the installed box points to the fork instead of only to
   upstream: the Roundcube support link, the admin panel footer, the default web page (new
   boxes only) and the SMTP banner.
-* Tests: `tests/fork` no longer contains addresses or host names of a
+* **Test scripts no longer contain a particular test network**\
+  Tests: `tests/fork` no longer contains addresses or host names of a
   particular test network. `prepare-testenv.sh` needs `JUMP_HOST`, `PEERS`,
   `BLOCK_V4` and `BLOCK_V6` (environment or `TESTENV_FILE`); `smoke.py` reads
   its env file from `MIAB_TEST_ENV` (default `tests/fork/credentials.env`,
   ignored by git) and the seed domains from `SEED2_DOMAIN`/`SEED3_DOMAIN`
   (default `seed2.example.net`/`seed3.example.net`), like `seed-legacy.sh`.
-* Tools: phase verify of `tools/upgrade-in-place-to-2604.sh` and
+* **Verify phase reports Postfix restrictions that are gone**\
+  Tools: phase verify of `tools/upgrade-in-place-to-2604.sh` and
   `tools/migrate-to-2604.sh` reports each item of an `smtpd_*_restrictions`
   parameter from before (of the old box) that is gone now ("Postfix
   restriction ... is gone: ...") as a failed check and at the top of
   `etc-report.txt`, not only as a changed line of `postconf -n`. A DNS list
   that only got return codes (upstream v68, `zen.spamhaus.org=127.0.0.[2..11]`)
   does not count as gone.
-* Tools: a Mail-in-a-Box backup that is running (e.g. the nightly one at
+* **A running backup no longer stops the upgrade or migration start**\
+  Tools: a Mail-in-a-Box backup that is running (e.g. the nightly one at
   01:04) no longer stops the start. `tools/upgrade-in-place-to-2604.sh`
   reports it in the preflight (also with `--check`) without a blocker, then
   waits for it with progress dots before anything is stopped (at most 2
@@ -2474,7 +3523,8 @@ tools, and the fixes from the in-place upgrade of a production box with rc3
   with `pgrep -f`, which also matched command lines that only name them; the
   `--rollback` of the migration ends a backup still running by these PIDs,
   no longer with `pkill -f`.
-* Tools: `tools/upgrade-in-place-to-2604.sh` and `tools/migrate-to-2604.sh`
+* **Tools run in tmux so a dropped SSH connection does not stop them**\
+  Tools: `tools/upgrade-in-place-to-2604.sh` and `tools/migrate-to-2604.sh`
   run themselves in a tmux session (`upgrade-2604`, `migrate-2604`) when a
   command that changes something is started from a terminal outside tmux or
   screen, so a dropped SSH connection no longer stops a release upgrade, the
@@ -2501,7 +3551,8 @@ tools, and the fixes from the in-place upgrade of a production box with rc3
 
 ### Fixed
 
-* Tools: `tools/upgrade-in-place-to-2604.sh` stops mail (and masks the units)
+* **In-place tool stops mail before its fresh backup (B57)**\
+  Tools: `tools/upgrade-in-place-to-2604.sh` stops mail (and masks the units)
   before the fresh Mail-in-a-Box backup of phase snapshot, not after it, so
   the backup holds all mail. Before, backup.py started Postfix and Dovecot
   again after its run, and mail accepted while the system archive was written
@@ -2513,25 +3564,30 @@ tools, and the fixes from the in-place upgrade of a production box with rc3
   them and does not repeat a backup that already ran with mail offline.
   The downtime estimate of the plan (`--check`) includes the fresh backup and
   says that a full one can take much longer.
-* Management: the usage report (`mail_log.py`) counts IMAP, POP3 and
+* **Usage report counts Dovecot 2.4 logins again (B58)**\
+  Management: the usage report (`mail_log.py`) counts IMAP, POP3 and
   ManageSieve logins again: Dovecot 2.4 logs them as "Logged in:", not
   "Login:" (B58).
-* Postfix: setup no longer sets `smtpd_tls_dh1024_param_file` and removes it
+* **Setup drops Postfix's `smtpd_tls_dh1024_param_file` (B59)**\
+  Postfix: setup no longer sets `smtpd_tls_dh1024_param_file` and removes it
   from an existing main.cf. Postfix 3.10 warned on every `postconf` call that
   its support will be removed; the default uses the RFC 7919 FFDHE groups
   (B59).
-* System: mail of cron jobs and root reaches the administrator. Setup writes
+* **Mail of cron jobs and root reaches the administrator (B60)**\
+  System: mail of cron jobs and root reaches the administrator. Setup writes
   PRIMARY_HOSTNAME to `/etc/mailname` (Postfix's myorigin; a provider's image
   could leave its own name there, and such mail bounced daily), comments out
   a 127.0.1.1 line in `/etc/hosts` with another machine's name, makes
   root@PRIMARY_HOSTNAME an automatic alias to administrator@ and writes the
   automatic aliases at the end of every setup run. The Nextcloud cron jobs
   send their output to root instead of www-data (B60).
-* fail2ban: the `miab-postfix-submission` filter (jails `miab-postfix465`,
+* **fail2ban submission filter can no longer ban third parties (B61)**\
+  fail2ban: the `miab-postfix-submission` filter (jails `miab-postfix465`,
   `miab-postfix587`) is anchored. A client could put `[<ip>]: ` into the SASL
   user name, which Postfix logs after the client address, and get a third
   party banned (B61).
-* fail2ban: the filters `miab-management-daemon` (jails `miab-management`,
+* **fail2ban management and Roundcube filters are anchored (B62)**\
+  fail2ban: the filters `miab-management-daemon` (jails `miab-management`,
   `miab-slow-management`) and `miab-roundcube` (`miab-roundcube`,
   `miab-slow-roundcube`) are anchored. A client could put the control
   panel's failed-login text with a third party's address into an SMTP AUTH
@@ -2539,17 +3595,20 @@ tools, and the fixes from the in-place upgrade of a production box with rc3
   address banned from the web ports (and through recidive from all); the
   Roundcube filter took the first ` from <ip>.` of the line, which could be
   part of the user name (B62).
-* Management: the API call `system/latest-upstream-version` answers HTTP
+* **Latest-version API answers 503 instead of 500 (B63)**\
+  Management: the API call `system/latest-upstream-version` answers HTTP
   503 "The latest version could not be determined." instead of HTTP 500 with
   a traceback in the daemon log when the release cannot be looked up (B63).
-* Management: a failed write to the user database (adding a user or alias
+* **Failed user database writes no longer keep it locked (B64)**\
+  Management: a failed write to the user database (adding a user or alias
   that exists, changing the password, quota or privileges of an address
   that is no user, removing one that does not exist) no longer keeps
   `users.sqlite` locked. With Python 3.14 the connection stayed open with
   its transaction until the garbage collector ran, often for minutes, and
   every other change in the control panel failed with "database is locked"
   (HTTP 500) until then (B64).
-* Setup: the documented command is now
+* **Documented setup command works with sudo-rs (B65)**\
+  Setup: the documented command is now
   `sudo bash -c "$(curl -fsSL .../setup/bootstrap.sh)"`. With upstream's
   `curl ... | sudo bash`, sudo-rs (the sudo of Ubuntu 26.04) stopped setup's
   first dialog box, and an interactive install or update hung without
@@ -2560,13 +3619,15 @@ tools, and the fixes from the in-place upgrade of a production box with rc3
 
 ### Upgrade note
 
-* Boxes on rc1 to rc3 were cloned from the fork's previous home. Point the
+* **Boxes on rc1 to rc3 must point the checkout to GitHub**\
+  Boxes on rc1 to rc3 were cloned from the fork's previous home. Point the
   checkout to GitHub once, then run the bootstrap command as usual:
   `sudo git -C /root/mailinabox remote set-url origin https://github.com/LM1337/Mail-in-a-box-26`
   (see "Updating the fork" in README-fork.md). Their status checks look for
   new releases at the previous home and may keep reporting the box as up to
   date until it runs rc4.
-* The slow mail jails are on after the upgrade, with an empty allowlist. On a
+* **Slow mail jails start with an empty allowlist**\
+  The slow mail jails are on after the upgrade, with an empty allowlist. On a
   box whose users sit behind one office address, put that network on the
   allowlist right after the upgrade (System > Intrusion Protection, or
   `sudo /root/mailinabox/management/fail2ban_admin.py --allow 192.0.2.0/24`).
@@ -2575,7 +3636,8 @@ tools, and the fixes from the in-place upgrade of a production box with rc3
   `/home/user-data/settings.yaml`) has the same effect from the first setup
   run on. Without it, a single phone with an old password can get the
   office banned from the mail ports, for longer each time.
-* Nextcloud sharing is limited to the own mail domain from this release on
+* **Nextcloud sharing limited to own mail domain by default**\
+  Nextcloud sharing is limited to the own mail domain from this release on
   (`NEXTCLOUD_SHARE_SCOPE=domain` is the default). On a box with several
   mail domains, users no longer find the accounts of the other domains in
   the share dialog, the contacts menu, the system address book and the team
@@ -2596,7 +3658,8 @@ of the preparation), about 50 minutes of mail downtime.
 
 ### New
 
-* Tools: `tools/upgrade-in-place-to-2604.sh` upgrades a box in place:
+* **In-place upgrade tool for 22.04 and 24.04 boxes**\
+  Tools: `tools/upgrade-in-place-to-2604.sh` upgrades a box in place:
   22.04 → 24.04 → 26.04 or a release-upgraded 24.04 box → 26.04, then setup of
   this fork on the existing data. Detects local extensions, makes an encrypted
   system archive next to the backups, keeps mail off across reboots, continues
@@ -2604,20 +3667,28 @@ of the preparation), about 50 minutes of mail downtime.
   (`/etc/mailinabox/upgrade-2604.d`), compares counts and fingerprints before
   and after, and removes leftovers of the old releases (`--cleanup-only`).
   See README-fork.md.
-* Dovecot: full-text search with fts_xapian (`95-mailinabox-fts.conf`, on by
+* **Dovecot full-text search with fts_xapian**\
+  Dovecot: full-text search with fts_xapian (`95-mailinabox-fts.conf`, on by
   default, `FTS=off` in `/etc/mailinabox.conf`), a daily
   `doveadm fts optimize -A`. Hand-made 2.3 FTS files are replaced; existing
   Xapian indexes keep working.
-* Tests: smoke check `fts-search` (IMAP SEARCH BODY and `doveadm fts lookup`).
+* **Smoke check for full-text search**\
+  Tests: smoke check `fts-search` (IMAP SEARCH BODY and `doveadm fts lookup`).
 
 ### Fixes for boxes upgraded in place
 
-* Dovecot: Dovecot 2.3 setting names kept in 10-auth/10-ssl are commented out (B51).
-* Spam: leftovers of the dovecot-antispam setup of older versions are removed (B52).
-* Management: the Python venv is rebuilt when its interpreter no longer runs (B53).
-* Setup: bootstrap.sh explains an existing checkout of another origin (B54).
-* System/apt: PPA sources and keys of earlier releases are removed; Launchpad builds of ppa:ondrej are moved back to Ubuntu packages (B55).
-* System: a failing pollinate no longer stops setup (B56).
+* **In-place boxes: Dovecot 2.3 setting names commented out (B51)**\
+  Dovecot: Dovecot 2.3 setting names kept in 10-auth/10-ssl are commented out (B51).
+* **In-place boxes: dovecot-antispam leftovers removed (B52)**\
+  Spam: leftovers of the dovecot-antispam setup of older versions are removed (B52).
+* **In-place boxes: Python venv rebuilt when it no longer runs (B53)**\
+  Management: the Python venv is rebuilt when its interpreter no longer runs (B53).
+* **In-place boxes: bootstrap.sh explains a checkout of another origin (B54)**\
+  Setup: bootstrap.sh explains an existing checkout of another origin (B54).
+* **In-place boxes: old PPA sources and keys removed (B55)**\
+  System/apt: PPA sources and keys of earlier releases are removed; Launchpad builds of ppa:ondrej are moved back to Ubuntu packages (B55).
+* **In-place boxes: a failing pollinate no longer stops setup (B56)**\
+  System: a failing pollinate no longer stops setup (B56).
 
 ## v78-r2604.0-rc2 (2026-10-23)
 
@@ -2627,15 +3698,20 @@ steps: fresh install (49/49 smoke checks) and migration from a v74 box
 
 ### Fixes
 
-* DNS: SSHFP records come from the public key sshd actually serves. It is derived from the private host key, with `.pub` only as a fallback (B11). ECDSA P-384/P-521 keys map to algorithm 3 (B34).
-* Mail: quota validation accepts ASCII digits only. Unicode digits such as a fullwidth `１０G` broke the user's Dovecot userdb lookup (B17, also in v78).
-* Z-Push: `MBSTRING_OVERLOAD` is defined for `z_RTF` on PHP 8. CalDAV Sync requests with RTF bodies used to crash with HTTP 500 (B31, also in v78).
-* Tools: `migrate-to-2604.sh` hardening:
+* **SSHFP records come from the host key sshd serves (B11, B34)**\
+  DNS: SSHFP records come from the public key sshd actually serves. It is derived from the private host key, with `.pub` only as a fallback (B11). ECDSA P-384/P-521 keys map to algorithm 3 (B34).
+* **Quota validation accepts ASCII digits only (B17)**\
+  Mail: quota validation accepts ASCII digits only. Unicode digits such as a fullwidth `１０G` broke the user's Dovecot userdb lookup (B17, also in v78).
+* **Z-Push no longer crashes on RTF bodies on PHP 8 (B31)**\
+  Z-Push: `MBSTRING_OVERLOAD` is defined for `z_RTF` on PHP 8. CalDAV Sync requests with RTF bodies used to crash with HTTP 500 (B31, also in v78).
+* **Migration tool hardening**\
+  Tools: `migrate-to-2604.sh` hardening:
   * stopped units stay disabled across reboots;
   * backups are paused again after every rsync;
   * rollback is safe (backups paused, leftover backup runs ended, `virtual_transport` restored, zone restore and nsd reload separated);
   * the Nextcloud event and `occ status` checks are more accurate.
-* Tests: `prepare-testenv.sh` fails unless ufw is active and the production deny rules are loaded in the kernel, whatever the caller's locale.
+* **`prepare-testenv.sh` requires active ufw with deny rules**\
+  Tests: `prepare-testenv.sh` fails unless ufw is active and the production deny rules are loaded in the kernel, whatever the caller's locale.
 
 ## v78-r2604.0-rc1 (2026-10-23)
 
@@ -2643,7 +3719,8 @@ First release of the fork: PR #2603 + v78 + the fixes below.
 
 ### New
 
-* `tools/migrate-to-2604.sh` moves a box (upstream v68+ on Ubuntu 22.04, or a 24.04 in-place upgrade) to a fresh Ubuntu 26.04 machine in one command.
+* **Migration tool moves a box to a fresh 26.04 machine**\
+  `tools/migrate-to-2604.sh` moves a box (upstream v68+ on Ubuntu 22.04, or a 24.04 in-place upgrade) to a fresh Ubuntu 26.04 machine in one command.
   * Phases:
     1. `--check` dry run with a downtime estimate and checks of port 25, Spamhaus and PTR.
     2. Live rsync, then an optional `--rehearse`.
@@ -2654,84 +3731,117 @@ First release of the fork: PR #2603 + v78 + the fixes below.
   * Resumable. Backups stay paused until the new box is verified.
   * Further modes: `--rollback`, `--status`, `--check-old`, `--finish` and `--from-backup`.
   * Details in README-fork.md.
-* `tests/fork/`: seed data for a legacy box (`seed-legacy.sh`), end-to-end smoke test (`smoke.py`) and test-network preparation (`prepare-testenv.sh`).
+* **Seed data, smoke test and test-network scripts in `tests/fork/`**\
+  `tests/fork/`: seed data for a legacy box (`seed-legacy.sh`), end-to-end smoke test (`smoke.py`) and test-network preparation (`prepare-testenv.sh`).
 
 ### Fixes
 
 Setup and system
-* Bootstrap accepts Ubuntu 26.04 and installs from the fork (B05). The version status check compares against the fork's tag (B40).
-* `email_validator` is installed whenever it is missing for the address prompt (B21).
-* TLS: back to MIAB's `dh2048.pem` instead of generating 4096-bit parameters (B43).
-* The timezone check uses `/etc/localtime` (B44).
-* `wget_verify` picks the hash algorithm by length and no longer overwrites the caller's variables (B45, B46).
-* sury PHP repository:
+* **Bootstrap accepts Ubuntu 26.04 and installs from the fork (B05, B40)**\
+  Bootstrap accepts Ubuntu 26.04 and installs from the fork (B05). The version status check compares against the fork's tag (B40).
+* **`email_validator` is installed when missing (B21)**\
+  `email_validator` is installed whenever it is missing for the address prompt (B21).
+* **TLS uses MIAB's `dh2048.pem` again (B43)**\
+  TLS: back to MIAB's `dh2048.pem` instead of generating 4096-bit parameters (B43).
+* **Timezone check uses `/etc/localtime` (B44)**\
+  The timezone check uses `/etc/localtime` (B44).
+* **`wget_verify` picks the hash algorithm by length (B45, B46)**\
+  `wget_verify` picks the hash algorithm by length and no longer overwrites the caller's variables (B45, B46).
+* **sury PHP repository is pinned and its key checked (B25, B26, B27, …)**\
+  sury PHP repository:
   * pinned to the packages Ubuntu 26.04 lacks (B25);
   * keyring checked against the key fingerprint (B26);
   * key no longer trusted globally (B27);
   * PHP packages it had already replaced move back to Ubuntu (B07).
-* unattended-upgrades covers sury and the duplicity PPA (B28, also in v78).
+* **unattended-upgrades covers sury and the duplicity PPA (B28)**\
+  unattended-upgrades covers sury and the duplicity PPA (B28, also in v78).
 
 Dovecot 2.4
-* quota-status answers DUNNO, so mail to aliases, catch-alls and domain aliases is no longer rejected (B01).
-* Per-user quota:
+* **Mail to aliases and catch-alls is no longer rejected by quota-status (B01)**\
+  quota-status answers DUNNO, so mail to aliases, catch-alls and domain aliases is no longer rejected (B01).
+* **Per-user quota fixes (B02, B38, B14, …)**\
+  Per-user quota:
   * the limit comes from the userdb (`quota_storage_size`) (B02);
   * the maildir quota driver keeps the usage up to date (B38);
   * the grace is 10% of each user's quota again (B14);
   * `quota_status_toolarge` is set (B15).
-* `$STORAGE_ROOT` is expanded in `99-local-sieve.conf`, so user filters and vacation replies run (B04).
-* Sieve redirects use the recipient as envelope sender (B03).
-* ManageSieve port 2000 is closed (B39). LMTP username format and sieve plugin are pinned in `99-local.conf` (B13).
+* **User Sieve filters and vacation replies run again (B04)**\
+  `$STORAGE_ROOT` is expanded in `99-local-sieve.conf`, so user filters and vacation replies run (B04).
+* **Sieve redirects use the recipient as envelope sender (B03)**\
+  Sieve redirects use the recipient as envelope sender (B03).
+* **ManageSieve port 2000 closed, LMTP settings pinned (B39, B13)**\
+  ManageSieve port 2000 is closed (B39). LMTP username format and sieve plugin are pinned in `99-local.conf` (B13).
 
 Spam
-* IMAPSieve spam/ham learning runs:
+* **IMAPSieve spam and ham learning runs (B06, B16, B47, …)**\
+  IMAPSieve spam/ham learning runs:
   * LF line endings, enforced by `.gitattributes` (B06);
   * 120 s pipe timeout (B16);
   * no failed-pipe noise in the log (B47);
   * ham rules skip trash and spam moves (B22).
-* spampd local-only mode is really off, so DNSBL, URIBL, Pyzor and Razor checks run (B24).
-* SpamAssassin rule updates run via `spamassassin-maintenance.timer` (B23). The unused spamd is disabled (B48).
+* **spampd runs DNSBL, URIBL, Pyzor and Razor checks (B24)**\
+  spampd local-only mode is really off, so DNSBL, URIBL, Pyzor and Razor checks run (B24).
+* **SpamAssassin rule updates run via a timer (B23, B48)**\
+  SpamAssassin rule updates run via `spamassassin-maintenance.timer` (B23). The unused spamd is disabled (B48).
 
 fail2ban
-* The dovecot jail reads `mail.log` (B09). The filter matches Dovecot 2.4 login failures (B08) and IPv6 local addresses (B33, also in v78), and resists IP injection through the user name.
+* **The dovecot fail2ban jail works with Dovecot 2.4 (B09, B08, B33)**\
+  The dovecot jail reads `mail.log` (B09). The filter matches Dovecot 2.4 login failures (B08) and IPv6 local addresses (B33, also in v78), and resists IP injection through the user name.
 
 DNS
-* SSHFP records:
+* **SSHFP records keep IANA algorithm numbers and avoid ssh-keyscan (B12, B36, B35)**\
+  SSHFP records:
   * keep the IANA algorithm numbers (B12);
   * are built from the host key files instead of `ssh-keyscan`, which OpenSSH 10's PerSourcePenalties throttled (B36);
   * no longer depend on sshd listening on IPv4 localhost (B35, also in v78).
-* nsd logs to syslog only (B37, also in v78).
+* **nsd logs to syslog only (B37)**\
+  nsd logs to syslog only (B37, also in v78).
 
 Web, Nextcloud, Roundcube, Z-Push
-* nginx serves Nextcloud `.mjs` ES modules as JavaScript, so the Contacts app loads (B10). Roundcube 1.7 `static.php/<path>` assets get a proper PATH_INFO split (B50).
-* Nextcloud:
+* **nginx serves Nextcloud `.mjs` modules and Roundcube 1.7 assets (B10, B50)**\
+  nginx serves Nextcloud `.mjs` ES modules as JavaScript, so the Contacts app loads (B10). Roundcube 1.7 `static.php/<path>` assets get a proper PATH_INFO split (B50).
+* **Nextcloud upgrade failure handling and opcache settings (B19, B42)**\
+  Nextcloud:
   * `occ upgrade` failure handling works under `set -e` (B19, also in v78);
   * opcache settings also apply to PHP-FPM (B42).
-* Webmail: the CardDAV preset uses the carddav 5.x keys (`discovery_url`, `preemptive_basic_auth`) (B20).
-* Z-Push: `DAV_SSL_VERIFY` is defined for autodiscover. Z-Push 2.7.7 crashed with HTTP 500 (B32, also in v78).
+* **Webmail CardDAV preset uses carddav 5.x keys (B20)**\
+  Webmail: the CardDAV preset uses the carddav 5.x keys (`discovery_url`, `preemptive_basic_auth`) (B20).
+* **Z-Push autodiscover no longer crashes with HTTP 500 (B32)**\
+  Z-Push: `DAV_SSL_VERIFY` is defined for autodiscover. Z-Push 2.7.7 crashed with HTTP 500 (B32, also in v78).
 
 Management and tools
-* `mail_log.py` parses RFC 3339 rsyslog timestamps (B18).
-* `daemon.py` no longer has a `return` inside `finally` in `/logout` (B41).
-* `ssl_certificates.py` uses the timezone-aware `not_valid_*_utc` properties (cryptography >= 42) and an aware UTC "now". It is a separate `fix(ssl)` commit, so it can be reverted without touching the version bump.
-* `owncloud-restore.sh`:
+* **`mail_log.py` parses RFC 3339 timestamps (B18)**\
+  `mail_log.py` parses RFC 3339 rsyslog timestamps (B18).
+* **`daemon.py` no longer returns inside `finally` in `/logout` (B41)**\
+  `daemon.py` no longer has a `return` inside `finally` in `/logout` (B41).
+* **`ssl_certificates.py` uses timezone-aware certificate dates**\
+  `ssl_certificates.py` uses the timezone-aware `not_valid_*_utc` properties (cryptography >= 42) and an aware UTC "now". It is a separate `fix(ssl)` commit, so it can be reverted without touching the version bump.
+* **`owncloud-restore.sh` refuses unusable backups (B30, B29, B49)**\
+  `owncloud-restore.sh`:
   * refuses backups without application code (B30, also in v78);
   * refuses code that cannot run on PHP 8.5 (B29);
   * uses a defined PHP version (B49).
-* Postfix: a comment explains the harmless "no SASL support" warning on port 25.
+* **Comment explains Postfix's harmless "no SASL support" warning**\
+  Postfix: a comment explains the harmless "no SASL support" warning on port 25.
 
 ### Setup and supply chain
 
-* `wget_verify` picks the hash algorithm by length (64 hex = SHA256,
+* **`wget_verify` picks the hash by length; all pins are SHA256**\
+  `wget_verify` picks the hash algorithm by length (64 hex = SHA256,
   128 = SHA512, 40 = SHA1 kept for compatibility). Every active pin is now
   SHA256 and was checked against the upstream checksum where one is
   published (Nextcloud `.sha256`, GitHub release digest, roundcube.net).
-* The Nextcloud upgrade chain starts at Nextcloud 26. Installs with
+* **Nextcloud upgrade chain starts at Nextcloud 26**\
+  The Nextcloud upgrade chain starts at Nextcloud 26. Installs with
   Nextcloud 20-25 skip the migration with a message (they need PHP <= 8.1).
-* packages.sury.org is pinned to what Ubuntu 26.04 lacks (php-common,
+* **packages.sury.org is pinned and its keyring checked**\
+  packages.sury.org is pinned to what Ubuntu 26.04 lacks (php-common,
   php8.2, php8.2-*, php8.5-imap); its keyring is checked against key
   `15058500A0235D97F5D10063B188E2B695BD4743` and no longer trusted globally.
-* The management venv is recreated when the system Python version changes.
-* The html5_notifier icon is resolved through `rcmail.assets_path()` so it
+* **Management venv is recreated when system Python changes**\
+  The management venv is recreated when the system Python version changes.
+* **html5_notifier icon works with Roundcube 1.7**\
+  The html5_notifier icon is resolved through `rcmail.assets_path()` so it
   works with Roundcube 1.7's `public_html` docroot.
 
 ### Version updates
@@ -2782,7 +3892,8 @@ Nextcloud stays on 34: user_external has no release for Nextcloud 35 yet.
 
 ### Notes for review and testing
 
-* Scope exceptions of the version-update series (intended, not drift):
+* **Scope exceptions of the version-update series**\
+  Scope exceptions of the version-update series (intended, not drift):
   * `management/ssl_certificates.py` is outside the version-pin file set.
     Its change was first part of the cryptography bump and now sits in its
     own `fix(ssl)` commit. Not required by cryptography 50 (the naive
@@ -2792,7 +3903,8 @@ Nextcloud stays on 34: user_external has no release for Nextcloud 35 yet.
   * `management/templates/login.html`: besides the asset pin, `$.trim(x)`
     became `String(x || '').trim()` (same behaviour; `$.trim` is deprecated
     in jQuery 3.5+).
-* The sury apt pin (`/etc/apt/preferences.d/mailinabox-sury-php`) was
+* **Verification of the sury apt pin on a fresh 26.04 VM**\
+  The sury apt pin (`/etc/apt/preferences.d/mailinabox-sury-php`) was
   verified on a fresh 26.04 VM (certification run for rc2): `php8.5-*` and
   `libgd3` come from Ubuntu (`8.5.4-0ubuntu1.5`, `2.3.3-13ubuntu2`), and only
   `php-common`, `php8.5-imap` and the temporary `php8.2-*` come from sury.

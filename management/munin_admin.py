@@ -8,7 +8,9 @@
 # text with /usr/sbin/sendmail. The setting "munin_alerts" in
 # $STORAGE_ROOT/settings.yaml chooses:
 #
-#   recipient  "admin":  administrator@PRIMARY_HOSTNAME (the default),
+#   recipient  "admin":  the recipient of the box's reports (the default; it is
+#                        administrator@PRIMARY_HOSTNAME unless System >
+#                        Notifications names another address, admin_mail.py),
 #              "custom": the address in "address",
 #              "off":    no alerts (the host tree gets "contacts none"),
 #   level      "warning":  warning and critical (the default),
@@ -57,13 +59,20 @@ ADDRESS_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_+-]*(\.[A-Za-z0-9_+-]+)*@([A-Z
 
 # munin-limits' own text for one service, restricted to the critical values.
 # A service without a critical value gives an empty text. (Munin's template
-# language; munin-limits turns \n and \t into a line break and a tab.)
+# language; munin-limits turns \n and \t into a line break and a tab.) The
+# return to normal is not in it: the template sees the current states
+# (cfields, wfields, ufields) and the values back to normal in this run
+# (fofields), but not the state a value had before, so it cannot tell a
+# value back from critical from one back from warning (README-fork.md).
 CRITICAL_TEXT = (r"${if:cfields ${var:group} :: ${var:host} :: ${var:graph_title}\n\tCRITICALs:"
 	r"${loop<,>:cfields  ${var:label} is ${var:value} (outside range [${var:crange}])"
 	r"${if:extinfo : ${var:extinfo}}}.\n}")
 
 def default_address(env):
-	return "administrator@" + env["PRIMARY_HOSTNAME"]
+	# The recipient of the box's reports (admin_mail.py), administrator@ by
+	# default. Imported here: admin_mail imports this module.
+	from admin_mail import report_address
+	return report_address(env)
 
 def validate_address(address):
 	address = (address or "").strip()
@@ -121,11 +130,14 @@ def recipient_address(env, settings):
 	return default_address(env)
 
 def notify_argv(env, settings):
-	# The contact's command as an argument list. Without a custom address it
-	# is the bare command of rc6.
+	# The contact's command as an argument list. Without a custom address
+	# (of Munin's or of the reports) it is the bare command of rc6.
 	argv = [NOTIFY]
 	if settings["recipient"] == "custom":
 		argv += ["--to", validate_address(settings["address"])]
+	elif settings["recipient"] == "admin" and default_address(env) != "administrator@" + env["PRIMARY_HOSTNAME"]:
+		# The reports go to another address (System > Notifications).
+		argv += ["--to", validate_address(default_address(env))]
 	return argv
 
 def render_config(env, settings):
@@ -144,7 +156,7 @@ cgiurl_graph /admin/munin/cgi-graph
 
 """
 	if to is None:
-		ret += """# Alerts: off (admin panel, Munin Monitoring). No contact is defined, and
+		ret += """# Alerts: off (admin panel, System > Notifications). No contact is defined, and
 # the host tree below says "contacts none".
 
 """
@@ -160,7 +172,7 @@ cgiurl_graph /admin/munin/cgi-graph
 contact.admin.command {" ".join(notify_argv(env, settings))}
 """
 		if settings["level"] == "critical":
-			ret += "# Only critical values (admin panel, Munin Monitoring).\n"
+			ret += "# Only critical values (admin panel, System > Notifications).\n"
 			ret += f"contact.admin.text {CRITICAL_TEXT}\n"
 		ret += "\n"
 		contacts = "admin"
