@@ -354,7 +354,7 @@ Resources:
           id -u $STORAGE_USER &>/dev/null || useradd -m $STORAGE_USER
           mkdir -p $STORAGE_ROOT
           git clone "${MailInABoxCloneUrl}" /opt/mailinabox
-          ln -s /opt/mailinabox /root/mailinabox # not sure about this - needs review - suspect ai confused - sometimes ai gets it right :-}
+          ln -s /opt/mailinabox /root/mailinabox # not sure about this - needs review - see old-miab-servr-examination_202611231738.txt --> /root/mailinabox does not exist
           cd /opt/mailinabox && git checkout "${MailInABoxBranchOrTag}"
 
           # 7. Restore from S3 Backup (if RestorePrefix is provided)
