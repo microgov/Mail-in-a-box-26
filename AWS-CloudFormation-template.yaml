@@ -22,11 +22,12 @@
 #   - https://github.com/LM1337/Mail-in-a-box-26
 #   - https://mailinabox.email (Joshua Tauberer & contributors)
 #
-# passes linting with codium as of 202611232124
-# editing complete - i hope.
-# prolly will work now. 202611232154
-
-
+# passes linting with codium as of 202611242251
+# passes aws change-set dry run
+#    "Status": "CREATE_COMPLETE",
+#    "StatusReason": null,
+# 2026 11 24
+#
 
 AWSTemplateFormatVersion: '2010-09-09'
 Description: >
@@ -43,6 +44,7 @@ Parameters:
     Default: ''
   BackupS3Bucket:
     Description: S3 bucket to use for backups
+    Default: ''
     Type: String
   NextCloudS3Bucket:
     Description: S3 bucket to use for Nextcloud data (optional)
@@ -104,6 +106,7 @@ Parameters:
 
 Conditions:
   InstanceEIPProvided: !Not [!Equals [!Ref InstanceEIP, '']]
+  BackupS3: !Not [!Equals [!Ref BackupS3Bucket, '']]
   NextCloudS3: !Not [!Equals [!Ref NextCloudS3Bucket, '']]
   UseSesRelay: !Equals [!Ref SesRelay, 'true']
   RestoreKeyInSsmParameter: !Not [!Equals [!Ref RestoreKeySsmParameterName, '']]
@@ -156,15 +159,18 @@ Resources:
               - Effect: Allow
                 Action: cloudformation:SignalResource
                 Resource: '*'
-        - PolicyName: BackupS3BucketAccessMIAB
-          PolicyDocument:
-            Version: '2012-10-17'
-            Statement:
-              - Effect: Allow
-                Action: 's3:*'
-                Resource:
-                  - !Sub arn:${AWS::Partition}:s3:::${BackupS3Bucket}/*
-                  - !Sub arn:${AWS::Partition}:s3:::${BackupS3Bucket}
+        - !If
+          - BackupS3
+          - PolicyName: BackupS3BucketAccessMIAB
+            PolicyDocument:
+              Version: '2012-10-17'
+              Statement:
+                - Effect: Allow
+                  Action: 's3:*'
+                  Resource:
+                    - !Sub arn:${AWS::Partition}:s3:::${BackupS3Bucket}/*
+                    - !Sub arn:${AWS::Partition}:s3:::${BackupS3Bucket}
+          - !Ref AWS::NoValue
         - !If
           - NextCloudS3
           - PolicyName: NextCloudS3Policy
@@ -228,7 +234,7 @@ Resources:
     Condition: NewAdminPasswordToSsm
     Type: AWS::SSM::Parameter
     Properties:
-      Name: /MailInABoxAdminPassword-${AWS::StackName}
+      Name: !Sub /MailInABoxAdminPassword-${AWS::StackName}
       Type: String
       Value: DefaultToBeUpdatedByInstaller
       Description: Initial admin Password for Mail-in-a-Box WebUI
@@ -289,14 +295,11 @@ Resources:
 
           python3 -m venv /opt/aws/cfn-bootstrap-venv
           /opt/aws/cfn-bootstrap-venv/bin/pip install --upgrade pip
-          #
-          # /opt/aws/cfn-bootstrap-venv/bin/pip install http://amazonaws.com
           /opt/aws/cfn-bootstrap-venv/bin/pip install --quiet --no-cache-dir https://s3.amazonaws.com/cloudformation-examples/aws-cfn-bootstrap-py3-latest.tar.gz
           mkdir -p /opt/aws/bin
           ln -sf /opt/aws/cfn-bootstrap-venv/bin/cfn-* /opt/aws/bin/
           # Install AWS CLI v2 (ARM64 compatible via uname -m)
           cd /tmp
-          # curl -fsSL "amazonaws.com(uname -m).zip" -o awscliv2.zip
           curl -fsSL "https://awscli.amazonaws.com/awscli-exe-linux-$(uname -m).zip" -o awscliv2.zip
           unzip -q awscliv2.zip
           ./aws/install
@@ -399,48 +402,51 @@ Resources:
           EOT
           netplan apply
 
-          # 10. Configure S3 Backups & Encryption Key
-          export RESTORE_S3_REGION=$(aws s3api get-bucket-location --bucket "${BackupS3Bucket}" --query 'LocationConstraint' --output text)
-          [[ "$RESTORE_S3_REGION" == "None" ]] && RESTORE_S3_REGION=us-east-1
-          echo "Mail-in-a-box (${MailInABoxBranchOrTag}) backups for $INSTANCE_ID created on $(date -Im)" > /tmp/README.txt
-          aws s3 cp /tmp/README.txt "s3://${BackupS3Bucket}/$INSTANCE_ID/README.txt"
-          mkdir -p "$STORAGE_ROOT/backup"
-          cat <<EOT > "$STORAGE_ROOT/backup/custom.yaml"
+          # 10. Configure S3 Backups & Encryption Key (if BackupS3Bucket is provided)
+          if [[ -n "${BackupS3Bucket}" ]]; then
+            export RESTORE_S3_REGION=$(aws s3api get-bucket-location --bucket "${BackupS3Bucket}" --query 'LocationConstraint' --output text)
+            [[ "$RESTORE_S3_REGION" == "None" ]] && RESTORE_S3_REGION=us-east-1
+            echo "Mail-in-a-box (${MailInABoxBranchOrTag}) backups for $INSTANCE_ID created on $(date -Im)" > /tmp/README.txt
+            aws s3 cp /tmp/README.txt "s3://${BackupS3Bucket}/$INSTANCE_ID/README.txt"
+            mkdir -p "$STORAGE_ROOT/backup"
+            cat <<EOT > "$STORAGE_ROOT/backup/custom.yaml"
           min_age_in_days: 7
-          # target: s3://s3.$RESTORE_S3_amazonaws.com{BackupS3Bucket}/$INSTANCE_ID
           target: s3://s3.$RESTORE_S3_REGION.amazonaws.com/${BackupS3Bucket}/$INSTANCE_ID
           target_user: ""
           target_pass: ""
           EOT
-          #
-          KEYFILE="$STORAGE_ROOT/backup/secret_key.txt"
-          if [[ -z "${RestorePrefix}" ]]; then
-            if [[ -n "${RestoreKey}" ]]; then
-              echo "${RestoreKey}" | tr ' ' '\n' > "$KEYFILE"
-            elif [[ -n "${RestoreKeySsmParameterName}" ]]; then
-              restore_key_param_exists="$(aws ssm describe-parameters --filters "Key=Name,Values=/${RestoreKeySsmParameterName}" --query Parameters --output text)"
-              if [[ -n "$restore_key_param_exists" ]]; then
-                aws ssm get-parameter --name "/${RestoreKeySsmParameterName}" --with-decryption --query Parameter.Value --output text | tr ' ' '\n' > "$KEYFILE"
-              elif [[ -s "$KEYFILE" ]]; then
-                aws ssm put-parameter \
-                  --overwrite \
-                  --name "/${RestoreKeySsmParameterName}" \
-                  --type SecureString \
-                  --value "$(tr '\n' ' ' < "$KEYFILE")"
+
+            KEYFILE="$STORAGE_ROOT/backup/secret_key.txt"
+            if [[ -z "${RestorePrefix}" ]]; then
+              if [[ -n "${RestoreKey}" ]]; then
+                echo "${RestoreKey}" | tr ' ' '\n' > "$KEYFILE"
+              elif [[ -n "${RestoreKeySsmParameterName}" ]]; then
+                restore_key_param_exists="$(aws ssm describe-parameters --filters "Key=Name,Values=/${RestoreKeySsmParameterName}" --query Parameters --output text)"
+                if [[ -n "$restore_key_param_exists" ]]; then
+                  aws ssm get-parameter --name "/${RestoreKeySsmParameterName}" --with-decryption --query Parameter.Value --output text | tr ' ' '\n' > "$KEYFILE"
+                elif [[ -s "$KEYFILE" ]]; then
+                  aws ssm put-parameter \
+                    --overwrite \
+                    --name "/${RestoreKeySsmParameterName}" \
+                    --type SecureString \
+                    --value "$(tr '\n' ' ' < "$KEYFILE")"
+                fi
               fi
             fi
+            if [ ! -s "$KEYFILE" ]; then
+              openssl rand -base64 32 | tr '/+' '_-' > "$KEYFILE"
+            fi
+            chmod 600 "$KEYFILE"
+            export PASSPHRASE=$(head -n1 "$KEYFILE")
           fi
-          if [ ! -s "$KEYFILE" ]; then
-          openssl rand -base64 32 | tr '/+' '_-' > "$KEYFILE"
-          fi
-          chmod 600 "$KEYFILE"
-          export PASSPHRASE=$(head -n1 "$KEYFILE")
 
           # Signal CloudFormation success before running initial backup & reboot
           /opt/aws/bin/cfn-signal -e 0 --stack ${AWS::StackName} --resource EC2Instance --region ${AWS::Region}
           trap - EXIT
-          export GPG_PASSPHRASE="$PASSPHRASE"
-          /opt/mailinabox/management/backup.py || echo "Initial backup failed, cron will retry later"
+          if [[ -n "${BackupS3Bucket}" ]]; then
+            export GPG_PASSPHRASE="$PASSPHRASE"
+            /opt/mailinabox/management/backup.py || echo "Initial backup failed, cron will retry later"
+          fi
           # Clean cloud-init secrets and reboot cleanly
           rm -f /var/lib/cloud/instances/$INSTANCE_ID/scripts/part-00* \
                 /var/lib/cloud/instances/$INSTANCE_ID/user-data.txt* \
@@ -648,3 +654,7 @@ Outputs:
   RestorePrefix:
     Description: The S3 prefix where backups are stored (matches EC2 Instance ID)
     Value: !Ref EC2Instance
+
+
+
+
