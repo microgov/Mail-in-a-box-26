@@ -214,7 +214,7 @@ Resources:
                 - Effect: Allow
                   Action: ssm:PutParameter
                   Resource:
-                    - !Sub arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/MailInABoxAdminPassword
+                    - !Sub arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/MailInABoxAdminPassword-${AWS::StackName}
           - !Ref AWS::NoValue
 
   InstanceProfile:
@@ -228,7 +228,7 @@ Resources:
     Condition: NewAdminPasswordToSsm
     Type: AWS::SSM::Parameter
     Properties:
-      Name: /MailInABoxAdminPassword
+      Name: /MailInABoxAdminPassword-${AWS::StackName}
       Type: String
       Value: DefaultToBeUpdatedByInstaller
       Description: Initial admin Password for Mail-in-a-Box WebUI
@@ -338,7 +338,7 @@ Resources:
             if [[ -z "${RestorePrefix}" ]]; then
               aws ssm put-parameter \
                   --overwrite \
-                  --name "/MailInABoxAdminPassword" \
+                  --name "/MailInABoxAdminPassword-${AWS::StackName}" \
                   --type SecureString \
                   --value "$EMAIL_PW"
             fi
