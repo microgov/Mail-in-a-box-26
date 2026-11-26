@@ -400,6 +400,7 @@ Resources:
                   dhcp4-overrides:
                     use-dns: false
           EOT
+          chmod 600 /etc/netplan/99-custom-dns.yaml
           netplan apply
 
           # 10. Configure S3 Backups & Encryption Key (if BackupS3Bucket is provided)
