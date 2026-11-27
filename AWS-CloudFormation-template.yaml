@@ -303,6 +303,9 @@ Resources:
           curl -fsSL "https://awscli.amazonaws.com/awscli-exe-linux-$(uname -m).zip" -o awscliv2.zip
           unzip -q awscliv2.zip
           ./aws/install
+          # remove the downloaded zip and extracted installer directory  so they don't sit in /tmp during the rest of setup
+          rm -rf /tmp/aws /tmp/awscliv2.zip
+          export PATH=$PATH:/usr/local/bin:/opt/aws/bin
           export PATH=$PATH:/usr/local/bin:/opt/aws/bin
           hash -r
           # Ensure CloudFormation is signaled on exit/failure
@@ -386,6 +389,10 @@ Resources:
           fi
 
           # 8. Execute Mail-in-a-Box Setup
+          # Use disk-backed /var/tmp on <=1GB RAM instances to prevent tmpfs exhaustion during Nextcloud download
+          if [[ "${InstanceType}" == "t4g.nano" || "${InstanceType}" == "t4g.micro" ]]; then
+            export TMPDIR=/var/tmp
+          fi
           cd /opt/mailinabox && setup/start.sh
 
           # 9. Configure Local DNS Resolution via Netplan
