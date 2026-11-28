@@ -370,6 +370,11 @@ Resources:
           ln -s /opt/mailinabox /root/mailinabox
           cd /opt/mailinabox && git checkout "${MailInABoxBranchOrTag}"
 
+          # Use disk-backed /var/tmp on <=1GB RAM instances to prevent tmpfs exhaustion during duplicity restore & Nextcloud download
+          if [[ "${InstanceType}" == "t4g.nano" || "${InstanceType}" == "t4g.micro" ]]; then
+            export TMPDIR=/var/tmp
+          fi
+
           # 7. Restore from S3 Backup (if RestorePrefix is provided)
           if [[ -n "${RestorePrefix}" ]]; then
             apt-get install -o DPkg::Lock::Timeout=120 -y duplicity
@@ -396,10 +401,6 @@ Resources:
           fi
 
           # 8. Execute Mail-in-a-Box Setup
-          # Use disk-backed /var/tmp on <=1GB RAM instances to prevent tmpfs exhaustion during Nextcloud download
-          if [[ "${InstanceType}" == "t4g.nano" || "${InstanceType}" == "t4g.micro" ]]; then
-            export TMPDIR=/var/tmp
-          fi
           cd /opt/mailinabox && setup/start.sh
 
           # 9. Configure Local DNS Resolution via Netplan
