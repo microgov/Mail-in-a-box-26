@@ -374,18 +374,25 @@ Resources:
           if [[ -n "${RestorePrefix}" ]]; then
             apt-get install -o DPkg::Lock::Timeout=120 -y duplicity
             export S3_URL="s3://${BackupS3Bucket}/${RestorePrefix}"
-          if [[ -n "${RestoreKey}" ]]; then
-            export PASSPHRASE_FULL="${RestoreKey}"
-          elif [[ -n "${RestoreKeySsmParameterName}" ]]; then
-            PASSPHRASE_FULL=$(aws ssm get-parameter --name "/${RestoreKeySsmParameterName}" --with-decryption --query Parameter.Value --output text)
-          else
-            echo "Either RestoreKey or RestoreKeySsmParameterName must be set when restoring."
-            exit 1
-          fi
-          export PASSPHRASE=$(echo "$PASSPHRASE_FULL" | awk '{print $1}')
-          duplicity restore --force "$S3_URL" "$STORAGE_ROOT"
-          mkdir -p "$STORAGE_ROOT/backup"
-          echo "$PASSPHRASE_FULL" | tr ' ' '\n' > "$STORAGE_ROOT/backup/secret_key.txt"
+            set +x
+            if [[ -n "${RestoreKey}" ]]; then
+              PASSPHRASE_FULL="${RestoreKey}"
+            elif [[ -n "${RestoreKeySsmParameterName}" ]]; then
+              PASSPHRASE_FULL=$(aws ssm get-parameter --name "/${RestoreKeySsmParameterName}" --with-decryption --query Parameter.Value --output text)
+            else
+              echo "Either RestoreKey or RestoreKeySsmParameterName must be set when restoring."
+              exit 1
+            fi
+            export PASSPHRASE=$(echo "$PASSPHRASE_FULL" | awk '{print $1}')
+            set -x
+            # Duplicity 3.x refuses to restore into a non-empty directory (useradd -m populated /etc/skel)
+            find "$STORAGE_ROOT" -mindepth 1 -delete
+            duplicity restore "$S3_URL" "$STORAGE_ROOT"
+            mkdir -p "$STORAGE_ROOT/backup"
+            set +x
+            echo "$PASSPHRASE_FULL" | tr ' ' '\n' > "$STORAGE_ROOT/backup/secret_key.txt"
+            set -x
+            chown -R "$STORAGE_USER:$STORAGE_USER" "$STORAGE_ROOT"
           fi
 
           # 8. Execute Mail-in-a-Box Setup
