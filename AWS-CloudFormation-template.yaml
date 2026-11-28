@@ -397,7 +397,8 @@ Resources:
             set +x
             echo "$PASSPHRASE_FULL" | tr ' ' '\n' > "$STORAGE_ROOT/backup/secret_key.txt"
             set -x
-            chown -R "$STORAGE_USER:$STORAGE_USER" "$STORAGE_ROOT"
+            chown "$STORAGE_USER:$STORAGE_USER" "$STORAGE_ROOT"
+            chown -R "$STORAGE_USER:$STORAGE_USER" "$STORAGE_ROOT/backup"
           fi
 
           # 8. Execute Mail-in-a-Box Setup
